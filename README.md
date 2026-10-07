@@ -1,6 +1,6 @@
 # inferrous
 
-LLM inference written in Rust, with every GPU kernel also written in Rust and compiled by [cuda-oxide](https://github.com/bitemyapp/cuda-oxide). There are no CUDA C++ kernels and no vendor BLAS or attention libraries.
+LLM inference written in Rust, with every GPU kernel also written in Rust and compiled by cuda-oxide, the SIMT kernel compiler in [NVIDIA cuda-rust](https://github.com/NVIDIA/cuda-rust). There are no CUDA C++ kernels and no vendor BLAS or attention libraries.
 
 The first engine, [`inferrous-qwen3`](crates/inferrous-qwen3), runs Qwen3-8B with INT8 weights and dynamic INT8 activations (W8A8) on one NVIDIA RTX PRO 6000 Blackwell (SM120). It decodes at **182.3 / 178.2 / 170.5 tokens/s** for 5 / 129 / 512-token prompts, faster than the best stock W8A8 configuration we measured (vLLM with Humming INT8 kernels, 144.4 / 143.3 / 142.9). See [benchmarks](docs/qwen3-8b-w8a8/benchmarks.md) for workloads, timing boundaries and caveats.
 
@@ -22,8 +22,8 @@ This is research-grade code, not an accuracy-certified model server.
 ## Requirements
 
 - Linux with an SM120 NVIDIA GPU (developed on an RTX PRO 6000 Blackwell Max-Q, driver 580.159.04) and CUDA 12.8. CUDA 13.1 is used only for Compute Sanitizer and the stock-engine comparisons.
-- The pinned Rust toolchain (`rust-toolchain.toml`, nightly-2026-04-03).
-- The cuda-oxide submodule at the pinned revision. Its own documentation covers codegen-backend prerequisites.
+- The pinned Rust toolchain (`rust-toolchain.toml`, nightly-2026-08-28).
+- The NVIDIA cuda-rust submodule (`vendor/cuda-rust`) at the pinned revision. Its cuda-oxide documentation covers codegen-backend prerequisites.
 - Python with PyTorch, `safetensors` and `numpy` for model preparation and reference fixtures.
 - The `Qwen/Qwen3-8B` checkpoint at revision `b968826d9c46dd6066d109eabc6255188de91218`.
 
@@ -36,8 +36,8 @@ cd inferrous
 python3 crates/inferrous-qwen3/tools/prepare.py --source <hf-snapshot>/b968826d9c46dd6066d109eabc6255188de91218 \
   --output clean-work/model-bundle
 # Build the cuda-oxide codegen backend once, from the pinned submodule.
-(cd vendor/cuda-oxide/crates/rustc-codegen-cuda && cargo build --release)
-export CUDA_OXIDE_BACKEND=$PWD/vendor/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
+(cd vendor/cuda-rust/cuda-oxide/crates/rustc-codegen-cuda && cargo build --release)
+export CUDA_OXIDE_BACKEND=$PWD/vendor/cuda-rust/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
 crates/inferrous-qwen3/tools/cuda.sh build
 target/inferrous-gpu/release/inferrous-qwen3 clean-work/model-bundle \
   --prompt 'The capital of France is' --max-tokens 32
@@ -51,8 +51,8 @@ The [engine guide](docs/qwen3-8b-w8a8/README.md) covers tests, operator fixtures
 |---|---|
 | `crates/inferrous-qwen3` | The Qwen3-8B W8A8 engine: host runtime, device kernels, tests and tools |
 | `docs/` | All documentation, indexed in [docs/README.md](docs/README.md): the engine guide, benchmarks, validation, safety contract, optimization records and result summaries, plus plans and research |
-| `vendor/cuda-oxide` | Rust-to-PTX compiler and runtime (submodule; Apache-2.0) |
+| `vendor/cuda-rust` | NVIDIA cuda-rust: host runtime crates and the cuda-oxide Rust-to-PTX compiler (submodule; Apache-2.0) |
 
 ## License
 
-Copyright (c) 2026 Chris Allen <cma@bitemyapp.com>. Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option. cuda-oxide is Apache-2.0 (NVIDIA CORPORATION & AFFILIATES); model weights carry their own licences (Qwen3: Apache-2.0).
+Copyright (c) 2026 Chris Allen <cma@bitemyapp.com>. Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option. NVIDIA cuda-rust, including cuda-oxide, is Apache-2.0 (NVIDIA CORPORATION & AFFILIATES); model weights carry their own licences (Qwen3: Apache-2.0).

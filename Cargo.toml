@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/inferrous-qwen3"]
-exclude = ["vendor/cuda-oxide"]
+exclude = ["vendor/cuda-rust"]
 resolver = "2"
 
 [workspace.package]

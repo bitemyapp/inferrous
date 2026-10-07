@@ -5,7 +5,7 @@ use crate::{
     model::{Generation, Model, Request, sha},
 };
 use anyhow::Result;
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig, PinnedHostBuffer};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, PinnedHostBuffer, simt::LaunchConfig};
 use std::{
     collections::BTreeMap,
     fs,

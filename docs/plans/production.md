@@ -16,7 +16,7 @@ This document lists everything required to turn the engine into a production ser
 | Outputs | Every step copies all 151,936 logits to pinned host memory and SHA-256 hashes them. | Keep as a verification mode; it cannot scale to batches. |
 | Correctness | Bit-exact regression against the original Rust oracle; independent operator fixtures; sanitizers; graph/eager replay. | The full-model Torch gate fails (DISC-001). No perplexity or eval data. |
 | Interface | CLI binary printing JSON per request. | Network API, auth, metrics, health, lifecycle. |
-| Build | nightly-2026-04-03 plus a cuda-oxide codegen backend; tests run only on the development workstation. | Reproducible toolchain, container, GPU CI. |
+| Build | nightly-2026-08-28 plus the cuda-oxide codegen backend from NVIDIA cuda-rust; tests run only on the development workstation. | Reproducible toolchain, container, GPU CI. |
 
 Hardware assumed throughout: one RTX PRO 6000 Blackwell Max-Q (SM120, 97,887 MiB, GDDR7 at about 1.7 TB/s peak and about 1.6 TB/s sustained, 300 W) per replica.
 
@@ -197,11 +197,11 @@ Ordered by expected value once batching lands:
 4. **Small-kernel fusions** (O quantization into the O prologue, Q/K preparation into attention), revalidated under batching.
 5. **KV quantization** (FP8 or INT8 per head and block). This halves KV traffic, the dominant cost at high batch or long context, but it is a D1 contract change.
 6. **Tighter head coding** (about 0.7% at batch 1; less as batches amortize the weights).
-7. **First-class PDL in cuda-oxide** (launch attribute and `griddepcontrol` intrinsics), replacing the graph rewrite and inline PTX.
+7. **Adopt cuda-rust's PDL support.** Upstream now provides `griddepcontrol` intrinsics (`grid_dependency::wait` and `trigger_dependents`) and a `cuda-core` launch helper with programmatic stream serialization; the generated SIMT launch methods do not expose it yet. Use them in place of the inline PTX, and extend the launch macros so the graph rewrite becomes unnecessary.
 
 ### W12. Build, packaging, CI and deployment
 
-- Build the cuda-oxide codegen backend from `vendor/cuda-oxide` inside the build, never from an out-of-tree checkout, and pin the toolchain and CUDA versions (12.8 for builds, 13.1 for sanitizer).
+- Build the cuda-oxide codegen backend from `vendor/cuda-rust` inside the build, never from an out-of-tree checkout, and pin the toolchain and CUDA versions (12.8 for builds, 13.1 for sanitizer).
 - A container image with the CUDA runtime matched to the minimum driver (580.x tested). Run `nvidia-smi` and device capability checks at startup.
 - GPU CI: a dedicated SM120 host registered as a CI runner. Every pull request runs both build variants, operator fixtures, the graph/eager replay and the hash oracle. Nightly runs add sanitizers, A/B performance against the previous release, and the eval subset.
 - A model bundle pipeline: `tools/prepare.py` becomes a versioned, reproducible export with manifest hashes, provenance (source revision, tool versions) and optional signing. The service refuses bundles whose root hash is not on an allowlist.

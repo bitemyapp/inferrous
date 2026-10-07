@@ -1,4 +1,5 @@
-# Matches the cuda-oxide codegen backend pin (vendor/cuda-oxide/rust-toolchain.toml).
+# Matches the cuda-oxide (SIMT) codegen backend pin in NVIDIA/cuda-rust
+# (vendor/cuda-rust/cuda-oxide/rust-toolchain.toml).
 [toolchain]
-channel = "nightly-2026-04-03"
+channel = "nightly-2026-08-28"
 components = ["rust-src", "rustc-dev", "llvm-tools", "rustfmt", "clippy"]

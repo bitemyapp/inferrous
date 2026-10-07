@@ -14,6 +14,10 @@
 - [Production plan](plans/production.md): decisions, workstreams and milestones for serving traffic.
 - [Qwen3.6-35B-A3B FP8](plans/qwen3.6-35b-a3b-fp8.md): implementation plan for the next model.
 
+## Maintenance
+
+- [Migration to NVIDIA cuda-rust](migrations/cuda-rust.md): what changed, correctness, and compile-time and runtime before/after.
+
 ## Research
 
 - [Modern open models for one RTX PRO 6000](research/single-gpu-model-candidates.md): candidates ranked by decode speed and coding quality.

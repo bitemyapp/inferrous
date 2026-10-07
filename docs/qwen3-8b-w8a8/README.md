@@ -12,12 +12,12 @@ On the workstation, optimized decode is **182.3 / 178.2 / 170.5 tokens/s** for 5
 
 ## Reproduce
 
-Commands run from the repository root on Linux with an SM120 GPU, using `clean-work/` as scratch space for bundles, fixtures and results. The cuda-oxide revision is `3d7cbe18f58981b88401ea70dee21e7996427956`; the toolchain is `nightly-2026-04-03`. No CUDA C++ inference kernels or vendor BLAS calls are used by this crate.
+Commands run from the repository root on Linux with an SM120 GPU, using `clean-work/` as scratch space for bundles, fixtures and results. The vendored NVIDIA cuda-rust revision is `6921d3ee07e28ec62895ea40fc2fef39977ca411`; the toolchain is `nightly-2026-08-28`. The optimization records through round 6 were measured with the earlier cuda-oxide fork (`3d7cbe18`, `nightly-2026-04-03`); the [cuda-rust migration record](../migrations/cuda-rust.md) compares the two. No CUDA C++ inference kernels or vendor BLAS calls are used by this crate.
 
 ```sh
-# Build the codegen backend once from the pinned vendor/cuda-oxide.
-(cd vendor/cuda-oxide/crates/rustc-codegen-cuda && cargo build --release)
-export CUDA_OXIDE_BACKEND=$PWD/vendor/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
+# Build the codegen backend once from the pinned vendor/cuda-rust.
+(cd vendor/cuda-rust/cuda-oxide/crates/rustc-codegen-cuda && cargo build --release)
+export CUDA_OXIDE_BACKEND=$PWD/vendor/cuda-rust/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
 crates/inferrous-qwen3/tools/cuda.sh build
 export CLEAN_OPERATOR_FIXTURES="$PWD/clean-work/operator-fixtures-64"
 export CLEAN_MODEL_BUNDLE="$PWD/clean-work/model-bundle"

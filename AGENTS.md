@@ -8,4 +8,4 @@
 ## Documentation layout
 
 - All documentation lives under `docs/`; only `README.md` and `AGENTS.md` stay at the repository root. Keep `docs/README.md` up to date as the index.
-- Engine documentation goes in `docs/<engine>/` (for example `docs/qwen3-8b-w8a8/`): optimization records in `optimization/round-N.md` and generated result summaries in `results/`. Plans go in `docs/plans/`, research in `docs/research/`.
+- Engine documentation goes in `docs/<engine>/` (for example `docs/qwen3-8b-w8a8/`): optimization records in `optimization/round-N.md` and generated result summaries in `results/`. Plans go in `docs/plans/`, research in `docs/research/`, and toolchain or dependency migration records in `docs/migrations/`.

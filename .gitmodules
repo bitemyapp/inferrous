@@ -1,3 +1,3 @@
-[submodule "vendor/cuda-oxide"]
-	path = vendor/cuda-oxide
-	url = https://github.com/bitemyapp/cuda-oxide.git
+[submodule "vendor/cuda-rust"]
+	path = vendor/cuda-rust
+	url = https://github.com/NVIDIA/cuda-rust.git
