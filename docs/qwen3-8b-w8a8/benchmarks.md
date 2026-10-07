@@ -1,0 +1,126 @@
+# Qwen3-8B INT8 benchmark comparison
+
+Measured on one RTX PRO 6000 Blackwell Max-Q (96 GB, 300 W), 2026-10-02–03. The independent cuda-oxide baseline is `bd6e4448`; the retained optimized runtime is `b88d941f`. Final measurements are in `round5/round5-final.jsonl`, with A/B/B/A controls in the same directory; the two stock winners were rerun in `round5/round5-stock-fa2.jsonl` and `round5/round5-stock-b12x.jsonl`. Current raw measurements, percentile summaries, environment details, profiles and regression reports are in [2026-10-03 results summary](results/round-3.md); earlier comparisons remain in [2026-10-02 results summary](results/rounds-1-2.md).
+
+**Accuracy limitation:** independent operator tests pass, and every optimization preserves the original Rust baseline's complete vocabulary logits. However, the full-model Torch numerical comparison fails its declared tolerance. Matching three greedy tokens does not establish quality. See [discrepancy notes](discrepancies.md). These are performance measurements of an experimental implementation.
+
+## Results
+
+All rows use the same Qwen3-8B revision, exported INT8 weights and FP32 channel scales. The body has per-channel symmetric INT8 weights and dynamic per-token INT8 activations; embeddings, output-head values and KV cache remain BF16. The GPU head uses lossless 12-bit storage plus exceptions, reconstructing the original BF16 bits before arithmetic; it introduces no additional quantization. No FP8 substitution, smoothing, rotations, prefix caching or speculative decoding. One request at a time, greedy generation, exactly 32 output tokens, EOS ignored, context limit 4096. Each run uses three warmups and twenty measured resident requests. The sixth pass runs original/candidate/candidate/original serially and pools forty measured requests per implementation and shape; stock columns retain twenty per shape and come from the fifth pass. GPU jobs run serially, without fixed application clocks.
+
+| Prompt tokens | Original decode tok/s | Optimized decode tok/s | Stock FA2 decode tok/s | Stock B12X decode tok/s |
+|---:|---:|---:|---:|---:|
+| 5 | 66.0 | **182.3** | 136.1 | 144.4 |
+| 129 | 57.1 | **178.2** | 140.4 | 143.3 |
+| 512 | 40.3 | **170.5** | 140.2 | 142.9 |
+
+Both stock columns use vLLM + Humming INT8 + native full CUDA graphs. FA2 is FlashAttention; B12X is an alternative Blackwell attention backend. B12X wins stock decode, but FA2 wins stock end-to-end latency for these 32-token requests:
+
+| Prompt tokens | Original API ms | Optimized API ms | Stock FA2 API ms | Stock B12X API ms |
+|---:|---:|---:|---:|---:|
+| 5 | 502.8 | **178.3** | 244.6 | 252.4 |
+| 129 | 743.4 | **192.9** | 237.4 | 254.0 |
+| 512 | 1572.6 | **226.2** | 243.3 | 254.8 |
+
+The clean implementation exceeds the stock decode winner by **26.2% / 24.4% / 19.3%** and reduces request latency versus FA2 by **27.1% / 18.8% / 7.0%**. Stock was not rerun in the sixth pass; these compare against the fifth pass's fresh stock runs. Long requests remain the closest comparison: the 512-token median is 17.1 ms below that stock run and 16.5 ms (6.8%) below the best stock median observed, 242.7 ms. Long prefill (first step 44.1 ms versus stock's roughly 22 ms first token) is the main remaining gap.
+
+
+The fourth pass adds gate/up/activation fusion and CTA-local bulk tensor copies for large prefill projections. A/B/B/A runs of the preceding and new binaries pool forty measured requests per shape, retaining every individual run:
+
+| Prompt tokens | Previous decode tok/s | New decode tok/s | Previous API ms | New API ms |
+|---:|---:|---:|---:|---:|
+| 5 | 165.95 | 167.09 | 195.22 | 193.96 |
+| 129 | 161.36 | 162.18 | 211.26 | 210.37 |
+| 512 | 156.28 | 157.34 | 244.54 | 241.91 |
+
+This is another **0.5–0.7% decode gain** and **0.4–1.1% lower request latency**. The long first step drops from 45.91 to 44.61 ms; the short/medium first steps are effectively unchanged at 8.16 / 18.96 ms. Recorded stock FA2 first-token latencies are 15.9 / 16.0 / 22.3 ms, so long prefill remains the main gap. The opening cold baseline was faster than later controls; no improvement is attributed to that clock/temperature difference. All logit hashes are unchanged. See [round 4 record](optimization/round-4.md) for rejected variants, compiler routing, the removed cluster-copy memory regression, and validation.
+
+The fifth pass retains pinned double-buffered result transfers, native nearest-even integer conversion, and hardware integer warp reductions. It also evaluates and removes lossless INT8 compression, an overlapped TMA variant, four-step graphs, a transposed tensor-core decode and two exact BF16 reciprocal algorithms. All preserve hashes, but those larger experiments did not establish a speed win.
+
+| Prompt tokens | Previous decode tok/s | New decode tok/s | Previous API ms | New API ms |
+|---:|---:|---:|---:|---:|
+| 5 | 167.134 | 169.625 | 193.908 | 191.081 |
+| 129 | 162.258 | 164.593 | 210.222 | 207.475 |
+| 512 | 157.350 | 159.470 | 241.843 | 238.948 |
+
+A/B/B/A gives **1.3–1.5% more decode throughput** and **1.2–1.5% lower API latency**. Both new runs beat both controls on all three shapes. First-step medians are 8.064 / 18.836 / 44.271 ms. These are ordinary single-step measurements; the rejected multi-step timing representation is not retained. See [round 5 record](optimization/round-5.md) for proofs, rejected implementations and the full validation record.
+
+The sixth pass keeps DRAM busy between projections. It adds L2 prefetch of upcoming weights (from attention-window CTAs and from each projection warp before it waits), a KV-prefix prefetch during QKV, hoisted cold loads in the latency-bound kernels, and programmatic graph edges with `griddepcontrol`. Prefill is unchanged. Serial A/B/B/A against the round-5 executable pools forty measured requests per shape:
+
+| Prompt tokens | Previous decode tok/s | New decode tok/s | Previous API ms | New API ms |
+|---:|---:|---:|---:|---:|
+| 5 | 170.278 | 182.270 | 190.356 | 178.290 |
+| 129 | 165.292 | 178.205 | 206.480 | 192.860 |
+| 512 | 160.138 | 170.496 | 237.988 | 226.197 |
+
+That is **6.5–7.8% more decode throughput** and **5.0–6.6% lower API latency**, with every hash unchanged. Both new runs beat both controls on all three shapes. First-step medians are unchanged at 7.95 / 18.64 / 44.12 ms. See [round 6 record](optimization/round-6.md) for the step-time accounting, microbenchmarks, rejected variants and validation.
+
+Timing boundaries matter: Rust's first step excludes request input/scratch allocation; stock first-token latency includes dispatch. Decode is 31 divided by the interval for tokens 2–32. Rust step timing includes graph launches, full logit transfer and GPU greedy selection; vLLM uses first/last token timestamps. Public API timing brackets each generation call. Rust additionally includes full-vocabulary checksumming and detokenization; hashes overlap the next GPU step, with the final hash inside API timing. vLLM disables detokenization. Both use persistent allocation pools; Rust resizes prefill scratch when the prompt length changes. Every prompt is recomputed, with no prefix reuse. Loading/JIT/decode capture is outside warm measurements. These boundaries show the usable implementations, not isolated kernel throughput. Output sequences need not agree across engines; shape and generated-token count do. No accuracy equivalence is inferred from shared weights.
+
+The separate memory measurements are instrumented runs and do not contribute to throughput timings. Original and first-pass Rust versions sampled 10,286 MiB of process GPU memory (`memory.json`). The second pass sampled **10,548 MiB** (`round2-memory.json`). The third pass retains those full-capacity KV caches and scratch, stores the head losslessly, and samples **10,256 MiB** (`round3-memory.json`). The fourth pass remains at **10,256 MiB** (`round4/round4-memory.json`); the rejected cluster-copy variant increased memory and is not retained. These are sampled maxima, not exact peaks. The fifth pass remains at **10,256 MiB** (`round5/round5-memory.json`); the new pinned transfer buffers reside on the host.
+
+## Which stock harness
+
+The fastest **locally tested** eligible harness for this workload is vLLM 0.30.0 with unmodified upstream Humming, dynamic INT8 activations and native CUDA graphs. FlashAttention wins stock request latency; B12X wins stock decode. This is an empirical anchor, not a claim about every engine, batch size or context length. Humming supports INT8 activation and weight types; its other activation types must not be substituted in this comparison. See [Humming's support matrix](https://github.com/vllm-project/humming#support-matrix).
+
+| vLLM configuration | Decode tok/s, 5 / 129 / 512 | API ms, 5 / 129 / 512 |
+|---|---|---|
+| Triton INT8, default compilation/graphs, FA2 | 77.9 / 77.8 / 77.8 | 414.9 / 416.9 / 424.7 |
+| Triton INT8, eager, FA2 | 113.3 / 110.9 / 110.2 | 292.3 / 298.5 / 306.5 |
+| Triton INT8, graph capture size 1, FA2 | 77.9 / 77.8 / 77.7 | 415.1 / 417.0 / 425.2 |
+| Triton INT8, V1 runner, FA2 | 78.2 / 78.2 / 78.1 | 413.1 / 415.4 / 423.5 |
+| Humming INT8, eager, FA2 | 78.1 / 76.9 / 77.2 | 423.8 / 430.1 / 428.5 |
+| Triton INT8, native full graphs, FA2 | 126.6 / 130.1 / 129.3 | 257.7 / 256.5 / 267.2 |
+| Humming INT8, native full graphs, FA2 (previous pass) | 140.6 / 140.5 / 140.3 | 236.9 / 237.4 / 242.7 |
+| Humming INT8, native full graphs, FA2 (third pass) | 136.1 / 140.4 / 140.0 | 243.8 / 237.2 / 244.0 |
+| **Humming INT8, native full graphs, FA2 (fifth pass)** | **136.1 / 140.4 / 140.2** | **244.6 / 237.4 / 243.3** |
+| Triton INT8, eager, B12X | 37.8 / 37.7 / 37.7 | 877.9 / 878.9 / 878.8 |
+| Humming INT8, native full graphs, B12X (previous pass) | 144.4 / 143.4 / 142.9 | 251.7 / 253.5 / 253.8 |
+| Humming INT8, native full graphs, B12X (third pass) | 144.4 / 143.3 / 142.9 | 252.3 / 254.1 / 254.8 |
+| **Humming INT8, native full graphs, B12X (fifth pass)** | **144.4 / 143.3 / 142.9** | **252.4 / 254.0 / 254.8** |
+
+Native graphs use supported settings: compilation mode 0, graph mode FULL, capture sizes `[1]`, custom operations `['all']`. This avoids the slower default compiled configuration here. Default compiled Humming also encountered a Torch `RecursionError`; disabling compilation while retaining native CUDA graphs resolved it without source patches. B12X requires block size 128 in this setup.
+
+Other candidates screened:
+
+- vLLM's default Cutlass INT8 path rejects SM120. The stock Triton path and Humming work, as do the Rust INT8 tensor-core kernels; this is a backend limitation, not absence of INT8 hardware. See the pinned [Cutlass](https://github.com/vllm-project/vllm/blob/v0.30.0/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py) and [Triton](https://github.com/vllm-project/vllm/blob/v0.30.0/vllm/model_executor/kernels/linear/scaled_mm/triton.py) implementations.
+- SGLang 0.5.21 / sgl-kernel 0.4.7: the required `int8_scaled_mm` probe rejects this device capability. No successful engine timing is claimed. Its [W8A8 implementation](https://github.com/sgl-project/sglang/blob/v0.5.21/python/sglang/srt/layers/quantization/w8a8_int8.py) routes through that operator.
+- TensorRT-LLM: the current PyTorch quantization matrix did not provide a matching INT8 W8A8 path for this experiment; the old TensorRT backend has been removed. This was documentation screening, not a benchmark or proof that every historical version is incapable. Sources: [quantization matrix](https://nvidia.github.io/TensorRT-LLM/latest/features/quantization.html), [backend removal](https://nvidia.github.io/TensorRT-LLM/latest/legacy/tensorrt-backend-removal.html).
+- LMDeploy: its model matrix did not verify Qwen3 CUDA W8A8 support; no timing is claimed. See [supported models](https://lmdeploy.readthedocs.io/en/latest/supported_models/supported_models.html).
+
+## Reproduce the stock winner
+
+Commands run from the repository root, with scratch files under `clean-work/`. Environment: `clean-work/vllm-venv`. Pinned components:
+
+| Component | Version |
+|---|---|
+| vLLM | 0.30.0 |
+| Torch | 2.13.0+cu130 |
+| Transformers | 5.18.0 |
+| compressed-tensors | 0.17.0 |
+| humming-kernels | 0.1.16.post13+g5d6e603a0 |
+| Humming source | `5d6e603a0332f85ba1d4c3da05298092d9a4a448` |
+| B12X | 1.3.0 |
+| Driver | 580.159.04 |
+| CUDA_HOME for stock engines | /usr/local/cuda-13.1 |
+
+The Humming package was built from the pinned official source without patches. The normal compressed-tensors **linear-backend adapter** does not carry the activation schema into Humming in this version. Use the **Humming quantization method**, which reads the checkpoint's INT8 input schema. The harness asserts that schema before running. This distinction prevents accidentally timing W8A16.
+
+```sh
+CUDA_HOME=/usr/local/cuda-13.1 VLLM_USE_FLASHINFER_SAMPLER=0 \
+  clean-work/vllm-venv/bin/python crates/inferrous-qwen3/tools/bench_engines.py \
+  vllm --model clean-work/model-bundle/hf \
+  --requests clean-work/workloads/requests.json \
+  --quantization humming --graphs-without-compile --attention-backend FLASH_ATTN \
+  --output clean-work/new-stock-run.jsonl --repeat 23
+```
+
+For the decode winner, change `FLASH_ATTN` to `B12X` and use another output path. For the best Triton run, change quantization to `compressed-tensors` and add `--linear-backend triton`. All harnesses preserve raw timestamps and token IDs. `tools/summarize.py` reproduces p50/p95/p99 API latency and throughput from the JSONL files. These twenty- or forty-sample tails are descriptive, not production p99s.
+
+## Validation and remaining gap
+
+The second pass adds shared-memory INT8 prefill tiles, exact norm/quantization fusion, coordinate-major K caches, shared and pipelined attention tiles, grouped query-head prefill, CUDA decode graphs, GPU greedy selection, overlapping logit hashes, producer-computed MLP maxima, combined Q/K preparation, and grouped decode projections. Each retained lever has its own commit, measurements and behavior argument in [round 2 record](optimization/round-2.md). The first pass is documented in [round 1 record](optimization/round-1.md). Slower experiments were removed; their measurements remain available. The third pass adds lossless BF16 head packing and fused decode projection/residual sums, documented in [round 3 record](optimization/round-3.md). The fourth pass fuses gate/up with SwiGLU and stages large prefill tiles using CTA-local TMA, documented in [round 4 record](optimization/round-4.md). The fifth pass adds pinned readback, native rounding and integer reductions, documented in [round 5 record](optimization/round-5.md).
+
+Nine tests pass in optimized and checked builds: independent operators, distinct-weight fused gate/up/activation, 1,328,443 native-rounding boundary and bit-pattern inputs against independent f64 nearest-even, exhaustive host/GPU BF16 reconstruction, admission/ties, capture cleanup and nineteen changing-input eager/graph comparisons. The latter cover seventeen prompt lengths through 4093, every graph capacity, long-to-short cache reuse and stop handling. All 138 final candidate requests preserve the original token IDs and all 4,416 complete-vocabulary hashes. The checked build matches all three workloads. Operator/argmax/packing memcheck, racecheck and synccheck, plus 512-token prefill and three-output full-model memcheck, report zero errors or hazards. Rust formatting and Python syntax checks pass. The restored optimized binary has the same SHA-256 as the measured binary. Results are retained beside the raw measurements. None of these replaces the still-failing independent full-model numerical gate.
+
+The final 512-token profile attributes 61.4% of GPU time to decode projections, 8.2% to the packed BF16 head, 9.0% to large prefill matrices and 5.1% to prefill attention. Longer prefill is the remaining performance target; preserving exact baseline arithmetic rules out replacing ordered floating-point reductions with a different reduction schedule without a separate numerical/quality decision.

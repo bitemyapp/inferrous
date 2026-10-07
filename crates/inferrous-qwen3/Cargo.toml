@@ -1,0 +1,25 @@
+[package]
+name = "inferrous-qwen3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+gpu = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokenizers = { version = "=0.21.4", default-features = false, features = ["onig"] }
+cuda-core = { path = "../../vendor/cuda-oxide/crates/cuda-core", optional = true }
+cuda-device = { path = "../../vendor/cuda-oxide/crates/cuda-device", optional = true }
+cuda-host = { path = "../../vendor/cuda-oxide/crates/cuda-host", optional = true }
+
+[[bin]]
+name = "inferrous-qwen3"
+path = "src/main.rs"
+required-features = ["gpu"]

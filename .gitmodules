@@ -1,0 +1,3 @@
+[submodule "vendor/cuda-oxide"]
+	path = vendor/cuda-oxide
+	url = https://github.com/bitemyapp/cuda-oxide.git

@@ -1,0 +1,4 @@
+/target/
+/clean-work/
+__pycache__/
+*.safetensors
