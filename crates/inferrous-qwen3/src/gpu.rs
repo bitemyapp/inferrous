@@ -98,6 +98,15 @@ struct Workspace {
 }
 impl Workspace {
     fn new(stream: &Arc<CudaStream>, rows: usize) -> Result<Self> {
+        Self::with_shape(stream, rows, 1, CONTEXT)
+    }
+
+    fn with_shape(
+        stream: &Arc<CudaStream>,
+        rows: usize,
+        output_rows: usize,
+        score_stride: usize,
+    ) -> Result<Self> {
         let f = |width| -> Result<Buffer> { Ok(DeviceBuffer::zeroed(stream, rows * width)?) };
         let mut workspace = Self {
             hidden: f(HIDDEN)?,
@@ -107,7 +116,7 @@ impl Workspace {
             k: f(1024)?,
             v: f(1024)?,
             attention: f(HIDDEN)?,
-            scores: f(32 * CONTEXT)?,
+            scores: f(32 * score_stride)?,
             o: f(HIDDEN)?,
             gate: f(12288)?,
             up: f(12288)?,
@@ -119,8 +128,8 @@ impl Workspace {
             map12: None,
             scales: f(1)?,
             maxima: DeviceBuffer::zeroed(stream, rows)?,
-            logits: DeviceBuffer::zeroed(stream, VOCAB)?,
-            next: DeviceBuffer::zeroed(stream, 1)?,
+            logits: DeviceBuffer::zeroed(stream, output_rows * VOCAB)?,
+            next: DeviceBuffer::zeroed(stream, output_rows)?,
         };
         if rows >= 256 {
             workspace.map4 = Some(crate::tensor::map(

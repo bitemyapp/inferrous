@@ -2386,4 +2386,439 @@ pub mod device {
             }
         }
     }
+    // Paged, ragged sequence kernels. Host validation owns page-table safety.
+    #[kernel]
+    pub fn prepare_qk_paged(
+        mut q: DisjointSlice<f32>,
+        mut k: DisjointSlice<f32>,
+        v: &[f32],
+        qgain: &[f32],
+        kgain: &[f32],
+        table: &[f32],
+        row_info: &[u32],
+        page_table: &[u32],
+        pages_per_sequence: u32,
+        mut ck: DisjointSlice<u16>,
+        mut cv: DisjointSlice<u16>,
+    ) {
+        static mut SUM: SharedArray<f32, 128> = SharedArray::UNINIT;
+        dependency_wait();
+        let p = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SUM) };
+        let block = thread::blockIdx_x() as usize;
+        let row = block / 40;
+        let h = block % 40;
+        let is_q = h < 32;
+        let head = if is_q { h } else { h - 32 };
+        let t = thread::threadIdx_x() as usize;
+        let start = row * (if is_q { 4096 } else { 1024 }) + head * 128;
+        let value = if is_q {
+            unsafe { *q.get_unchecked_mut(start + t) }
+        } else {
+            unsafe { *k.get_unchecked_mut(start + t) }
+        };
+        // Gains and the RoPE row are cold in L2; load them before the reduction.
+        let pos = row_info[row * 2 + 1] as usize;
+        let slot = row_info[row * 2] as usize;
+        let page = page_table[slot * pages_per_sequence as usize + pos / 64] as usize;
+        let within = pos % 64;
+        let gain = if is_q { qgain[t] } else { kgain[t] };
+        let (c, s) = if t < 64 {
+            (table[pos * 128 + t], table[pos * 128 + t + 64])
+        } else {
+            (0.0, 0.0)
+        };
+        // Original norm used 256 slots; its upper half contained positive zero.
+        unsafe {
+            *p.add(t) = add(add(0.0, mul(value, value)), 0.0);
+        }
+        thread::sync_threads();
+        if t < 32 {
+            let mut sum = unsafe {
+                add(
+                    add(*p.add(t), *p.add(t + 64)),
+                    add(*p.add(t + 32), *p.add(t + 96)),
+                )
+            };
+            let mut d = 16;
+            while d > 0 {
+                sum = add(sum, f32::from_bits(warp::shuffle_down(sum.to_bits(), d)));
+                d /= 2;
+            }
+            if t == 0 {
+                unsafe {
+                    *p = sum;
+                }
+            }
+        }
+        thread::sync_threads();
+        let inv = rsqrt(add(div(unsafe { *p }, 128.0), 1e-6));
+        let normalized = bf(mul(mul(value, inv), gain));
+        // All threads consume the sum before this shared allocation is reused.
+        thread::sync_threads();
+        unsafe {
+            *p.add(t) = normalized;
+        }
+        thread::sync_threads();
+        if t < 64 {
+            let a = unsafe { *p.add(t) };
+            let b = unsafe { *p.add(t + 64) };
+            let first = bf(add(mul(a, c), -mul(b, s)));
+            let second = bf(add(mul(b, c), mul(a, s)));
+            unsafe {
+                if is_q {
+                    *q.get_unchecked_mut(start + t) = first;
+                    *q.get_unchecked_mut(start + t + 64) = second;
+                } else {
+                    *k.get_unchecked_mut(start + t) = first;
+                    *k.get_unchecked_mut(start + t + 64) = second;
+                    *ck.get_unchecked_mut(page * 65536 + (head * 128 + t) * 64 + within) =
+                        (first.to_bits() >> 16) as u16;
+                    *ck.get_unchecked_mut(page * 65536 + (head * 128 + t + 64) * 64 + within) =
+                        (second.to_bits() >> 16) as u16;
+                }
+            }
+        }
+        if !is_q {
+            // Each K head also appends its matching V coordinates exactly once.
+            unsafe {
+                *cv.get_unchecked_mut((page * 64 + within) * 1024 + head * 128 + t) =
+                    (v[start + t].to_bits() >> 16) as u16;
+            }
+        }
+    }
+    #[kernel]
+    pub fn attention_scores_paged(
+        q: &[f32],
+        k: &[u16],
+        row_info: &[u32],
+        page_table: &[u32],
+        pages_per_sequence: u32,
+        stride: u32,
+        tiles: u32,
+        mut scores: DisjointSlice<f32>,
+    ) {
+        dependency_wait();
+        static mut QUERY: SharedArray<f32, 128> = SharedArray::UNINIT;
+        static mut TILE: SharedArray<u32, 4096, 16> = SharedArray::UNINIT;
+        let block = thread::blockIdx_x() as usize;
+        let query = block / tiles as usize;
+        let base = block % tiles as usize * 64;
+        let t = thread::threadIdx_x() as usize;
+        let end = row_info[query / 32 * 2 + 1] as usize + 1;
+        if base >= end {
+            return;
+        }
+        let slot = row_info[query / 32 * 2] as usize;
+        let page = page_table[slot * pages_per_sequence as usize + base / 64] as usize;
+        let kv = query % 32 / 4;
+        let query_values = unsafe { SharedArray::as_raw_mut_ptr(&raw mut QUERY) };
+        let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+        let halves = tile.cast::<u16>();
+        unsafe {
+            *query_values.add(t) = q[query * 128 + t];
+            let mut piece = 0;
+            while piece < 8 {
+                let i = t + piece * 128;
+                cuda_device::async_copy::cp_async_ca_16(
+                    tile.add(i * 4),
+                    k.as_ptr()
+                        .add(page * 65536 + (kv * 128 + i / 8) * 64 + i % 8 * 8)
+                        .cast::<u32>(),
+                );
+                piece += 1;
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+            cuda_device::async_copy::cp_async_wait_all();
+        }
+        thread::sync_threads();
+        if t < 64 && base + t < end {
+            let mut sum = 0.0;
+            let mut c = 0;
+            while c < 128 {
+                sum = add(
+                    sum,
+                    mul(
+                        unsafe { *query_values.add(c) },
+                        widen(unsafe { *halves.add(c * 64 + t) }),
+                    ),
+                );
+                c += 1;
+            }
+            unsafe {
+                *scores.get_unchecked_mut(query * stride as usize + base + t) =
+                    mul(sum, 0.08838834764831845_f32);
+            }
+        }
+    }
+
+    /// Fixed per-query softmax tree, independent of cache layout and batch size.
+    #[kernel]
+    pub fn attention_softmax_paged(mut scores: DisjointSlice<f32>, row_info: &[u32], stride: u32) {
+        dependency_wait();
+        static mut REDUCE: SharedArray<f32, 128> = SharedArray::UNINIT;
+        let query = thread::blockIdx_x() as usize;
+        let t = thread::threadIdx_x() as usize;
+        let end = row_info[query / 32 * 2 + 1] as usize + 1;
+        let offset = query * stride as usize;
+        let reduce = unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCE) };
+        let mut maximum = f32::NEG_INFINITY;
+        let mut j = t;
+        while j < end {
+            maximum = maximum.max(unsafe { *scores.get_unchecked_mut(offset + j) });
+            j += 128;
+        }
+        unsafe {
+            *reduce.add(t) = maximum;
+        }
+        thread::sync_threads();
+        let mut d = 64;
+        while d > 0 {
+            if t < d {
+                unsafe {
+                    *reduce.add(t) = (*reduce.add(t)).max(*reduce.add(t + d));
+                }
+            }
+            thread::sync_threads();
+            d /= 2;
+        }
+        let maximum = unsafe { *reduce };
+        let mut total = 0.0;
+        let mut j = t;
+        while j < end {
+            let s = exp(add(
+                unsafe { *scores.get_unchecked_mut(offset + j) },
+                -maximum,
+            ));
+            unsafe {
+                *scores.get_unchecked_mut(offset + j) = s;
+            }
+            total = add(total, s);
+            j += 128;
+        }
+        thread::sync_threads();
+        unsafe {
+            *reduce.add(t) = total;
+        }
+        thread::sync_threads();
+        let mut d = 64;
+        while d > 0 {
+            if t < d {
+                unsafe {
+                    *reduce.add(t) = add(*reduce.add(t), *reduce.add(t + d));
+                }
+            }
+            thread::sync_threads();
+            d /= 2;
+        }
+        let denominator = unsafe { *reduce };
+        let mut j = t;
+        while j < end {
+            unsafe {
+                *scores.get_unchecked_mut(offset + j) =
+                    div(*scores.get_unchecked_mut(offset + j), denominator);
+            }
+            j += 128;
+        }
+    }
+
+    /// Ordered PV accumulation with a page lookup per 64-token block.
+    #[kernel]
+    pub fn attention_values_paged(
+        scores: &[f32],
+        v: &[u16],
+        row_info: &[u32],
+        page_table: &[u32],
+        pages_per_sequence: u32,
+        stride: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        dependency_wait();
+        let block = thread::blockIdx_x() as usize;
+        let query = block / 4;
+        let coordinate = block % 4 * 32 + thread::threadIdx_x() as usize;
+        let slot = row_info[query / 32 * 2] as usize;
+        let end = row_info[query / 32 * 2 + 1] as usize + 1;
+        let kv = query % 32 / 4;
+        let mut sum = 0.0;
+        let mut base = 0;
+        while base < end {
+            let page = page_table[slot * pages_per_sequence as usize + base / 64] as usize;
+            let mut j = 0;
+            let count = (end - base).min(64);
+            #[unroll(8)]
+            while j < count {
+                sum = add(
+                    sum,
+                    mul(
+                        scores[query * stride as usize + base + j],
+                        widen(v[(page * 64 + j) * 1024 + kv * 128 + coordinate]),
+                    ),
+                );
+                j += 1;
+            }
+            base += 64;
+        }
+        unsafe {
+            *out.get_unchecked_mut(query * 128 + coordinate) = bf(sum);
+        }
+    }
+    #[kernel]
+    pub fn head_packed_rows(
+        x: &[f32],
+        output_rows: &[u32],
+        words: &[u32],
+        offsets: &[u32],
+        exceptions: &[u16],
+        mut out: DisjointSlice<f32>,
+        prefetch: u32,
+    ) {
+        let tid = thread::index_1d().get();
+        let lane = tid % 32;
+        let index = tid / 32;
+        let row = index % 151936;
+        if index < out.len() {
+            // Sixteen 96-word chunks form each packed row's contiguous 6144 bytes.
+            prefetch_row(
+                unsafe { words.as_ptr().add(row * 1536) }.cast(),
+                6144,
+                prefetch,
+                lane,
+            );
+        }
+        dependency_wait();
+        if index >= out.len() {
+            return;
+        }
+        let start = output_rows[index / 151936] as usize * 4096;
+        let mut sum = 0.0;
+        // Three coalesced word planes encode eight successive terms per lane.
+        // Keep the original lane-strided FP32 accumulation and warp sum order.
+        let mut group = 0;
+        while group < 16 {
+            let chunk = row * 16 + group;
+            let word = chunk * 96 + lane;
+            let w0 = words[word];
+            let w1 = words[word + 32];
+            let w2 = words[word + 64];
+            let j = group * 256 + lane;
+            sum = add(
+                sum,
+                mul(
+                    x[start + j],
+                    widen(unpack_code(w0, offsets, exceptions, chunk)),
+                ),
+            );
+            sum = add(
+                sum,
+                mul(
+                    x[start + j + 32],
+                    widen(unpack_code(w0 >> 12, offsets, exceptions, chunk)),
+                ),
+            );
+            sum = add(
+                sum,
+                mul(
+                    x[start + j + 64],
+                    widen(unpack_code(
+                        (w0 >> 24) | (w1 << 8),
+                        offsets,
+                        exceptions,
+                        chunk,
+                    )),
+                ),
+            );
+            sum = add(
+                sum,
+                mul(
+                    x[start + j + 96],
+                    widen(unpack_code(w1 >> 4, offsets, exceptions, chunk)),
+                ),
+            );
+            sum = add(
+                sum,
+                mul(
+                    x[start + j + 128],
+                    widen(unpack_code(w1 >> 16, offsets, exceptions, chunk)),
+                ),
+            );
+            sum = add(
+                sum,
+                mul(
+                    x[start + j + 160],
+                    widen(unpack_code(
+                        (w1 >> 28) | (w2 << 4),
+                        offsets,
+                        exceptions,
+                        chunk,
+                    )),
+                ),
+            );
+            sum = add(
+                sum,
+                mul(
+                    x[start + j + 192],
+                    widen(unpack_code(w2 >> 8, offsets, exceptions, chunk)),
+                ),
+            );
+            sum = add(
+                sum,
+                mul(
+                    x[start + j + 224],
+                    widen(unpack_code(w2 >> 20, offsets, exceptions, chunk)),
+                ),
+            );
+            group += 1;
+        }
+        let mut d = 16;
+        while d > 0 {
+            sum = add(sum, f32::from_bits(warp::shuffle_down(sum.to_bits(), d)));
+            d /= 2;
+        }
+        if lane == 0 {
+            unsafe {
+                *out.get_unchecked_mut(index) = bf(sum);
+            }
+        }
+    }
+    #[kernel]
+    pub fn select_token_rows(x: &[f32], mut out: DisjointSlice<u32>) {
+        static mut PARTIAL: SharedArray<u32, 96> = SharedArray::UNINIT;
+        dependency_wait();
+        let row = thread::blockIdx_x() as usize;
+        let t = thread::threadIdx_x() as usize;
+        let p = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PARTIAL) };
+        let mut value = f32::NEG_INFINITY;
+        let mut index = u32::MAX;
+        let mut bad = if x.len() == 0 { 1 } else { 0 };
+        let mut j = t;
+        while j < 151936 {
+            let v = x[row * 151936 + j];
+            if !v.is_finite() {
+                bad = 1;
+            }
+            if v > value || (v == value && (j as u32) < index) {
+                value = v;
+                index = j as u32;
+            }
+            j += 1024;
+        }
+        let (value, index, bad) = best_warp(value, index, bad);
+        if t % 32 == 0 {
+            unsafe {
+                *p.add(t / 32) = value.to_bits();
+                *p.add(32 + t / 32) = index;
+                *p.add(64 + t / 32) = bad;
+            }
+        }
+        thread::sync_threads();
+        if t < 32 {
+            let (_, index, bad) =
+                unsafe { best_warp(f32::from_bits(*p.add(t)), *p.add(32 + t), *p.add(64 + t)) };
+            if t == 0 {
+                unsafe {
+                    *out.get_unchecked_mut(row) = if bad == 0 { index } else { u32::MAX };
+                }
+            }
+        }
+    }
 }

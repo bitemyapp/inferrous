@@ -869,3 +869,192 @@ fn integer_rounding_boundaries() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn paged_attention_matches_contiguous_ragged_queries() -> anyhow::Result<()> {
+    let context = CudaContext::new(0)?;
+    let stream = context.default_stream();
+    let module = device::load(&context)?;
+    let stride = 4096;
+    let pages_per_sequence = stride / 64;
+    let table: Vec<u32> = (0..128).map(|i| (i * 37 % 128) as u32).collect();
+    let mut paged_k = vec![0_u16; 2 * stride * 1024];
+    let mut paged_v = paged_k.clone();
+    let mut contiguous = Vec::new();
+    for slot in 0..2 {
+        let mut k = vec![0_u16; stride * 1024];
+        let mut v = k.clone();
+        for position in 0..stride {
+            let page = table[slot * pages_per_sequence + position / 64] as usize;
+            for coordinate in 0..1024 {
+                let key =
+                    (((position * 17 + coordinate * 3 + slot * 31) % 37) as f32 - 18.0) / 32.0;
+                let value =
+                    (((position * 23 + coordinate * 7 + slot * 11) % 51) as f32 - 25.0) / 32.0;
+                let kb = (key.to_bits() >> 16) as u16;
+                let vb = (value.to_bits() >> 16) as u16;
+                k[coordinate * stride + position] = kb;
+                v[position * 1024 + coordinate] = vb;
+                paged_k[page * 65536 + coordinate * 64 + position % 64] = kb;
+                paged_v[(page * 64 + position % 64) * 1024 + coordinate] = vb;
+            }
+        }
+        contiguous.push((
+            DeviceBuffer::from_host(&stream, &k)?,
+            DeviceBuffer::from_host(&stream, &v)?,
+        ));
+    }
+    let queries: [(usize, usize); 6] = [(1, 4095), (0, 0), (1, 64), (0, 129), (0, 63), (1, 512)];
+    let info: Vec<u32> = queries
+        .iter()
+        .flat_map(|&(slot, pos)| [slot as u32, pos as u32])
+        .collect();
+    let q: Vec<f32> = (0..queries.len() * 4096)
+        .map(|i| ((i * 7 % 31) as f32 - 15.0) / 16.0)
+        .collect();
+    let q_device = DeviceBuffer::from_host(&stream, &q)?;
+    let info = DeviceBuffer::from_host(&stream, &info)?;
+    let page_table = DeviceBuffer::from_host(&stream, &table)?;
+    let k_device = DeviceBuffer::from_host(&stream, &paged_k)?;
+    let v_device = DeviceBuffer::from_host(&stream, &paged_v)?;
+    let mut scores = DeviceBuffer::<f32>::zeroed(&stream, queries.len() * 32 * stride)?;
+    let mut output = DeviceBuffer::<f32>::zeroed(&stream, queries.len() * 4096)?;
+    // SAFETY: the table is a permutation of the 128 allocated physical pages;
+    // every row selects one valid sequence/position and owns disjoint scratch.
+    unsafe {
+        module.attention_scores_paged(
+            &stream,
+            rows(queries.len() * 32 * 64, 128),
+            &q_device,
+            &k_device,
+            &info,
+            &page_table,
+            64,
+            stride as u32,
+            64,
+            &mut scores,
+        )?;
+        module.attention_softmax_paged(
+            &stream,
+            rows(queries.len() * 32, 128),
+            &mut scores,
+            &info,
+            stride as u32,
+        )?;
+        module.attention_values_paged(
+            &stream,
+            rows(queries.len() * 32 * 4, 32),
+            &scores,
+            &v_device,
+            &info,
+            &page_table,
+            64,
+            stride as u32,
+            &mut output,
+        )?;
+    }
+    let actual = output.to_host_vec(&stream)?;
+    let hint = DeviceBuffer::<i8>::zeroed(&stream, 1)?;
+    for (row, &(slot, position)) in queries.iter().enumerate() {
+        let q = DeviceBuffer::from_host(&stream, &q[row * 4096..(row + 1) * 4096])?;
+        let control = DeviceBuffer::from_host(&stream, &[0, position as u32])?;
+        let mut scores = DeviceBuffer::<f32>::zeroed(&stream, 32 * stride)?;
+        let mut expected = DeviceBuffer::<f32>::zeroed(&stream, 4096)?;
+        let tiles = (position + 1).div_ceil(64);
+        // SAFETY: one valid legacy query against its fully initialized cache.
+        unsafe {
+            module.attention_scores(
+                &stream,
+                rows(32 * tiles, 128),
+                &q,
+                &contiguous[slot].0,
+                &control,
+                tiles as u32,
+                &mut scores,
+            )?;
+            module.attention_softmax(&stream, rows(32, 128), &mut scores, &control, &hint, 0, 0)?;
+            module.attention_values(
+                &stream,
+                rows(32 * 4, 32),
+                &scores,
+                &contiguous[slot].1,
+                &control,
+                &mut expected,
+            )?;
+        }
+        let expected = expected.to_host_vec(&stream)?;
+        for (column, (&a, &e)) in actual[row * 4096..(row + 1) * 4096]
+            .iter()
+            .zip(&expected)
+            .enumerate()
+        {
+            assert_eq!(a.to_bits(), e.to_bits(), "row {row}, coordinate {column}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn paged_attention_reaches_native_context() -> anyhow::Result<()> {
+    let context = CudaContext::new(0)?;
+    let stream = context.default_stream();
+    let module = device::load(&context)?;
+    let stride = 32768;
+    let pages: Vec<u32> = (0..512).rev().collect();
+    // Uniform logits give exactly 1/32768. Constant V across keys has an
+    // independently known mean, with distinct values for every KV coordinate.
+    let values: Vec<u16> = (0..stride * 1024)
+        .map(|i| {
+            let v = ((i % 1024 % 97) as f32 - 48.0) / 16.0;
+            (v.to_bits() >> 16) as u16
+        })
+        .collect();
+    let k = DeviceBuffer::<u16>::zeroed(&stream, values.len())?;
+    let v = DeviceBuffer::from_host(&stream, &values)?;
+    let q = DeviceBuffer::<f32>::zeroed(&stream, 4096)?;
+    let info = DeviceBuffer::from_host(&stream, &[0, (stride - 1) as u32])?;
+    let table = DeviceBuffer::from_host(&stream, &pages)?;
+    let mut scores = DeviceBuffer::<f32>::zeroed(&stream, 32 * stride)?;
+    let mut output = DeviceBuffer::<f32>::zeroed(&stream, 4096)?;
+    // SAFETY: the single sequence maps all 512 pages exactly once, and its
+    // visible prefix is fully initialized through the final native position.
+    unsafe {
+        module.attention_scores_paged(
+            &stream,
+            rows(32 * 512, 128),
+            &q,
+            &k,
+            &info,
+            &table,
+            512,
+            stride as u32,
+            512,
+            &mut scores,
+        )?;
+        module.attention_softmax_paged(
+            &stream,
+            rows(32, 128),
+            &mut scores,
+            &info,
+            stride as u32,
+        )?;
+        module.attention_values_paged(
+            &stream,
+            rows(32 * 4, 32),
+            &scores,
+            &v,
+            &info,
+            &table,
+            512,
+            stride as u32,
+            &mut output,
+        )?;
+    }
+    let actual = output.to_host_vec(&stream)?;
+    for (i, value) in actual.into_iter().enumerate() {
+        let kv_coordinate = (i / 128 / 4) * 128 + i % 128;
+        let expected = ((kv_coordinate % 97) as f32 - 48.0) / 16.0;
+        assert_eq!(value.to_bits(), expected.to_bits(), "coordinate {i}");
+    }
+    Ok(())
+}
