@@ -36,3 +36,39 @@ Inspection of the installed Humming compressed-tensors schema confirms that chan
 The initial current-version smoke screens expose two unsupported defaults on SM120: vLLM compressed-tensors with automatic linear dispatch selects a CUTLASS INT8 operation that rejects SM120, and SGLang's W8A8 path raises `No implemented int8_scaled_mm for current compute capability`. These failures are not timing results. SGLang's compressed-tensors W8A8 source calls the same CUDA entrypoint; a second runtime test of that adapter has not been performed. vLLM's explicit Triton linear backend completes two repetitions each of a single 5-token prompt and a four-sequence 129-token batch in full-recomputation mode. Its metrics report zero cached prefix tokens on all one-token calls, and submitted prefix lengths grow as expected. This is harness validation in eager mode, not the final stock configuration screen. Logs and raw results use `clean-work/stock/vllm032-ct-{auto,triton}-recompute-smoke.*` and `sglang0522-recompute-smoke.*`.
 
 Compute Sanitizer 2026.3 (CUDA 13.4.92, now included in the Nix shell) reports zero memory errors for both paged attention operator tests and for the complete batch CLI with four 129-token prompts and eight generated tokens each. Racecheck reports zero hazards, errors or warnings for the paged operator tests, including the native-context case. Artifacts are `clean-work/kv-batch-baseline/paged-memcheck.log`, `paged-racecheck-attempt2.log` and `batch-cli-memcheck.log`. The initial racecheck invocation used an incorrect executable path and ran no test; the corrected invocation is the evidence. The CLI benchmark smoke also confirms identical full-logit hashes between cached and recomputed modes for all repeated requests. These checks cover the new path; they do not claim exhaustive sanitizer coverage of every requested benchmark shape.
+
+## Output-head scheduling
+
+Interleaving vocabulary rows across batch members lets adjacent warps reuse the same packed head weights in cache. The old scheduling processed an entire vocabulary for one output row before moving to the next, exceeding L2 capacity between uses. The arithmetic of each dot and the output matrix layout remain unchanged. A separate batch-32 verification matches all 256 generated full-logit hashes against the saved original executable. The ordinary ragged/session oracle test also passes.
+
+Paired A/B/B/A runs use 129-token prompts, eight output tokens, no prefix caching, graph decode, prefill chunk 1024 and verification disabled. Each process has one warmup and three measured repetitions; the table combines six measurements per variant. Results are `clean-work/kv-batch-baseline/head-b{1,4,32}-{a1,b1,b2,a2}.jsonl`; complete-hash probes are `head-b32-head-{original,interleaved}-verify.jsonl`.
+
+| Batch | Original median API | Interleaved median API | Original aggregate decode | Interleaved aggregate decode |
+|---|---:|---:|---:|---:|
+| 1 | 55.229 ms | 55.132 ms | 173.28 tokens/s | 174.51 tokens/s |
+| 4 | 101.312 ms | 93.142 ms | 400.14 tokens/s | 447.37 tokens/s |
+| 32 | 449.282 ms | 400.130 ms | 1163.42 tokens/s | 1494.97 tokens/s |
+
+The aggregate decode estimate divides total post-first-token outputs by the slowest stream's measured decode interval. These are homogeneous batches; do not apply that estimator to ragged or differently stopped requests. The single-stream difference is small enough to treat as unchanged. Batch 4 and batch 32 improve generation latency by 8.1% and 10.9%, respectively.
+
+## Adaptive prefill policy
+
+A short recomputation pilot with four 129-token prompts and four outputs reduced median API latency from about 198 ms at chunk 256 to 165 ms at chunk 512 and 138 ms at chunk 1024, with identical complete logit hashes. This pilot is not paired evidence for a universal chunk setting. The scheduler now treats the configured chunk as an upper bound and also enforces a score scratch byte budget, based on the largest position that the next chunk could reach. The RTX 5090 capacity policy permits up to 1024 rows with a 1 GiB score limit; it drops to at most 256 rows when the visible context requires a 32K score stride. The PRO 6000 policy remains a separate unmeasured starting point. Full-model tests force a smaller scratch budget to verify scheduling invariance.
+
+The adaptive policy passes all 16 ordinary GPU tests in release (26.57 seconds) and checked release (31.74 seconds), including forced 4 MiB scratch scheduling. The native-context test also passes (303.49 seconds; diagnostic cold/warm/recompute times 92.771/0.518/201.338 seconds), preserving every cross-mode logit hash. This timing does not establish a long-prefill speedup; that remains dominated by attention. The ordinary suite now explicitly ignores two opt-in tasks: native-context model validation and projection profiling.
+
+## Projection measurements
+
+`cuda.sh test --ignored projection_shapes --nocapture` measures projection kernels with CUDA events around captured launch sequences. It cycles through 32 distinct weight allocations, a 512 MiB or 1.5 GiB working set, and excludes three warmups before retaining seven timings. Every candidate's output is compared exactly against the DP4A implementation. This avoids a single small matrix remaining entirely in L2. It measures isolated projections, so candidate dispatch changes still require end-to-end paired validation. The host restricts hardware performance counters to administrators; CUDA-event timing requires no driver setting change.
+
+The experiment passes in 7.21 seconds. Raw timings are `clean-work/kv-batch-baseline/projection-profile.log` and extracted `projection-profile.json`. The original thresholds are generally appropriate, but the RTX 5090 has clear candidates for small batched MLP projections:
+
+| Shape (rows × input × output) | Original kernel and median | Candidate and median |
+|---|---|---|
+| 2 × 12288 × 4096 | Split-K, 80.1 µs | DP4A, 33.2 µs |
+| 4 × 12288 × 4096 | Split-K, 80.2 µs | DP4A, 47.6 µs |
+| 8 × 12288 × 4096 | Split-K, 80.1 µs | Tiled, 58.8 µs |
+| 16 × 12288 × 4096 | Split-K, 81.8 µs | Tiled, 59.2 µs |
+| 16 × 4096 × 12288 | Split-K, 51.8 µs | Tiled, 33.8 µs |
+
+These candidates have not yet been retained in the model dispatch. The original PRO 6000 selection remains unchanged. The profile also confirms that replacing the existing 32-row tiled projection with Split-K would be slower, so that proposed direction is rejected before changing production dispatch.

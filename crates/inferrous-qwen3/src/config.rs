@@ -41,6 +41,9 @@ pub struct EngineConfig {
     pub max_context: usize,
     pub max_batch: usize,
     pub prefill_chunk: usize,
+    /// Bound each score workspace while allowing larger short-context chunks.
+    #[serde(default = "default_score_scratch")]
+    pub score_scratch_bytes: usize,
     pub kv_cache_bytes: usize,
     pub prefix_cache_entries: usize,
     pub verify_logits: bool,
@@ -52,18 +55,23 @@ fn graphs_enabled() -> bool {
     true
 }
 
+fn default_score_scratch() -> usize {
+    1 << 30
+}
+
 impl EngineConfig {
     /// Capacity defaults, not a claim of measured optimal kernel tuning.
     pub fn for_hardware(hardware: HardwareProfile, max_context: usize) -> Self {
-        let (max_batch, prefill_chunk, kv_gib) = match hardware {
-            HardwareProfile::Rtx5090 => (16, 256, 12),
-            HardwareProfile::RtxPro6000 => (64, 512, 64),
+        let (max_batch, prefill_chunk, kv_gib, score_gib) = match hardware {
+            HardwareProfile::Rtx5090 => (16, 1024, 12, 1),
+            HardwareProfile::RtxPro6000 => (64, 512, 64, 4),
         };
         Self {
             hardware,
             max_context,
             max_batch,
             prefill_chunk,
+            score_scratch_bytes: score_gib << 30,
             kv_cache_bytes: kv_gib * (1 << 30),
             prefix_cache_entries: 32,
             verify_logits: true,
@@ -87,6 +95,11 @@ impl EngineConfig {
         ensure!(
             (self.max_batch..=1024).contains(&self.prefill_chunk),
             "prefill chunk must cover the batch and be at most 1024 tokens"
+        );
+        let score_row_bytes = 32 * self.max_context.next_power_of_two().max(PAGE_TOKENS) * 4;
+        ensure!(
+            self.score_scratch_bytes / score_row_bytes >= self.max_batch,
+            "score workspace budget cannot hold one query per admitted sequence"
         );
         ensure!(
             self.prefix_cache_entries <= 1024,

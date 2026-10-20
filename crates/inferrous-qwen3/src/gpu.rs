@@ -1,5 +1,7 @@
 use crate::graph::Graph;
 mod batch;
+#[cfg(test)]
+mod profile;
 use crate::{
     CONTEXT, HIDDEN, VOCAB,
     kernels::device,

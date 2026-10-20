@@ -417,6 +417,27 @@ impl BatchEngine {
         // fences it before caller-owned session leases can be released.
         let outcome = (|| -> Result<()> {
             while done.iter().any(|&finished| !finished) {
+                // No sequence can advance by more than the whole token chunk.
+                // Bound the next visible prefix before packing rows, allowing
+                // larger early chunks while keeping each score allocation bounded.
+                let score_stride = sessions
+                    .iter()
+                    .zip(&done)
+                    .filter(|(_, finished)| !**finished)
+                    .map(|(session, _)| {
+                        session
+                            .tokens
+                            .len()
+                            .min(session.cache.written_tokens() + self.config.prefill_chunk)
+                    })
+                    .max()
+                    .expect("an unfinished sequence exists")
+                    .next_power_of_two()
+                    .max(PAGE_TOKENS);
+                let row_budget = self
+                    .config
+                    .prefill_chunk
+                    .min(self.config.score_scratch_bytes / (32 * score_stride * 4));
                 let mut input = Vec::new();
                 let mut info = Vec::new();
                 let mut output_rows = Vec::new();
@@ -433,7 +454,7 @@ impl BatchEngine {
                         begin < session.tokens.len(),
                         "session has no unprocessed token"
                     );
-                    let quota = (self.config.prefill_chunk - input.len()) / remaining;
+                    let quota = (row_budget - input.len()) / remaining;
                     remaining -= 1;
                     let end = session.tokens.len().min(begin + quota);
                     session.cache.check_append(end)?;
@@ -468,6 +489,9 @@ impl BatchEngine {
                     prefill
                 };
                 if storage.as_ref().is_none_or(|step| step.shape != shape) {
+                    // Release the previous shape before allocating its replacement,
+                    // avoiding a temporary doubling of the score workspace.
+                    drop(storage.take());
                     *storage = Some(Step::new(&self.gpu.stream, shape, table.len())?);
                 }
                 let step = storage.as_mut().expect("allocated above");
@@ -878,6 +902,10 @@ mod tests {
         for (actual, expected) in warm.generations.iter().zip(&expected) {
             same(actual, expected);
         }
+        // Force the workspace budget to split these prefixes into smaller
+        // chunks even though the configured token limit is much larger.
+        engine.config.score_scratch_bytes = 4 << 20;
+        engine.config.validate(model.max_context())?;
         let recomputed = engine.generate(&model, &requests, CacheMode::Recompute)?;
         assert_eq!(recomputed.reused_tokens, 0);
         assert_eq!(
@@ -890,6 +918,7 @@ mod tests {
         for (actual, expected) in recomputed.generations.iter().zip(&expected) {
             same(actual, expected);
         }
+        engine.config.score_scratch_bytes = 1 << 30;
         let reversed: Vec<_> = requests.iter().rev().cloned().collect();
         engine.config.cuda_graphs = false;
         let reordered = engine.generate(&model, &reversed, CacheMode::Reuse)?;

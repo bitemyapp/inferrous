@@ -2757,7 +2757,11 @@ pub mod device {
         let tid = thread::index_1d().get();
         let lane = tid % 32;
         let index = tid / 32;
-        let row = index % 151936;
+        // Adjacent warps evaluate the same vocabulary row for different batch
+        // members, so its packed weights stay hot in L1/L2 across those uses.
+        // The output remains row-major and each dot's arithmetic is unchanged.
+        let batch = index % output_rows.len();
+        let row = index / output_rows.len();
         if index < out.len() {
             // Sixteen 96-word chunks form each packed row's contiguous 6144 bytes.
             prefetch_row(
@@ -2771,7 +2775,7 @@ pub mod device {
         if index >= out.len() {
             return;
         }
-        let start = output_rows[index / 151936] as usize * 4096;
+        let start = output_rows[batch] as usize * 4096;
         let mut sum = 0.0;
         // Three coalesced word planes encode eight successive terms per lane.
         // Keep the original lane-strided FP32 accumulation and warp sum order.
@@ -2858,7 +2862,7 @@ pub mod device {
         }
         if lane == 0 {
             unsafe {
-                *out.get_unchecked_mut(index) = bf(sum);
+                *out.get_unchecked_mut(batch * 151936 + row) = bf(sum);
             }
         }
     }
