@@ -596,6 +596,10 @@ impl BatchEngine {
         pages_per_sequence: usize,
     ) -> Result<()> {
         let gpu = &self.gpu;
+        let policy = match (self.config.hardware, self.config.tuned_projections) {
+            (crate::config::HardwareProfile::Rtx5090, true) => ProjectionPolicy::Rtx5090,
+            _ => ProjectionPolicy::Original,
+        };
         let w = &mut step.w;
         let (nr, outputs, stride) = step.shape;
         // SAFETY: admission validates all tokens, row positions and page leases.
@@ -626,6 +630,7 @@ impl BatchEngine {
                 &layer.weights["q"],
                 &mut w.q,
                 w.map4.as_ref(),
+                policy,
             )?;
             gpu.linear_quantized(
                 &w.quant4,
@@ -633,6 +638,7 @@ impl BatchEngine {
                 &layer.weights["k"],
                 &mut w.k,
                 w.map4.as_ref(),
+                policy,
             )?;
             gpu.linear_quantized(
                 &w.quant4,
@@ -640,6 +646,7 @@ impl BatchEngine {
                 &layer.weights["v"],
                 &mut w.v,
                 w.map4.as_ref(),
+                policy,
             )?;
             unsafe {
                 gpu.module.prepare_qk_paged(
@@ -699,6 +706,7 @@ impl BatchEngine {
                 &mut w.residual,
                 w.map4.as_ref(),
                 false,
+                policy,
             )?;
             gpu.norm_quantize(
                 &w.residual,
@@ -736,6 +744,7 @@ impl BatchEngine {
                     &layer.weights["gate"],
                     &mut w.gate,
                     w.map4.as_ref(),
+                    policy,
                 )?;
                 gpu.linear_quantized(
                     &w.quant4,
@@ -743,6 +752,7 @@ impl BatchEngine {
                     &layer.weights["up"],
                     &mut w.up,
                     w.map4.as_ref(),
+                    policy,
                 )?;
                 unsafe {
                     gpu.module.swiglu(
@@ -766,6 +776,7 @@ impl BatchEngine {
                 &mut w.hidden,
                 w.map12.as_ref(),
                 false,
+                policy,
             )?;
         }
         if outputs > 0 {
@@ -810,6 +821,16 @@ mod tests {
         }
     }
 
+    fn test_hardware() -> Result<HardwareProfile> {
+        let name = CudaContext::new(0)?.device_name()?;
+        for profile in [HardwareProfile::Rtx5090, HardwareProfile::RtxPro6000] {
+            if profile.validate_device(&name).is_ok() {
+                return Ok(profile);
+            }
+        }
+        anyhow::bail!("no test profile for {name}")
+    }
+
     fn same(actual: &Generation, expected: &Generation) {
         assert_eq!(actual.token_ids, expected.token_ids);
         assert_eq!(actual.logit_sha256, expected.logit_sha256);
@@ -823,7 +844,7 @@ mod tests {
         let bundle = std::env::var_os("CLEAN_LONG_MODEL_BUNDLE")
             .context("set CLEAN_LONG_MODEL_BUNDLE to an extended 32768-token bundle")?;
         let model = Model::load(Path::new(&bundle))?;
-        let mut config = EngineConfig::for_hardware(HardwareProfile::Rtx5090, 32768);
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 32768);
         config.max_batch = 4;
         config.kv_cache_bytes = 9 << 30;
         let mut engine = BatchEngine::new(&model, config)?;
@@ -868,7 +889,7 @@ mod tests {
         let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE")
             .context("set CLEAN_MODEL_BUNDLE for batched model validation")?;
         let model = Model::load(Path::new(&bundle))?;
-        let mut config = EngineConfig::for_hardware(HardwareProfile::Rtx5090, 4096);
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 4096);
         config.max_batch = 8;
         config.kv_cache_bytes = 512 << 20;
         let mut engine = BatchEngine::new(&model, config)?;

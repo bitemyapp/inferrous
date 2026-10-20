@@ -47,11 +47,14 @@ pub struct EngineConfig {
     pub kv_cache_bytes: usize,
     pub prefix_cache_entries: usize,
     pub verify_logits: bool,
-    #[serde(default = "graphs_enabled")]
+    #[serde(default = "enabled")]
     pub cuda_graphs: bool,
+    /// Permit the measured hardware-specific projection dispatch. Disable for A/B runs.
+    #[serde(default = "enabled")]
+    pub tuned_projections: bool,
 }
 
-fn graphs_enabled() -> bool {
+fn enabled() -> bool {
     true
 }
 
@@ -76,6 +79,7 @@ impl EngineConfig {
             prefix_cache_entries: 32,
             verify_logits: true,
             cuda_graphs: true,
+            tuned_projections: hardware == HardwareProfile::Rtx5090,
         }
     }
 

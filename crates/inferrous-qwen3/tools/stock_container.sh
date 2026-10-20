@@ -33,4 +33,5 @@ exec docker run --rm \
   --env XDG_CACHE_HOME=/workspace/clean-work/stock/cache \
   --env VLLM_USE_FLASHINFER_SAMPLER=0 \
   --env VLLM_NO_USAGE_STATS=1 \
+  --env INFERROUS_STOCK_IMAGE="$image" \
   --entrypoint "$1" "$image" "${@:2}"

@@ -14,7 +14,8 @@ The project's discipline is measurement and exactness:
 
 This is research-grade code, not an accuracy-certified model server.
 
-- One request at a time, greedy decoding, up to 4096 tokens of context.
+- Greedy decoding with [paged sessions, ragged batches and full-prefix recomputation](docs/qwen3-8b-w8a8/sessions.md), validated through 32,768 total tokens. The original single-request 4K engine remains the short-context regression oracle.
+- Separate RTX 5090 and RTX PRO 6000 configurations. The [RTX 5090 batch performance comparison](docs/plans/kv-cache-batching-rtx5090.md) is in progress; the workstation timings above describe the original engine.
 - The full-model numerical comparison against an independent PyTorch composition currently fails its declared tolerance ([discrepancy notes](docs/qwen3-8b-w8a8/discrepancies.md)). Model quality has not been evaluated.
 - The [production plan](docs/plans/production.md) lists what serving traffic would require: paged KV, continuous batching, sampling, an API and a quality gate.
 - [Qwen3.6-35B-A3B FP8](docs/plans/qwen3.6-35b-a3b-fp8.md) is the next model: Gated DeltaNet hybrid attention, fine-grained MoE and MTP.

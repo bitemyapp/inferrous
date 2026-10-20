@@ -7,5 +7,6 @@
   "prefix_cache_entries": 32,
   "verify_logits": false,
   "cuda_graphs": true,
+  "tuned_projections": true,
   "score_scratch_bytes": 1073741824
 }

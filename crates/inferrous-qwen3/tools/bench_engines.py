@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--cache-mode", choices=["reuse", "recompute"], default="reuse")
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--graph-size-one", action="store_true")
+    ap.add_argument("--graph-capture-sizes", type=int, nargs="+")
     ap.add_argument("--graphs-without-compile", action="store_true")
     ap.add_argument("--linear-backend", choices=["auto", "triton"], default="auto")
     ap.add_argument("--quantization", choices=["compressed-tensors", "humming"], default="compressed-tensors")
@@ -44,6 +45,11 @@ def main():
         ap.error("invalid context, sequence count or memory fraction")
     if args.cache_mode == "recompute" and args.prefix_cache:
         ap.error("recompute mode requires prefix caching disabled")
+    if args.graph_capture_sizes is not None and (args.graph_size_one or any(size < 1 for size in args.graph_capture_sizes)):
+        ap.error("graph capture sizes must be positive and cannot accompany --graph-size-one")
+    capture_sizes = [1] if args.graph_size_one else args.graph_capture_sizes
+    if args.graphs_without_compile and capture_sizes is None:
+        capture_sizes = sorted({1 << power for power in range(args.max_num_seqs.bit_length())} | {args.max_num_seqs})
     workloads = json.loads(args.requests.read_text())
     if not workloads:
         ap.error("empty workloads")
@@ -70,10 +76,10 @@ def main():
                                                    param_dtype=torch.bfloat16, stack_size=1)
             scale_dtype = str(attrs["weight_scale"]["dtype"])
             print("Humming effective weight scale dtype:", scale_dtype, flush=True)
-        extra = {"compilation_config": {"cudagraph_capture_sizes": [1]}} if args.graph_size_one else {}
+        extra = {"compilation_config": {"cudagraph_capture_sizes": capture_sizes}} if capture_sizes else {}
         if args.graphs_without_compile:
             assert not args.eager
-            extra["compilation_config"] = dict(mode=0, cudagraph_mode="FULL", cudagraph_capture_sizes=[1], custom_ops=["all"])
+            extra["compilation_config"] = dict(mode=0, cudagraph_mode="FULL", cudagraph_capture_sizes=capture_sizes, custom_ops=["all"])
         if args.attention_backend == "B12X":
             extra["block_size"] = 128
         engine = LLM(model=str(args.model.resolve()), dtype="bfloat16",
@@ -109,7 +115,7 @@ def main():
     manifest = args.model.parent / "manifest.json"
     model_root = hashlib.sha256(manifest.read_bytes()).hexdigest()
     environment = {key: os.environ.get(key) for key in
-                   ["CUDA_HOME", "VLLM_USE_V2_MODEL_RUNNER", "VLLM_USE_FLASHINFER_SAMPLER"]}
+                   ["CUDA_HOME", "VLLM_USE_V2_MODEL_RUNNER", "VLLM_USE_FLASHINFER_SAMPLER", "INFERROUS_STOCK_IMAGE"]}
 
     def generate_batch(prompts, limits):
         if args.engine == "vllm":
@@ -163,6 +169,7 @@ def main():
                               attention_backend=(args.attention_backend if args.engine == "vllm"
                                                  else args.sglang_attention_backend or "auto"),
                               graph_size_one=args.graph_size_one,
+                              graph_capture_sizes=capture_sizes,
                               graphs_without_compile=args.graphs_without_compile,
                               quantization=args.quantization if args.engine == "vllm" else args.sglang_quantization,
                               weight_scale_dtype=scale_dtype, device_name=device_name,

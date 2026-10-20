@@ -51,6 +51,12 @@ struct Matrix {
     k: usize,
     n: usize,
 }
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProjectionPolicy {
+    Original,
+    Rtx5090,
+}
 struct PackedHead {
     words: DeviceBuffer<u32>,
     offsets: DeviceBuffer<u32>,
@@ -386,6 +392,7 @@ impl GpuModel {
         combined: &mut Buffer,
         map: Option<&DeviceBuffer<u64>>,
         prefetch: bool,
+        policy: ProjectionPolicy,
     ) -> Result<()> {
         if scale.len() == 1 && w.k == 12288 {
             // SAFETY: the preceding SwiGLU produced this exact completed maximum;
@@ -429,7 +436,7 @@ impl GpuModel {
                 )?;
             }
         } else {
-            self.linear_quantized(q, scale, w, out, map)?;
+            self.linear_quantized(q, scale, w, out, map, policy)?;
             self.residual(residual, out, combined)?;
         }
         Ok(())
@@ -467,8 +474,15 @@ impl GpuModel {
         w: &Matrix,
         out: &mut Buffer,
         map: Option<&DeviceBuffer<u64>>,
+        policy: ProjectionPolicy,
     ) -> Result<()> {
         let nr = scale.len();
+        // Cold-weight CUDA-event measurements on the 5090 favor wider tiles
+        // for small MLP batches and DP4A for two to four down-projection rows.
+        // Keep the original PRO 6000/legacy dispatch independently selectable.
+        let tuned_tiled = policy == ProjectionPolicy::Rtx5090
+            && ((nr >= 4 && w.n == 12288) || (nr >= 5 && w.k == 12288));
+        let tuned_dp4a = policy == ProjectionPolicy::Rtx5090 && w.k == 12288 && nr <= 4;
         // SAFETY: fixed graph supplies exact dimensions and distinct buffers. Scratch
         // stays alive across all queued uses. Stream order protects quantizer reuse.
         unsafe {
@@ -483,7 +497,7 @@ impl GpuModel {
                     w.k as u32,
                     out,
                 )?;
-            } else if nr >= 32 {
+            } else if nr >= 32 || tuned_tiled {
                 self.module.linear_tiled(
                     &self.stream,
                     rows(nr.div_ceil(32) * w.n.div_ceil(64), 256),
@@ -494,7 +508,7 @@ impl GpuModel {
                     w.k as u32,
                     out,
                 )?;
-            } else if nr > 1 {
+            } else if nr > 1 && !tuned_dp4a {
                 self.module.linear_splitk(
                     &self.stream,
                     rows(nr.div_ceil(16) * w.n.div_ceil(8), 256),
@@ -548,6 +562,7 @@ impl GpuModel {
         trace: Option<&Path>,
         step: usize,
     ) -> Result<()> {
+        let policy = ProjectionPolicy::Original;
         let nr = w.hidden.len() / HIDDEN;
         // Only single-row decode streams weights once per token; prefill reuses them.
         let pf = nr == 1 && self.prefetch;
@@ -609,6 +624,7 @@ impl GpuModel {
                     &layer.weights["q"],
                     &mut w.q,
                     w.map4.as_ref(),
+                    policy,
                 )?;
                 self.linear_quantized(
                     &w.quant4,
@@ -616,6 +632,7 @@ impl GpuModel {
                     &layer.weights["k"],
                     &mut w.k,
                     w.map4.as_ref(),
+                    policy,
                 )?;
                 self.linear_quantized(
                     &w.quant4,
@@ -623,6 +640,7 @@ impl GpuModel {
                     &layer.weights["v"],
                     &mut w.v,
                     w.map4.as_ref(),
+                    policy,
                 )?;
             }
             if l == 4 {
@@ -718,6 +736,7 @@ impl GpuModel {
                 &mut w.residual,
                 w.map4.as_ref(),
                 pf,
+                policy,
             )?;
             if l == 4 {
                 self.trace(trace, step, "debug.a", &w.attention)?;
@@ -764,6 +783,7 @@ impl GpuModel {
                     &layer.weights["gate"],
                     &mut w.gate,
                     w.map4.as_ref(),
+                    policy,
                 )?;
                 self.linear_quantized(
                     &w.quant4,
@@ -771,6 +791,7 @@ impl GpuModel {
                     &layer.weights["up"],
                     &mut w.up,
                     w.map4.as_ref(),
+                    policy,
                 )?;
             }
             if l == 4 {
@@ -801,6 +822,7 @@ impl GpuModel {
                 &mut w.hidden,
                 w.map12.as_ref(),
                 pf,
+                policy,
             )?;
             if l == 4 {
                 self.trace(trace, step, "debug.act", &w.act)?;

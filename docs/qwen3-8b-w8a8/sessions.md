@@ -22,7 +22,9 @@ The extension preserves all original RoPE bytes and appends positions through 32
 
 `--batch FILE` accepts a JSON array of the same request objects used by `--request`: `prompt_ids`, `max_tokens`, and `stop_ids`. Batch mode requires `--engine-config FILE`. Prompt plus maximum output must fit `max_context`, which must fit the bundle's RoPE table. `--cache-mode reuse` retains autoregressive K/V and eligible prompt prefixes; `--cache-mode recompute` clears the initialized prefix after every sampled token and processes all prompt and generated tokens again at the next iteration. Its scratch KV is reused as storage but no computed K/V survives to the next output iteration.
 
-The output records the actual GPU name, exact engine configuration, cache mode, request order, per-request token IDs and timings, processed token rows, reused prefix token rows and batch elapsed time. `verify_logits: true` additionally copies and hashes every vocabulary logit for correctness comparisons. Performance profiles use `false` and return an empty hash list. Timing reports must state which setting they used. Prefix cache hits occur only at 64-token boundaries; the last prompt token is always evaluated to obtain the output head.
+`--batch-suite FILE` accepts a JSON object mapping workload names to nonempty request arrays. One loaded engine serves every workload in sorted name order, with `--repeat N` repetitions per workload. The output includes the workload name. Prefix state persists across workloads when enabled, so cold measurements must set `prefix_cache_entries: 0`.
+
+The output records the actual GPU name, exact engine configuration, cache mode, request order, per-request token IDs and timings, processed token rows, reused prefix token rows and batch elapsed time. `verify_logits: true` additionally copies and hashes every vocabulary logit for correctness comparisons. Performance profiles use `false` and return an empty hash list. Timing reports must state which setting they used. Prefix cache hits occur only at 64-token boundaries; the last prompt token is always evaluated to obtain the output head. `tuned_projections: false` selects the original projection dispatch for paired comparisons. The RTX 5090 profile enables its measured small-batch dispatch; PRO 6000 and the legacy engine retain the original selection.
 
 ## Rust ownership
 
@@ -47,7 +49,7 @@ CLEAN_BOUNDS_CHECKS=1 CLEAN_LONG_MODEL_BUNDLE="$PWD/clean-work/model-bundle-32k"
   crates/inferrous-qwen3/tools/cuda.sh test --ignored native_context --nocapture
 ```
 
-`cuda_graphs: true` enables graph replay for decode batches; setting it to `false` provides the eager comparison. Graphs own stable step storage and are replaced when shape changes. The `bench_batch.py` tool accepts a workload JSON object mapping names to request arrays, runs repetitions with a resident engine per workload, verifies complete deterministic outputs, and checks the exact processed-row count in recomputation mode. Use `prefix_cache_entries: 0` for cold-prefix measurements. A nonzero value permits explicit warm-prefix measurements, recorded through `reused_tokens`.
+`cuda_graphs: true` enables graph replay for decode batches; setting it to `false` provides the eager comparison. Graphs own stable step storage and are replaced when shape changes. The `bench_batch.py` tool accepts a workload JSON object mapping names to request arrays, runs the suite with one resident engine, records the executable SHA-256, verifies complete deterministic outputs, and checks the exact processed-row count in recomputation mode. Use `prefix_cache_entries: 0` for cold-prefix measurements. A nonzero value permits explicit warm-prefix measurements, recorded through `reused_tokens`.
 
 ```sh
 python crates/inferrous-qwen3/tools/bench_batch.py \

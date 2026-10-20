@@ -71,4 +71,21 @@ The experiment passes in 7.21 seconds. Raw timings are `clean-work/kv-batch-base
 | 16 × 12288 × 4096 | Split-K, 81.8 µs | Tiled, 59.2 µs |
 | 16 × 4096 × 12288 | Split-K, 51.8 µs | Tiled, 33.8 µs |
 
-These candidates have not yet been retained in the model dispatch. The original PRO 6000 selection remains unchanged. The profile also confirms that replacing the existing 32-row tiled projection with Split-K would be slower, so that proposed direction is rejected before changing production dispatch.
+The candidates are retained after the paired model experiment below. The original PRO 6000 and legacy selections remain unchanged. The profile also confirms that replacing the existing 32-row tiled projection with Split-K would be slower, so that proposed direction is rejected before changing production dispatch.
+
+## Paired projection dispatch
+
+The same executable runs the original and tuned projection dispatch through `tuned_projections: false/true`. A/B/B/A suites use 129-token prompts, eight outputs, batches 1/2/4/8/16/32, chunk 1024, 4 GiB KV, no prefix caching, graph decode and verification disabled. Each process has three warmups and six measurements per workload, giving twelve measured samples per variant. Separate verification suites compare every full-vocabulary logit hash, in both cached and fully recomputed modes. All hashes match. `bench_batch.py` now loads one engine for the complete named suite and records the executable SHA-256 in every record.
+
+| Batch | Original cached API | Tuned cached API | Original aggregate decode | Tuned aggregate decode |
+|---|---:|---:|---:|---:|
+| 1 | 55.654 ms | 55.938 ms | 173.57 tokens/s | 172.50 tokens/s |
+| 2 | 78.303 ms | 66.457 ms | 238.98 tokens/s | 299.87 tokens/s |
+| 4 | 94.651 ms | 85.095 ms | 439.18 tokens/s | 515.60 tokens/s |
+| 8 | 144.188 ms | 134.611 ms | 731.26 tokens/s | 821.63 tokens/s |
+| 16 | 241.151 ms | 224.098 ms | 1039.56 tokens/s | 1207.40 tokens/s |
+| 32 | 404.493 ms | 404.065 ms | 1489.93 tokens/s | 1489.52 tokens/s |
+
+Cached API latency improves 15.1%, 10.1%, 6.6% and 7.1% at batches 2, 4, 8 and 16. The batch-1 and batch-32 controls use unchanged dispatch and are treated as unchanged. Full-prefix recomputation also remains effectively unchanged: original/tuned median API latencies in batch order are 129.34/130.02, 168.12/167.85, 266.95/269.25, 572.67/565.40, 1082.33/1079.71 and 2098.15/2098.40 ms. Its large prefill row counts mostly use the existing tiled dispatch. These measurements support the small cached-batch change; they do not imply a recomputation improvement.
+
+Raw records and full-logit probes are `clean-work/kv-batch-baseline/projection-{reuse,recompute}-{a1,b1,b2,a2,av,bv}.jsonl`; the summary and script are `projection-abba-summary.json` and `compare_projections.py`. One-second GPU temperature, power, clock, utilization and memory samples are retained in `projection-abba-telemetry.csv`. Among samples with at least 50% GPU utilization, SM clocks span 2557–2872 MHz (median 2625 MHz) and temperature spans 56–82°C. All GPU processes ran serially; desktop activity remained present. The regular release suite passes 16 tests in 30.83 seconds, with native-context and timing experiments explicitly ignored. The stock comparison matrix is still pending.
