@@ -12,6 +12,7 @@
 
 ## Plans
 
+- [KV cache, batching and RTX 5090](plans/kv-cache-batching-rtx5090.md): active implementation, validation matrix and performance comparison work.
 - [Production plan](plans/production.md): decisions, workstreams and milestones for serving traffic.
 - [Qwen3.6-35B-A3B FP8](plans/qwen3.6-35b-a3b-fp8.md): implementation plan for the next model.
 
