@@ -141,6 +141,7 @@ for backend in FLASH_ATTN B12X; do
     label=fa2
     if [[ "$backend" == B12X ]]; then label=b12x; fi
     clean-work/vllm-venv/bin/python crates/inferrous-qwen3/tools/bench_engines.py vllm \
+      --hardware-profile rtx-pro-6000 \
         --model clean-work/model-bundle/hf --requests clean-work/workloads/requests.json \
         --quantization humming --graphs-without-compile --attention-backend "$backend" \
         --output "clean-work/round5-stock-$label.jsonl" --repeat 23 \

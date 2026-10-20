@@ -19,6 +19,11 @@ def main():
     ap.add_argument("--requests", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--repeat", type=int, default=23)
+    ap.add_argument("--hardware-profile", choices=["rtx5090", "rtx-pro-6000"], required=True)
+    ap.add_argument("--max-context", type=int, default=4096)
+    ap.add_argument("--max-num-seqs", type=int, default=1)
+    ap.add_argument("--memory-fraction", type=float)
+    ap.add_argument("--prefix-cache", action="store_true")
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--graph-size-one", action="store_true")
     ap.add_argument("--graphs-without-compile", action="store_true")
@@ -26,10 +31,14 @@ def main():
     ap.add_argument("--quantization", choices=["compressed-tensors", "humming"], default="compressed-tensors")
     ap.add_argument("--attention-backend", choices=["FLASH_ATTN", "TRITON_ATTN", "B12X", "FLASHINFER"], default="FLASH_ATTN")
     args = ap.parse_args()
+    if args.memory_fraction is None:
+        args.memory_fraction = {"rtx5090": 0.70, "rtx-pro-6000": 0.30}[args.hardware_profile]
     if args.output.exists():
         ap.error("output already exists; preserve previous measurements")
     if args.repeat < 1:
         ap.error("repeat must be positive")
+    if args.max_context < 1 or args.max_num_seqs < 1 or not 0 < args.memory_fraction < 1:
+        ap.error("invalid context, sequence count or memory fraction")
     requests = json.loads(args.requests.read_text())
     assert all(not r["stop_ids"] and r["max_tokens"] > 0 for r in requests.values())
     if args.engine == "vllm":
@@ -51,18 +60,18 @@ def main():
         if args.attention_backend == "B12X":
             extra["block_size"] = 128
         engine = LLM(model=str(args.model.resolve()), dtype="bfloat16",
-                     quantization=args.quantization, max_model_len=4096,
-                     max_num_seqs=1, gpu_memory_utilization=0.3,
-                     enable_prefix_caching=False, enforce_eager=args.eager,
+                     quantization=args.quantization, max_model_len=args.max_context,
+                     max_num_seqs=args.max_num_seqs, gpu_memory_utilization=args.memory_fraction,
+                     enable_prefix_caching=args.prefix_cache, enforce_eager=args.eager,
                      kernel_config={"linear_backend_per_quant": {"int8_w8a8": args.linear_backend}},
                      attention_backend=args.attention_backend,
                      disable_log_stats=False, seed=0, **extra)
     else:
         import sglang
         engine = sglang.Engine(model_path=str(args.model.resolve()), dtype="bfloat16",
-                              quantization="w8a8_int8", context_length=4096,
-                              max_running_requests=1, mem_fraction_static=0.3,
-                              disable_radix_cache=True, disable_cuda_graph=args.eager,
+                              quantization="w8a8_int8", context_length=args.max_context,
+                              max_running_requests=args.max_num_seqs, mem_fraction_static=args.memory_fraction,
+                              disable_radix_cache=not args.prefix_cache, disable_cuda_graph=args.eager,
                               random_seed=0)
     versions = {name: importlib.metadata.version(name) for name in
                 [args.engine, "torch", "transformers", "compressed-tensors"]}
@@ -100,6 +109,9 @@ def main():
                               graph_size_one=args.graph_size_one,
                               graphs_without_compile=args.graphs_without_compile,
                               quantization=args.quantization,
+                              max_context=args.max_context, max_num_seqs=args.max_num_seqs,
+                              hardware_profile=args.hardware_profile,
+                              memory_fraction=args.memory_fraction, prefix_cache=args.prefix_cache,
                               workload=name, request=request, run=run,
                               request_seconds=seconds, token_ids=tokens, backend_metrics=meta)
                 f.write(json.dumps(record, default=str) + "\n")

@@ -110,6 +110,7 @@ The Humming package was built from the pinned official source without patches. T
 CUDA_HOME=/usr/local/cuda-13.1 VLLM_USE_FLASHINFER_SAMPLER=0 \
   clean-work/vllm-venv/bin/python crates/inferrous-qwen3/tools/bench_engines.py \
   vllm --model clean-work/model-bundle/hf \
+  --hardware-profile rtx-pro-6000 \
   --requests clean-work/workloads/requests.json \
   --quantization humming --graphs-without-compile --attention-backend FLASH_ATTN \
   --output clean-work/new-stock-run.jsonl --repeat 23
