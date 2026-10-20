@@ -942,11 +942,11 @@ impl GpuModel {
 #[cfg(test)]
 mod replay_tests {
     use super::*;
+    use anyhow::Context;
     #[test]
     fn reused_graphs_match_eager() -> Result<()> {
-        let Some(bundle) = std::env::var_os("CLEAN_MODEL_BUNDLE") else {
-            return Ok(());
-        };
+        let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE")
+            .context("set CLEAN_MODEL_BUNDLE to run the full-model eager/graph replay test")?;
         let model = Model::load(Path::new(&bundle))?;
         let gpu = GpuModel::new(&model)?;
         // Resize prefill scratch, cross graph/attention dispatch boundaries,

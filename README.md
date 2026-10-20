@@ -21,7 +21,7 @@ This is research-grade code, not an accuracy-certified model server.
 
 ## Requirements
 
-- Linux with an SM120 NVIDIA GPU (developed on an RTX PRO 6000 Blackwell Max-Q, driver 580.159.04) and CUDA 12.8. CUDA 13.1 is used only for Compute Sanitizer and the stock-engine comparisons.
+- Linux with an SM120 NVIDIA GPU (including the RTX 5090) and a working NVIDIA driver. The pinned cuda-rust bindings require CUDA 13.0 or newer; the Nix shell supplies CUDA 13.4. Historical benchmark environments are recorded separately in the results.
 - The pinned Rust toolchain (`rust-toolchain.toml`, nightly-2026-08-28).
 - The NVIDIA cuda-rust submodule (`vendor/cuda-rust`) at the pinned revision. Its cuda-oxide documentation covers codegen-backend prerequisites.
 - Python with PyTorch, `safetensors` and `numpy` for model preparation and reference fixtures.
@@ -32,18 +32,19 @@ This is research-grade code, not an accuracy-certified model server.
 ```sh
 git clone --recurse-submodules https://github.com/bitemyapp/inferrous.git
 cd inferrous
-# Export the pinned checkpoint into a cuda-oxide bundle (refuses existing output).
-python3 crates/inferrous-qwen3/tools/prepare.py --source <hf-snapshot>/b968826d9c46dd6066d109eabc6255188de91218 \
-  --output clean-work/model-bundle
-# Build the cuda-oxide codegen backend once, from the pinned submodule.
-(cd vendor/cuda-rust/cuda-oxide/crates/rustc-codegen-cuda && cargo build --release)
-export CUDA_OXIDE_BACKEND=$PWD/vendor/cuda-rust/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
+nix develop
+# Download the pinned checkpoint and prepare the bundle, fixtures, and workloads.
+crates/inferrous-qwen3/tools/cuda.sh prepare
+# Build the pinned backend and SM120 engine in release mode.
 crates/inferrous-qwen3/tools/cuda.sh build
+crates/inferrous-qwen3/tools/cuda.sh test
 target/inferrous-gpu/release/inferrous-qwen3 clean-work/model-bundle \
   --prompt 'The capital of France is' --max-tokens 32
+# Three warmups and twenty measured requests for each of three prompt lengths.
+crates/inferrous-qwen3/tools/cuda.sh bench clean-work/local.jsonl
 ```
 
-The [engine guide](docs/qwen3-8b-w8a8/README.md) covers tests, operator fixtures, reference traces and benchmarks. The prepared bundle root, recorded in the [benchmarks](docs/qwen3-8b-w8a8/benchmarks.md), identifies an exact reproduction of the benchmarked weights.
+The [local Nix setup](docs/migrations/local-nix.md) covers prerequisites, existing checkpoints, checked builds and regression comparisons. The [engine guide](docs/qwen3-8b-w8a8/README.md) covers tests, operator fixtures, reference traces and benchmarks. The prepared bundle root, recorded in the [benchmarks](docs/qwen3-8b-w8a8/benchmarks.md), identifies an exact reproduction of the benchmarked weights.
 
 ## Layout
 

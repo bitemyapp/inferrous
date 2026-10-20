@@ -8,6 +8,7 @@
 - [Safety contract](qwen3-8b-w8a8/safety.md): device indexing, launch, graph and lifetime arguments.
 - Optimization records: [round 1](qwen3-8b-w8a8/optimization/round-1.md), [round 2](qwen3-8b-w8a8/optimization/round-2.md), [round 3](qwen3-8b-w8a8/optimization/round-3.md), [round 4](qwen3-8b-w8a8/optimization/round-4.md), [round 5](qwen3-8b-w8a8/optimization/round-5.md), [round 6](qwen3-8b-w8a8/optimization/round-6.md).
 - [Results summaries](qwen3-8b-w8a8/results/README.md) for every round.
+- [RTX 5090 Nix validation](qwen3-8b-w8a8/results/rtx5090-nix.md): local release/checked test results, benchmark timings and exact-output comparisons.
 
 ## Plans
 
@@ -16,6 +17,7 @@
 
 ## Maintenance
 
+- [Local Nix development](migrations/local-nix.md): CUDA and Rust setup, release tests, model preparation and RTX 5090 benchmarks.
 - [Migration to NVIDIA cuda-rust](migrations/cuda-rust.md): what changed, correctness, and compile-time and runtime before/after.
 
 ## Research

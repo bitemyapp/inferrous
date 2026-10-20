@@ -9,3 +9,4 @@ Each optimization round's raw artifacts (measurement JSONL, logs, profiles, scri
 | [Round 4 (2026-10-03)](round-4.md) | [round 4 record](../optimization/round-4.md) |
 | [Round 5 (2026-10-03)](round-5.md) | [round 5 record](../optimization/round-5.md) |
 | [Round 6 (2026-10-06)](round-6.md) | [round 6 record](../optimization/round-6.md) |
+| [RTX 5090 Nix validation (2026-10-20)](rtx5090-nix.md) | [Local Nix setup](../../migrations/local-nix.md), release/checked tests and benchmarks |
