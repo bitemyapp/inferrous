@@ -2,10 +2,11 @@
 # Run an unmodified stock engine with the host GPU and driver, including NixOS.
 set -euo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
-engine=${1:?Usage: stock_container.sh vllm COMMAND [ARGUMENTS...]}
+engine=${1:?Usage: stock_container.sh ENGINE COMMAND [ARGUMENTS...]}
 shift
 case "$engine" in
   vllm) image=vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34 ;;
+  sglang) image=lmsysorg/sglang@sha256:e3a4f06001a29542fc4a8638536d9ffc5eb9c9942b08603c09b19a56eae4a1ae ;;
   *) echo "Unsupported stock image: $engine" >&2; exit 2 ;;
 esac
 [[ $# -gt 0 ]] || { echo "Supply the container command, for example python3." >&2; exit 2; }

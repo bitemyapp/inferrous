@@ -125,3 +125,24 @@ The second pass adds shared-memory INT8 prefill tiles, exact norm/quantization f
 Nine tests pass in optimized and checked builds: independent operators, distinct-weight fused gate/up/activation, 1,328,443 native-rounding boundary and bit-pattern inputs against independent f64 nearest-even, exhaustive host/GPU BF16 reconstruction, admission/ties, capture cleanup and nineteen changing-input eager/graph comparisons. The latter cover seventeen prompt lengths through 4093, every graph capacity, long-to-short cache reuse and stop handling. All 138 final candidate requests preserve the original token IDs and all 4,416 complete-vocabulary hashes. The checked build matches all three workloads. Operator/argmax/packing memcheck, racecheck and synccheck, plus 512-token prefill and three-output full-model memcheck, report zero errors or hazards. Rust formatting and Python syntax checks pass. The restored optimized binary has the same SHA-256 as the measured binary. Results are retained beside the raw measurements. None of these replaces the still-failing independent full-model numerical gate.
 
 The final 512-token profile attributes 61.4% of GPU time to decode projections, 8.2% to the packed BF16 head, 9.0% to large prefill matrices and 5.1% to prefill attention. Longer prefill is the remaining performance target; preserving exact baseline arithmetic rules out replacing ordered floating-point reductions with a different reduction schedule without a separate numerical/quality decision.
+
+## Paged and stock batch harnesses
+
+`tools/bench_batch.py` runs the paged engine using a JSON object mapping workload names to request arrays. Each array may contain homogeneous or ragged prompts and different positive output limits; timing workloads use empty stop lists. It records every repetition, verifies complete deterministic outputs, and checks the exact processed-token count for full recomputation. The [session guide](sessions.md) describes configuration, native-context preparation and timing boundaries.
+
+`tools/bench_engines.py` accepts the same named arrays, while retaining compatibility with the earlier single-request workload objects. `--cache-mode reuse` uses ordinary multi-token generation. `--cache-mode recompute` submits the entire growing prefix as a new one-token request at each step, retires finished sequences, and requires prefix caching disabled. It retains each step's submitted lengths, elapsed times and backend metrics. Two host unit tests verify those submission sequences independently of a GPU. Run them with `python -m unittest discover -s crates/inferrous-qwen3/tools/tests -v` inside the Nix shell.
+
+The pinned stock containers are launched with `tools/stock_container.sh`, which supports `vllm` and `sglang` and mounts the host driver on NixOS without installing a system container runtime. The current vLLM compressed-tensors automatic INT8 backend rejects SM120; select its supported Triton backend explicitly. For example, from the repository root:
+
+```sh
+crates/inferrous-qwen3/tools/stock_container.sh vllm python3 \
+  /workspace/crates/inferrous-qwen3/tools/bench_engines.py vllm \
+  --model /workspace/clean-work/model-bundle/hf \
+  --requests /workspace/clean-work/batch-workloads.json \
+  --output /workspace/clean-work/stock-batch-results.jsonl \
+  --hardware-profile rtx5090 --max-context 4096 --max-num-seqs 4 \
+  --quantization compressed-tensors --linear-backend triton \
+  --cache-mode reuse --repeat 23
+```
+
+Use a new output path for every run. Increasing context requires a matching workload, engine limit and memory budget; cold/warm prefix policy and verification overhead must be stated separately. Preserve failed engine logs and verify the expected number of JSONL records before accepting a result: a stock worker failure can terminate its parent without a useful process exit status. The current SGLang W8A8 kernel also rejects SM120. Humming runs but converts these FP32 per-channel weight scales to BF16; its effective precision is recorded separately. The [active round 7 record](optimization/round-7.md) distinguishes tested configurations, unsupported paths and the unfinished comparison matrix.
