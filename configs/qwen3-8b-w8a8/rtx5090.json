@@ -1,0 +1,9 @@
+{
+  "hardware": "rtx5090",
+  "max_context": 32768,
+  "max_batch": 16,
+  "prefill_chunk": 256,
+  "kv_cache_bytes": 12884901888,
+  "prefix_cache_entries": 32,
+  "verify_logits": false
+}

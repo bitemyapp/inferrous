@@ -49,6 +49,9 @@ impl Pool {
 #[derive(Clone, Debug)]
 pub struct CachePool(Arc<Pool>);
 impl CachePool {
+    pub fn owns(&self, lease: &CacheLease) -> bool {
+        Arc::ptr_eq(&self.0, &lease.pool)
+    }
     pub fn new(page_tokens: usize, pages: usize) -> Result<Self> {
         ensure!(
             page_tokens.is_power_of_two(),
@@ -111,6 +114,19 @@ pub struct CacheLease {
     written: usize,
 }
 impl CacheLease {
+    /// Discard initialized state while retaining private capacity for a fresh
+    /// full-prefix pass. The caller must fence previous GPU uses first.
+    pub fn restart(&mut self) -> Result<()> {
+        let state = self.pool.lock();
+        ensure!(
+            self.pages
+                .iter()
+                .all(|p| state.references[p.0 as usize] == 1),
+            "cannot invalidate shared prefix pages"
+        );
+        self.written = 0;
+        Ok(())
+    }
     pub fn pages(&self) -> &[PageId] {
         &self.pages
     }

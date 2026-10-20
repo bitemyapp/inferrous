@@ -1,10 +1,12 @@
 use crate::graph::Graph;
+mod batch;
 use crate::{
     CONTEXT, HIDDEN, VOCAB,
     kernels::device,
     model::{Generation, Model, Request, sha},
 };
 use anyhow::Result;
+pub use batch::{BatchEngine, BatchGeneration, Session, SessionOptions};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, PinnedHostBuffer, simt::LaunchConfig};
 use std::{
     collections::BTreeMap,

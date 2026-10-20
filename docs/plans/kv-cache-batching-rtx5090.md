@@ -20,10 +20,10 @@ Implement reusable KV caching, single-stream and batched execution, a real no-KV
 | Workstream | Required evidence | Status |
 |---|---|---|
 | Branch and reproducible baseline | Branch, baseline commit, saved executable/hash and raw measurements | Done: `491f1c2`, `clean-work/kv-batch-baseline/` |
-| Rust cache ownership/admission | Bounded paged allocation, transactional reservation, valid-token tracking, release/reuse and randomized invariant tests | Host allocator implemented; four tests pass, including 10,000 randomized ownership transitions; GPU integration pending |
-| Reusable sessions/prefixes | Cache hits avoid recomputation; misses, partial pages, reset and stale state are safe; outputs match recomputation | Pending |
-| Batched model execution | Shared-weight row batches, ragged sequence positions and attention, batched head/selection, bounded scratch | Pending |
-| True no-cache execution | Full prefix recomputed each output step; same prompt/output contract; valid batched baseline | Pending |
+| Rust cache ownership/admission | Bounded paged allocation, transactional reservation, valid-token tracking, release/reuse and randomized invariant tests | Implemented and integrated; host ownership tests and full-model release/checked admission, reuse and reclamation tests pass |
+| Reusable sessions/prefixes | Cache hits avoid recomputation; misses, partial pages, reset and stale state are safe; outputs match recomputation | Implemented; short-context exact full-model tests pass in release and checked builds |
+| Batched model execution | Shared-weight row batches, ragged sequence positions and attention, batched head/selection, bounded scratch | Implemented with bounded prefill and capacity waves; short-context exact model tests pass |
+| True no-cache execution | Full prefix recomputed each output step; same prompt/output contract; valid batched baseline | Implemented; processed-row counts and full-logit hashes validated; stock counterpart pending |
 | Longer context | Bounded/chunked prefill, attention through 32K, configurable RoPE/cache capacity, correct memory admission | Pending |
 | Hardware profiles | Explicit legacy PRO 6000 profile, independent 5090 tuning and metadata; no unmeasured cross-GPU claims | Pending |
 | Off-the-shelf comparison | Reproducible current vLLM/SGLang screening, eligible winner per scenario, true no-cache reference | vLLM 0.32.0 container pulled; PyTorch 2.13.0+cu130 executes on the RTX 5090 through explicit device/driver mounts; timing pending |
@@ -50,3 +50,7 @@ The unmodified `vllm/vllm-openai:v0.32.0` image is pinned by digest `sha256:befc
 The first successful screen uses Humming INT8, FLASH_ATTN, native decode graphs, 4K maximum context, one sequence, no prefix cache, memory fraction 0.70, and three warmups plus twenty measured repetitions per shape. vLLM resolves FULL graphs to FULL_DECODE_ONLY for this attention backend. It completes 69 requests: median decode 140.56 / 140.46 / 139.79 tokens/s and API latency 256.47 / 256.48 / 257.68 ms for 5 / 129 / 512 prompt tokens. This is one screened configuration, not the selected stock winner. Files are `clean-work/stock/vllm032-humming-fa2-baseline.jsonl`, `vllm032-humming-fa2-summary.json` and `vllm032-humming-fa2-baseline-attempt2.log`.
 
 The loader reports conversion of some O/down weight-scale parameters from FP32 to BF16. Review the stock quantizer's supported scale configuration and report any effective arithmetic difference before treating this as a precision-matched comparison. Do not patch stock kernels to manufacture a favorable baseline. Future harness runs require `--hardware-profile rtx5090` or `--hardware-profile rtx-pro-6000`; their default memory fractions are 0.70 and 0.30 respectively, with explicit overrides recorded. The first screen predates that required flag but records its effective fraction and is an RTX 5090 run.
+
+## Model integration checkpoint
+
+The [session guide](../qwen3-8b-w8a8/sessions.md) documents the new public Rust API, CLI and separate hardware capacity configurations. All 16 tests pass in release (29.46 seconds) and checked release (27.44 seconds), including ragged batched full-model comparisons, prefix hits, full recomputation, divergent session forks, stop boundaries and bounded admission waves. Hashes match the unchanged legacy engine exactly. Native RoPE extension is available and a 32K bundle was prepared with preserved original positions; full-model long-context checks and optimized timing remain pending.

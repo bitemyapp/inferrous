@@ -3,6 +3,7 @@
 ## Qwen3-8B W8A8 engine (`inferrous-qwen3`)
 
 - [Engine guide](qwen3-8b-w8a8/README.md): design, numerical contract, build, tests and reproduction.
+- [Paged sessions and batching](qwen3-8b-w8a8/sessions.md): configuration, CLI, ownership and validation status.
 - [Benchmarks](qwen3-8b-w8a8/benchmarks.md): workloads, timing boundaries and comparisons with stock engines.
 - [Validation coverage](qwen3-8b-w8a8/coverage.md) and [known numerical discrepancies](qwen3-8b-w8a8/discrepancies.md).
 - [Safety contract](qwen3-8b-w8a8/safety.md): device indexing, launch, graph and lifetime arguments.
