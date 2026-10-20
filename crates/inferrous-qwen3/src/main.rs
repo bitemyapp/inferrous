@@ -106,7 +106,8 @@ fn main() -> Result<()> {
                 serde_json::json!({"backend":"inferrous-paged", "profile":PROFILE,
                 "model_root":model.root, "requests":requests, "run":run,
                 "load_seconds":load_seconds, "generate_seconds":start.elapsed().as_secs_f64(),
-                "engine_config":engine.config(), "cache_mode":cache_mode, "batch":batch})
+                "engine_config":engine.config(), "device_name":engine.device_name(),
+                "cache_mode":cache_mode, "batch":batch})
             );
         }
         return Ok(());

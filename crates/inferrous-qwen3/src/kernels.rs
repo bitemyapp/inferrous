@@ -115,6 +115,46 @@ fn stage_values(
 }
 
 #[inline(always)]
+fn stage_values_paged(
+    tile: *mut u32,
+    probability: *mut f32,
+    scores: &[f32],
+    v: &[u16],
+    query: usize,
+    stride: usize,
+    page: usize,
+    kv: usize,
+    column: usize,
+    t: usize,
+    base: usize,
+    end: usize,
+) {
+    let slot = base / 64 % 2;
+    // A physical page contains a complete 64-token tile even at a causal tail.
+    // Two shared slots let the next page load overlap ordered accumulation.
+    unsafe {
+        if base + t < end {
+            *probability.add(slot * 64 + t) = scores[query * stride + base + t];
+        }
+        if base + t + 32 < end {
+            *probability.add(slot * 64 + t + 32) = scores[query * stride + base + t + 32];
+        }
+        let mut piece = 0;
+        while piece < 8 {
+            let i = t + piece * 32;
+            cuda_device::async_copy::cp_async_ca_16(
+                tile.add(slot * 1024 + i * 4),
+                v.as_ptr()
+                    .add((page * 64 + i / 4) * 1024 + kv * 128 + column + i % 4 * 8)
+                    .cast::<u32>(),
+            );
+            piece += 1;
+        }
+        cuda_device::async_copy::cp_async_commit_group();
+    }
+}
+
+#[inline(always)]
 fn best_warp(mut value: f32, mut index: u32, mut bad: u32) -> (f32, u32, u32) {
     let mut d = 16;
     while d > 0 {
@@ -2633,16 +2673,57 @@ pub mod device {
         mut out: DisjointSlice<f32>,
     ) {
         dependency_wait();
+        static mut TILE: SharedArray<u32, 2048, 16> = SharedArray::UNINIT;
+        static mut PROB: SharedArray<f32, 128> = SharedArray::UNINIT;
         let block = thread::blockIdx_x() as usize;
         let query = block / 4;
-        let coordinate = block % 4 * 32 + thread::threadIdx_x() as usize;
+        let column = block % 4 * 32;
+        let t = thread::threadIdx_x() as usize;
         let slot = row_info[query / 32 * 2] as usize;
         let end = row_info[query / 32 * 2 + 1] as usize + 1;
         let kv = query % 32 / 4;
+        let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+        let halves = tile.cast::<u16>();
+        let probability = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PROB) };
+        stage_values_paged(
+            tile,
+            probability,
+            scores,
+            v,
+            query,
+            stride as usize,
+            page_table[slot * pages_per_sequence as usize] as usize,
+            kv,
+            column,
+            t,
+            0,
+            end,
+        );
         let mut sum = 0.0;
         let mut base = 0;
         while base < end {
-            let page = page_table[slot * pages_per_sequence as usize + base / 64] as usize;
+            unsafe {
+                cuda_device::async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            if base + 64 < end {
+                let page = page_table[slot * pages_per_sequence as usize + base / 64 + 1] as usize;
+                stage_values_paged(
+                    tile,
+                    probability,
+                    scores,
+                    v,
+                    query,
+                    stride as usize,
+                    page,
+                    kv,
+                    column,
+                    t,
+                    base + 64,
+                    end,
+                );
+            }
+            let shared_slot = base / 64 % 2;
             let mut j = 0;
             let count = (end - base).min(64);
             #[unroll(8)]
@@ -2650,16 +2731,17 @@ pub mod device {
                 sum = add(
                     sum,
                     mul(
-                        scores[query * stride as usize + base + j],
-                        widen(v[(page * 64 + j) * 1024 + kv * 128 + coordinate]),
+                        unsafe { *probability.add(shared_slot * 64 + j) },
+                        widen(unsafe { *halves.add(shared_slot * 2048 + j * 32 + t) }),
                     ),
                 );
                 j += 1;
             }
+            thread::sync_threads();
             base += 64;
         }
         unsafe {
-            *out.get_unchecked_mut(query * 128 + coordinate) = bf(sum);
+            *out.get_unchecked_mut(query * 128 + column + t) = bf(sum);
         }
     }
     #[kernel]

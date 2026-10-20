@@ -69,6 +69,8 @@ struct Prefix {
 }
 
 struct Step {
+    // Captured storage must be destroyed before any of its allocations.
+    graph: Option<Graph>,
     shape: (usize, usize, usize),
     w: Workspace,
     input: DeviceBuffer<u32>,
@@ -85,6 +87,7 @@ impl Step {
     ) -> Result<Self> {
         let (n, output_rows, stride) = shape;
         Ok(Self {
+            graph: None,
             shape,
             w: Workspace::with_shape(stream, n, output_rows.max(1), stride)?,
             input: DeviceBuffer::zeroed(stream, n)?,
@@ -103,11 +106,22 @@ impl Drop for Step {
 }
 
 struct Execution {
-    caches: Vec<Cache>,
+    // A step can capture these caches: fence and destroy its graph first.
     decode: Option<Step>,
     prefill: Option<Step>,
     prefixes: VecDeque<Prefix>,
+    caches: Vec<Cache>,
     poisoned: bool,
+}
+
+struct ExecutionFence(Option<Arc<CudaStream>>);
+impl Drop for ExecutionFence {
+    fn drop(&mut self) {
+        // A host panic must also fence before caller-owned leases can unwind.
+        if let Some(stream) = &self.0 {
+            stream.context().record_err(stream.synchronize());
+        }
+    }
 }
 
 pub struct BatchEngine {
@@ -116,11 +130,14 @@ pub struct BatchEngine {
     gpu: GpuModel,
     config: EngineConfig,
     model_root: String,
+    device_name: String,
 }
 
 impl BatchEngine {
     pub fn new(model: &Model, config: EngineConfig) -> Result<Self> {
-        config.validate(model.max_context)?;
+        config.validate(model.max_context())?;
+        let device_name = CudaContext::new(0)?.device_name()?;
+        config.hardware.validate_device(&device_name)?;
         let pool = CachePool::with_byte_budget(PAGE_TOKENS, config.kv_cache_bytes)?;
         let gpu = GpuModel::new(model)?;
         let elements = pool.usage().total_pages * PAGE_TOKENS * 1024;
@@ -145,11 +162,15 @@ impl BatchEngine {
             gpu,
             config,
             model_root: model.root.clone(),
+            device_name,
         })
     }
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+    pub fn device_name(&self) -> &str {
+        &self.device_name
     }
     pub fn cache_usage(&self) -> CacheUsage {
         self.pool.usage()
@@ -364,6 +385,7 @@ impl BatchEngine {
             "batch engine failed previously; recreate it"
         );
         self.gpu.stream.synchronize()?;
+        let mut lease_fence = ExecutionFence(Some(self.gpu.stream.clone()));
         for (session, option) in sessions.iter_mut().zip(options) {
             if option.cache == CacheMode::Recompute {
                 session.cache.reset();
@@ -456,7 +478,24 @@ impl BatchEngine {
                     step.outputs
                         .copy_from_host(&self.gpu.stream, &output_rows)?;
                 }
-                self.forward(step, caches, pages_per_sequence)?;
+                if self.config.cuda_graphs && input.len() == output_slots.len() {
+                    if step.graph.is_none() {
+                        // SAFETY: Step and Execution own all captured buffers.
+                        // Metadata copies complete before capture/replay, and the
+                        // execution mutex excludes every concurrent mutation.
+                        // Multirow kernels use ordinary full-completion edges.
+                        step.graph = Some(unsafe {
+                            Graph::capture(&self.gpu.stream, false, || {
+                                self.forward(step, caches, pages_per_sequence)
+                            })?
+                        });
+                    }
+                    unsafe {
+                        step.graph.as_ref().expect("captured above").launch()?;
+                    }
+                } else {
+                    self.forward(step, caches, pages_per_sequence)?;
+                }
                 self.gpu.stream.synchronize()?;
                 for (slot, end) in ends {
                     sessions[slot].cache.commit_append(end)?;
@@ -504,6 +543,9 @@ impl BatchEngine {
             Ok(())
         })();
         let fence = self.gpu.stream.synchronize();
+        if fence.is_ok() {
+            lease_fence.0 = None;
+        }
         if outcome.is_err() || fence.is_err() {
             execution.poisoned = true;
         }
@@ -752,6 +794,52 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CLEAN_LONG_MODEL_BUNDLE with 32768 RoPE positions and 9 GiB KV capacity"]
+    fn native_context_ragged_recompute_and_chunk_invariance() -> Result<()> {
+        let bundle = std::env::var_os("CLEAN_LONG_MODEL_BUNDLE")
+            .context("set CLEAN_LONG_MODEL_BUNDLE to an extended 32768-token bundle")?;
+        let model = Model::load(Path::new(&bundle))?;
+        let mut config = EngineConfig::for_hardware(HardwareProfile::Rtx5090, 32768);
+        config.max_batch = 4;
+        config.kv_cache_bytes = 9 << 30;
+        let mut engine = BatchEngine::new(&model, config)?;
+        let requests: Vec<_> = [8192, 16384, 32766]
+            .into_iter()
+            .enumerate()
+            .map(|(i, length)| request(length, i as u32 + 50, 2))
+            .collect();
+        let cold = engine.generate(&model, &requests, CacheMode::Reuse)?;
+        eprintln!("native context cold pass: {:.3}s", cold.elapsed_seconds);
+        assert_eq!(cold.reused_tokens, 0);
+        assert_eq!(cold.processed_tokens, 8193 + 16385 + 32767);
+        let warm = engine.generate(&model, &requests, CacheMode::Reuse)?;
+        eprintln!("native context warm pass: {:.3}s", warm.elapsed_seconds);
+        assert_eq!(warm.reused_tokens, 8128 + 16320 + 32704);
+        assert_eq!(
+            warm.processed_tokens + warm.reused_tokens,
+            cold.processed_tokens
+        );
+        for (actual, expected) in warm.generations.iter().zip(&cold.generations) {
+            same(actual, expected);
+        }
+        engine.clear_prefixes()?;
+        engine.config.prefill_chunk = 128;
+        engine.config.cuda_graphs = false;
+        let fresh = engine.generate(&model, &requests, CacheMode::Recompute)?;
+        assert_eq!(fresh.reused_tokens, 0);
+        assert_eq!(fresh.processed_tokens, 2 * (8192 + 16384 + 32766) + 3);
+        for (actual, expected) in fresh.generations.iter().zip(&cold.generations) {
+            same(actual, expected);
+        }
+        assert_eq!(engine.cache_usage().used_pages, 0);
+        eprintln!(
+            "native context cold {:.3}s; warm {:.3}s; recompute {:.3}s",
+            cold.elapsed_seconds, warm.elapsed_seconds, fresh.elapsed_seconds
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ragged_sessions_prefixes_and_recomputation_match_legacy() -> Result<()> {
         let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE")
             .context("set CLEAN_MODEL_BUNDLE for batched model validation")?;
@@ -759,7 +847,7 @@ mod tests {
         let mut config = EngineConfig::for_hardware(HardwareProfile::Rtx5090, 4096);
         config.max_batch = 8;
         config.kv_cache_bytes = 512 << 20;
-        let engine = BatchEngine::new(&model, config)?;
+        let mut engine = BatchEngine::new(&model, config)?;
         let requests: Vec<_> = [1, 5, 65, 129, 257]
             .into_iter()
             .enumerate()
@@ -803,10 +891,12 @@ mod tests {
             same(actual, expected);
         }
         let reversed: Vec<_> = requests.iter().rev().cloned().collect();
+        engine.config.cuda_graphs = false;
         let reordered = engine.generate(&model, &reversed, CacheMode::Reuse)?;
         for (actual, expected) in reordered.generations.iter().rev().zip(&expected) {
             same(actual, expected);
         }
+        engine.config.cuda_graphs = true;
 
         // A stopped sequence must not change surviving members or their slot mapping.
         let mut stopping = requests.clone();

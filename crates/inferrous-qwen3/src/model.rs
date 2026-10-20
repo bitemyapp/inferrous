@@ -31,7 +31,7 @@ pub(crate) struct Layer {
     pub(crate) weights: BTreeMap<String, Matrix>,
 }
 pub struct Model {
-    pub max_context: usize,
+    max_context: usize,
     pub(crate) layers: Vec<Layer>,
     pub(crate) embedding: Vec<u16>,
     pub(crate) head: Vec<u16>,
@@ -44,6 +44,12 @@ pub fn sha(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 impl Model {
+    /// Validated RoPE capacity; callers cannot enlarge it without loading a
+    /// bundle with the corresponding table and tensor hash.
+    pub fn max_context(&self) -> usize {
+        self.max_context
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = fs::read(path.join("manifest.json"))?;
         let m: Manifest = serde_json::from_slice(&bytes)?;

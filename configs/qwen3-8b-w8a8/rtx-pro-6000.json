@@ -5,5 +5,6 @@
   "prefill_chunk": 512,
   "kv_cache_bytes": 68719476736,
   "prefix_cache_entries": 32,
-  "verify_logits": false
+  "verify_logits": false,
+  "cuda_graphs": true
 }

@@ -54,6 +54,7 @@
         packages = [
           rust
           cuda
+          pkgs.cudaPackages_13.cuda_sanitizer_api
           llvm.clang
           llvm.libclang
           python

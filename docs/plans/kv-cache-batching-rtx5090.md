@@ -24,11 +24,11 @@ Implement reusable KV caching, single-stream and batched execution, a real no-KV
 | Reusable sessions/prefixes | Cache hits avoid recomputation; misses, partial pages, reset and stale state are safe; outputs match recomputation | Implemented; short-context exact full-model tests pass in release and checked builds |
 | Batched model execution | Shared-weight row batches, ragged sequence positions and attention, batched head/selection, bounded scratch | Implemented with bounded prefill and capacity waves; short-context exact model tests pass |
 | True no-cache execution | Full prefix recomputed each output step; same prompt/output contract; valid batched baseline | Implemented; processed-row counts and full-logit hashes validated; stock counterpart pending |
-| Longer context | Bounded/chunked prefill, attention through 32K, configurable RoPE/cache capacity, correct memory admission | Pending |
-| Hardware profiles | Explicit legacy PRO 6000 profile, independent 5090 tuning and metadata; no unmeasured cross-GPU claims | Pending |
+| Longer context | Bounded/chunked prefill, attention through 32K, configurable RoPE/cache capacity, correct memory admission | Implemented; ragged full-model 8K/16K/near-32K cold/warm/recompute/chunk tests pass in release and checked release |
+| Hardware profiles | Explicit legacy PRO 6000 profile, independent 5090 tuning and metadata; no unmeasured cross-GPU claims | Separate capacity configurations, actual-device validation and metadata implemented; performance tuning remains active |
 | Off-the-shelf comparison | Reproducible current vLLM/SGLang screening, eligible winner per scenario, true no-cache reference | vLLM 0.32.0 container pulled; PyTorch 2.13.0+cu130 executes on the RTX 5090 through explicit device/driver mounts; timing pending |
 | GPU correctness | Operator fixtures, solo/batched/cache/no-cache comparisons, checked builds, sanitizer coverage, long-context checks | Paged attention operator tests added: ragged/shuffled pages are bit-exact with contiguous attention; a 32K uniform-attention reference passes. Model-level batched/long-context checks remain pending |
-| Optimization | Profiles, retained/rejected experiments, paired measurements across all scenarios | Pending |
+| Optimization | Profiles, retained/rejected experiments, paired measurements across all scenarios | Paged PV staging retained after exact-output paired 8K experiment; decode graphs validated; full matrix pending |
 | Final report and completion audit | Requirement-by-requirement evidence, complete comparison tables, remaining limitations | Pending |
 
 ## Initial findings
@@ -54,3 +54,7 @@ The loader reports conversion of some O/down weight-scale parameters from FP32 t
 ## Model integration checkpoint
 
 The [session guide](../qwen3-8b-w8a8/sessions.md) documents the new public Rust API, CLI and separate hardware capacity configurations. All 16 tests pass in release (29.46 seconds) and checked release (27.44 seconds), including ragged batched full-model comparisons, prefix hits, full recomputation, divergent session forks, stop boundaries and bounded admission waves. Hashes match the unchanged legacy engine exactly. Native RoPE extension is available and a 32K bundle was prepared with preserved original positions; full-model long-context checks and optimized timing remain pending.
+
+## Native model and staged-value checkpoint
+
+The [active round 7 record](../qwen3-8b-w8a8/optimization/round-7.md) contains the paired eager 8K value-kernel experiment: 17.6% lower generation latency and 3.33× decode throughput, with all full-logit hashes preserved. Ragged native-context model tests pass in release (305.58 seconds) and checked release (321.73 seconds), with logs `native-context-tests.log` and `native-context-checked.log` under `clean-work/kv-batch-baseline/`. They validate cold/warm prefix reuse, complete recomputation, chunk-size changes and eager/graph decode through the native context limit. The ordinary GPU suite passes 16 tests with the long test explicitly ignored by default; `cuda.sh test` now forwards test-runner arguments for that separate run. Long prefill remains expensive and is a principal optimization target.

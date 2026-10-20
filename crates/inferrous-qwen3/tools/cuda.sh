@@ -7,9 +7,10 @@ repo_dir=$(cd -- "$crate_dir/../.." && pwd)
 tools_dir="$crate_dir/tools"
 case "$mode" in
   prepare) exec python3 "$tools_dir/prepare_local.py" "$@" ;;
-  build|test)
+  build)
     [[ $# == 0 ]] || { echo "$mode does not accept arguments" >&2; exit 2; }
     ;;
+  test) ;;
   bench)
     if [[ $# -lt 1 || $# -gt 2 ]]; then
       echo "Usage: $0 bench OUTPUT.jsonl [BASELINE.jsonl]" >&2
@@ -67,6 +68,8 @@ target_dir="$repo_dir/target/inferrous-gpu"
 if [[ ${CLEAN_BOUNDS_CHECKS:-0} == 1 ]]; then target_dir+="-checked"; fi
 build_mode=$mode
 if [[ "$mode" == bench ]]; then build_mode=build; fi
+test_args=()
+if [[ "$mode" == test && $# -gt 0 ]]; then test_args=(-- "$@"); fi
 cd "$crate_dir"
 cargo run --locked --release --manifest-path "$oxide_dir/Cargo.toml" \
   --target-dir "$repo_dir/target/cargo-oxide" -p cargo-oxide -- \
@@ -74,7 +77,7 @@ cargo run --locked --release --manifest-path "$oxide_dir/Cargo.toml" \
   "${index_options[@]}" \
   --cargo-target-dir "$target_dir" \
   --device-codegen-crate inferrous-qwen3 \
-  -- --locked --release --features gpu -p inferrous-qwen3
+  -- --locked --release --features gpu -p inferrous-qwen3 "${test_args[@]}"
 
 if [[ "$mode" == bench ]]; then
   python3 "$tools_dir/bench_clean.py" --binary "$target_dir/release/inferrous-qwen3" \
