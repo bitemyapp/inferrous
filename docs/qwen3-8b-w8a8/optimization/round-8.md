@@ -654,3 +654,27 @@ Meanwhile, three more racecheck partitions complete with all 56 original outputs
 | `head_packed_eight_staged` | 4 | 414.84 s | 12,312,408,064 | `270438ca6bd9c8a04d37f12828b9e8b32880fae618a40f545da93d3eaf091548` |
 | `head_packed_sixteen_staged` | 3 | 630.08 s | 11,995,082,752 | `6a6e337b80614a55be0a4bee1856a3f739f9219d851d4e25c4c4fbf6b958bbfe` |
 | `linear` | 108 | 22.41 s | 36,906,123,264 | `3e27fd3bc3476eb5a152a5bd288444a70e3a3f968f89bc88fade21a131b48ab4` |
+
+## Projection resource experiments and completed large-kernel partitions
+
+An isolated `inferrous-projection-lifetimes` worktree investigates reducing the original 64×128 INT8 projection's register and shared-memory footprint while preserving all integer products and FP32 scale/BF16 boundaries. The main worktree and production dispatch remain unchanged. All compilation and static inspection run on `wx-workstation`; no GPU tests or timings are claimed for these candidates.
+
+The first candidate consumes one B fragment before loading the next, shortening the source-level live ranges. Its frozen release test executable compiles, but both kernels use 66 registers, zero stack/local storage and 26,624 shared bytes. Their 872 disassembled instruction texts are identical. This is not a new arithmetic or performance result and does not justify a GPU timing run. `projection-lifetimes-v1/static-audit.json` has SHA-256 `627f54dff5dd4815980539df1b70dacfb22870e35d95a76f682de08896a67494`, source patch `0826523e132be8d3f9d2e975d9cc181cfdf49b70a5ec421071e728ebba77b859`, and frozen executable `4f71388841f2d5392532fb116969d5bea5b8d1293be3177015328836d22e05a1`.
+
+Packing the A/B tiles and barrier into one static allocation also leaves the reported shared footprint unchanged. A dynamic-storage alternative keeps A/B in a declared 24,576-byte dynamic allocation and places the barrier in static storage; its 2,048 static bytes again produce a 26,624-byte total. Four-block launch bounds reduce registers to 64 but introduce a 16-byte stack frame, with ptxas reporting 16 bytes of spill stores and 32 bytes of spill loads. Read-only driver attributes report 102,400 shared bytes, 65,536 registers and 1,536 threads per SM. Four reported shared footprints would require 106,496 bytes, so these variants do not demonstrate the intended four-block fit. There is no resource-based reason to retain them or add GPU profiling to the queue.
+
+| Variant | Registers | Stack bytes | Static shared bytes | Declared dynamic bytes | Total shared bytes |
+|---|---:|---:|---:|---:|---:|
+| Original / reordered B fragments / packed static | 66 | 0 | 26,624 | 0 | 26,624 |
+| Packed static, four-block bound | 64 | 16 | 26,624 | 0 | 26,624 |
+| Dynamic A/B, static barrier | 66 | 0 | 2,048 | 24,576 | 26,624 |
+| Dynamic A/B, static barrier, four-block bound | 64 | 16 | 2,048 | 24,576 | 26,624 |
+
+The first dynamic build incorrectly treated launch-contract `domain` as a kernel identifier rather than dimensionality; the type checker rejects its one-dimensional output and launch configuration. That failed source/log/receipt remain under `projection-lifetimes-v3/`. Corrected one-dimensional contracts compile in v4. Its source patch SHA-256 is `f31dfca2d50cb055edbae5381c869ea64487ec1e8300388fe64f325d50c80bdc`, kernel `a30be771f8cb18aae164d444110af69192f2ef3e4d41b8120672e09d04fceae9`, frozen release test executable `6cab1e622332214f52640234ccfbe0e74b228fa92e672fbb6b0519ac44a357df`, build receipt `76bd02d858d9c479f8a12e96e516f036ca48f9199264835529c2b0b4f1fc0cf3`, and resource summary `51eb9eb7b1f541e2171fddc4258a6345adae4032072e29aaaeb559f227a32d8b`. The isolated conformance/profile additions are compiled but unexecuted. These resource experiments are set aside; they do not establish correctness or measured speed changes.
+
+The original and pipelined large-projection racechecks meanwhile complete on the unchanged production candidate. Both preserve all 56 original full-vocabulary hashes and tokens, and their complete result/log/model/stderr identities pass verification. Completed coverage is now 1,924 of 5,216 launches across fifteen families. The narrow-pipeline partition is running; aggregate acceptance and the queued numerical diagnostic remain pending.
+
+| Kernel family | Checked launches | Wall time | Peak process-group RSS, bytes | Validation SHA-256 |
+|---|---|---|---|---|
+| `linear_large` | 144 | 617.08 s | 11,808,100,352 | `85bbca750c7522b6016f44be488bea6f9d310de14946be2cdb0a40a016de7bd0` |
+| `linear_large_pipeline` | 216 | 678.13 s | 11,434,381,312 | `010cdaa9c4a9b2ad6569335739a3b9f1c65716134172ea0a47782d3593336b47` |
