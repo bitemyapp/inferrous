@@ -1,6 +1,7 @@
 """Exercise failure/recovery boundaries without GPU execution."""
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -61,6 +62,53 @@ class ExecutionPlanTests(unittest.TestCase):
             self.assertEqual(runner.execute_suite(self.plan, self.job, 'test-gpu', 'executor-sha'), saved)
         idle.assert_not_called()
         run.assert_not_called()
+
+    def test_real_process_and_monitor_lifecycle_with_cpu_only_stand_ins(self):
+        # Exercise Popen, telemetry files, termination and receipt creation.
+        # The fake nvidia-smi is first on PATH; no CUDA/GPU process is started.
+        programs = self.root / 'programs'
+        programs.mkdir()
+        monitor = programs / 'nvidia-smi'
+        monitor.write_text('''#!/usr/bin/env python3
+import sys,time
+if '--query-compute-apps=pid' in sys.argv:
+    pass
+else:
+    print('time,name,util,memory,sm,mem,temp,power', flush=True)
+    print('0,test-gpu,0,0,0,0,0,0', flush=True)
+    while True:
+        time.sleep(1)
+''')
+        monitor.chmod(0o755)
+        payload = self.root / 'payload.jsonl'
+        self.save_records(payload, self.records)
+        backend = self.root / 'cpu_backend.py'
+        backend.write_text('''import pathlib,shutil,sys,time
+output=pathlib.Path(sys.argv[sys.argv.index('--output')+1])
+telemetry=output.with_suffix('.telemetry.csv')
+deadline=time.monotonic()+5
+while not telemetry.exists() or telemetry.stat().st_size==0:
+    if time.monotonic()>deadline:
+        raise RuntimeError('CPU monitor did not start')
+    time.sleep(.01)
+shutil.copyfile('payload.jsonl',output)
+print('CPU-only backend completed',flush=True)
+''')
+        self.job['argv'] = [sys.executable, str(backend)] + self.job['argv'][1:]
+        self.plan['inputs_sha256'].update({name: runner.sha(self.root / name) for name in
+                                         ['cpu_backend.py', 'payload.jsonl', 'programs/nvidia-smi']})
+        path = str(programs) + os.pathsep + os.environ['PATH']
+        self.plan['environment']['PATH'] = path
+        with patch.dict(os.environ, PATH=path):
+            result = runner.execute_suite(self.plan, self.job, 'test-gpu', 'executor-sha')
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['exit_code'], 0)
+        self.assertEqual(result['telemetry_samples'], 1)
+        paths = runner.paths_for(self.output)
+        process = json.loads(paths['process'].read_text())
+        self.assertGreater(process['pid'], 0)
+        self.assertEqual(process['argv'], self.job['argv'])
+        self.assertIn('CPU-only backend completed', paths['stdout'].read_text())
 
     def test_complete_looking_output_with_nonzero_exit_is_never_accepted(self):
         def failure(plan, job, paths):
