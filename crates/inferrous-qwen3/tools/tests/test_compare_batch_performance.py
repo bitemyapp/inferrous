@@ -80,6 +80,7 @@ class PerformanceComparisonTests(unittest.TestCase):
         for record in self.slow + self.fast:
             record["cache_mode"] = "recompute"
             record["recompute_steps"] = [dict(slots=[0], prompt_lengths=[3 + i], elapsed_seconds=i + 1.0) for i in range(2)]
+            record["generations"][0]["backend_metrics"] = [dict(num_cached_tokens=0) for _ in range(2)]
         self.report()
         self.fast[-1]["recompute_steps"][-1]["prompt_lengths"] = [1]
         with self.assertRaisesRegex(ValueError, "complete active prefixes"):

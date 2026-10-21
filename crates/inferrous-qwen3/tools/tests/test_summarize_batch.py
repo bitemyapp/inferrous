@@ -40,6 +40,48 @@ class SummaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             summary.measurements(record)
 
+    def test_stock_prefix_metrics_distinguish_hits_zero_and_unknown(self):
+        record = self.record()
+        record.update(engine="vllm", prefix_cache=True)
+        for request, generation, cached in zip(record["requests"], record["generations"], [64, 0]):
+            request["prompt_ids"] = [1] * 129
+            generation["backend_metrics"]["num_cached_tokens"] = cached
+        self.assertEqual(summary.measurements(record)["reused_tokens"], [64])
+        record["generations"][0]["backend_metrics"]["num_cached_tokens"] = 0
+        self.assertEqual(summary.measurements(record)["reused_tokens"], [0])
+        record["generations"][1]["backend_metrics"]["num_cached_tokens"] = None
+        self.assertEqual(summary.measurements(record)["reused_tokens"], [])
+
+    def test_stock_prefix_counter_cannot_exceed_prompt_or_contradict_policy(self):
+        record = self.record()
+        record.update(engine="vllm", prefix_cache=False)
+        for request, generation in zip(record["requests"], record["generations"]):
+            request["prompt_ids"] = [1] * 5
+            generation["backend_metrics"]["num_cached_tokens"] = 1
+        with self.assertRaisesRegex(ValueError, "caching disabled"):
+            summary.measurements(record)
+        record["prefix_cache"] = True
+        for invalid in [-1, 6, 1.5, True]:
+            record["generations"][0]["backend_metrics"]["num_cached_tokens"] = invalid
+            with self.assertRaisesRegex(ValueError, "invalid stock"):
+                summary.measurements(record)
+
+    def test_recompute_reports_all_submissions_and_rejects_cached_work(self):
+        record = self.record()
+        record.update(engine="vllm", cache_mode="recompute", prefix_cache=False,
+                      recompute_steps=[dict(slots=slots, elapsed_seconds=elapsed)
+                        for slots, elapsed in [([0, 1], 0.5), ([0, 1], 1.5), ([0], 2.5), ([0], 3.5)]])
+        for request, generation in zip(record["requests"], record["generations"]):
+            request["prompt_ids"] = [1] * 5
+            generation["backend_metrics"] = [dict(num_cached_tokens=0) for _ in range(request["max_tokens"])]
+        self.assertEqual(summary.measurements(record)["reused_tokens"], [0])
+        record["generations"][0]["backend_metrics"][-1]["num_cached_tokens"] = 1
+        with self.assertRaisesRegex(ValueError, "caching disabled"):
+            summary.measurements(record)
+        record["generations"][0]["backend_metrics"].pop()
+        with self.assertRaisesRegex(ValueError, "incomplete stock cache"):
+            summary.measurements(record)
+
 
 if __name__ == "__main__":
     unittest.main()

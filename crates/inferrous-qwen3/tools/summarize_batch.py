@@ -37,6 +37,31 @@ def identity(record):
     return {field: record.get(field) for field in fields}
 
 
+def reused_tokens(record, local):
+    if local:
+        return [record["batch"]["reused_tokens"]]
+    if record.get("engine") != "vllm":
+        return []
+    counts = []
+    recompute = record["cache_mode"] == "recompute"
+    for request, generation in zip(record["requests"], record["generations"]):
+        metrics = generation["backend_metrics"]
+        submissions = metrics if recompute else [metrics]
+        if not isinstance(submissions, list) or len(submissions) != (request["max_tokens"] if recompute else 1):
+            raise ValueError("incomplete stock cache metrics")
+        for step, metric in enumerate(submissions):
+            cached = metric.get("num_cached_tokens")
+            if cached is not None:
+                limit = len(request["prompt_ids"]) + (step if recompute else 0)
+                if type(cached) is not int or not 0 <= cached <= limit:
+                    raise ValueError("invalid stock cached-token count")
+                if cached and (recompute or record.get("prefix_cache") is False):
+                    raise ValueError("stock reports prefix reuse with prefix caching disabled")
+            counts.append(cached)
+    # Missing native counters are unknown, never implicit zero-hit evidence.
+    return [sum(counts)] if counts and all(count is not None for count in counts) else []
+
+
 def measurements(record):
     local = record.get("backend") == "inferrous-paged"
     requests = record["requests"]
@@ -79,7 +104,7 @@ def measurements(record):
     return dict(api_seconds=[seconds], aggregate_output_tokens_per_second=[sum(len(g["token_ids"]) for g in generations) / seconds],
                 native_first_token_seconds=first_tokens, native_completion_seconds=completions,
                 native_per_stream_post_first_tokens_per_second=per_stream_decode,
-                reused_tokens=[record["batch"]["reused_tokens"]] if local else [],
+                reused_tokens=reused_tokens(record, local),
                 processed_tokens=[record["batch"]["processed_tokens"]] if local else [])
 
 
