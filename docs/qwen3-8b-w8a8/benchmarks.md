@@ -190,3 +190,15 @@ python crates/inferrous-qwen3/tools/summarize_batch.py \
 ```
 
 It excludes three warmups per workload per file and requires twenty measured samples per distinct executable/configuration/workload by default. Tuning pilots must explicitly lower `--min-samples` and label the smaller sample count. Complete request arrays, model roots, hardware, executable/image identities and settings separate series; reordered, missing or duplicate repetitions and incomplete outputs fail validation. The common host-call metrics are API latency and total output tokens divided by that latency, which also applies to ragged batches. Per-stream first-token/completion/post-first-output metrics retain the engine's native boundary: local generation-call timing, vLLM's native latency and monotonic timestamps, or recomputation-harness step completions. Do not treat those boundaries as interchangeable host-call measurements. Three additional host tests cover ragged completion accounting, timestamp domains and incomplete outputs. Percentile tails at these sample counts remain descriptive.
+
+Use `tools/compare_batch_performance.py` to compare complete matched series against every supplied stock candidate, separately for each cache/prefix mode:
+
+```sh
+python3 crates/inferrous-qwen3/tools/compare_batch_performance.py \
+  --local path/to/local-a1.jsonl path/to/local-a2.jsonl \
+  --stock path/to/stock-triton.jsonl path/to/stock-flashinfer.jsonl \
+  --workloads path/to/workloads.json \
+  --output path/to/new-performance-comparison.json
+```
+
+Every input must contain the complete workload set with matching request arrays and contiguous repetitions; distinct files can contribute samples to the same executable/configuration. The default excludes three warmups per file and requires twenty measurements per candidate and workload. The checker rejects duplicate file contents, changed identities within an input, verification-enabled local timings, precision changes, unmatched model/device/context/sequence/KV capacities, prefix-policy differences and incomplete recomputation submissions. It selects the lowest stock API median independently for each workload and reports local losses as well as gains. File hashes, candidate identities, sample counts and descriptive percentiles remain in the report. This establishes only the fastest supplied eligible candidate: exhaustive stock screening, numerical agreement, sanitizer gates and coverage of every required mode remain separate acceptance requirements. A stock engine whose actual KV capacity is not established cannot enter this explicitly matched-capacity comparison.
