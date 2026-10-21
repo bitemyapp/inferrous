@@ -14,6 +14,13 @@ esac
 driver_library=${NVIDIA_DRIVER_LIBRARY:-/run/opengl-driver/lib/libcuda.so.1}
 [[ -f "$driver_library" ]] || { echo "Set NVIDIA_DRIVER_LIBRARY to the host libcuda.so.1." >&2; exit 1; }
 driver_dir=$(dirname "$(readlink -f -- "$driver_library")")
+driver_utility_args=()
+# Some images rely on the NVIDIA container runtime to inject this utility.
+# Permit an explicit compatible host executable when using device binds instead.
+if [[ -n ${NVIDIA_SMI_BINARY:-} ]]; then
+  [[ -f "$NVIDIA_SMI_BINARY" && -x "$NVIDIA_SMI_BINARY" ]] || { echo "NVIDIA_SMI_BINARY must name an executable file." >&2; exit 1; }
+  driver_utility_args=(--volume "$(readlink -f -- "$NVIDIA_SMI_BINARY"):/usr/bin/nvidia-smi:ro")
+fi
 container_user="$(id -u):$(id -g)"
 # In rootless Docker, container root is the invoking host user; UID 1000 in
 # the container would instead map to a subordinate UID and lose file access.
@@ -25,6 +32,7 @@ exec docker run --rm \
   --shm-size 8g \
   --device /dev/nvidia0 --device /dev/nvidiactl --device /dev/nvidia-uvm \
   --volume "$driver_dir:/usr/local/nvidia/lib64:ro" \
+  "${driver_utility_args[@]}" \
   --volume "$repo_dir:/workspace:ro" \
   --volume "$repo_dir/clean-work:/workspace/clean-work" \
   --workdir /workspace \
