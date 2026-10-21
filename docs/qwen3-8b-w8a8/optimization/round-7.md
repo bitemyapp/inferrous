@@ -89,3 +89,63 @@ The same executable runs the original and tuned projection dispatch through `tun
 Cached API latency improves 15.1%, 10.1%, 6.6% and 7.1% at batches 2, 4, 8 and 16. The batch-1 and batch-32 controls use unchanged dispatch and are treated as unchanged. Full-prefix recomputation also remains effectively unchanged: original/tuned median API latencies in batch order are 129.34/130.02, 168.12/167.85, 266.95/269.25, 572.67/565.40, 1082.33/1079.71 and 2098.15/2098.40 ms. Its large prefill row counts mostly use the existing tiled dispatch. These measurements support the small cached-batch change; they do not imply a recomputation improvement.
 
 Raw records and full-logit probes are `clean-work/kv-batch-baseline/projection-{reuse,recompute}-{a1,b1,b2,a2,av,bv}.jsonl`; the summary and script are `projection-abba-summary.json` and `compare_projections.py`. One-second GPU temperature, power, clock, utilization and memory samples are retained in `projection-abba-telemetry.csv`. Among samples with at least 50% GPU utilization, SM clocks span 2557–2872 MHz (median 2625 MHz) and temperature spans 56–82°C. All GPU processes ran serially; desktop activity remained present. The regular release suite passes 16 tests in 30.83 seconds, with native-context and timing experiments explicitly ignored. The stock comparison matrix is still pending.
+
+## Grouped paged attention
+
+Four adjacent query heads share one KV head. The grouped score kernel stages that key tile once, then computes four independent ordered QK dots. The grouped value kernel likewise stages one V tile and four probability rows, preserving each sum's ascending key order. The softmax tree and rounding boundaries are unchanged. Shuffled-page/ragged operator tests match both the original paged probabilities and outputs exactly, then compare against the original contiguous implementation.
+
+The opt-in `grouped_attention_shapes` experiment flushes 256 MiB before each event-timed graph, takes three warmups and seven measured samples, and compares complete outputs for original scores/values, grouped scores only, grouped values only, and both grouped. Refined shapes cover 64/512/4096/32768 score strides and 1/2/4/8/16/64/256 rows where rows fit the stride. Grouped PV loses occupancy below sixteen rows; it is not used there. Grouped scores are selected at sixteen or more rows, at eight or more rows with stride at least 512, or at stride at least 4096. The RTX PRO 6000 policy remains unchanged. Raw operator data are `grouped-attention-profile-refined.log/json` under `clean-work/kv-batch-baseline/`.
+
+A/B/B/A model suites compare `tuned_attention: false/true` using one frozen executable, the extended bundle, 4 GiB KV, chunk 1024, no prefix caching, graph decode and verification disabled. Each process has one warmup and three measured repetitions, giving six measurements per variant. Separate full-logit probes match every output in both modes. Short prompts generate eight tokens; the 8192-token prompt generates eight cached outputs or two fully recomputed outputs. Comparisons within each mode have identical work; cached and recomputed columns are not interchangeable workloads.
+
+| Workload | Original cached API | Grouped cached API | Original recomputed API | Grouped recomputed API |
+|---|---:|---:|---:|---:|
+| Batch 1, prompt 129 | 55.275 ms | 54.187 ms | 127.514 ms | 119.981 ms |
+| Batch 2, prompt 129 | 66.002 ms | 64.227 ms | 166.998 ms | 151.476 ms |
+| Batch 4, prompt 129 | 84.875 ms | 81.081 ms | 269.610 ms | 238.115 ms |
+| Batch 8, prompt 129 | 134.384 ms | 127.304 ms | 564.269 ms | 506.810 ms |
+| Batch 16, prompt 129 | 222.073 ms | 207.204 ms | 1081.584 ms | 960.250 ms |
+| Batch 32, prompt 129 | 403.244 ms | 375.633 ms | 2107.165 ms | 1864.230 ms |
+| Batch 1, prompt 8192 | 4308.044 ms | 2056.210 ms | 8623.893 ms | 4046.580 ms |
+
+The 8K API improvements are 52.3% cached and 53.1% recomputed. Solo 8K cached decode remains approximately unchanged at 103.95 versus 105.80 tokens/s; most of the improvement is prefill. Short cached batches improve 2.0–6.8%, and short recomputation improves 5.9–11.7%. Artifacts are `grouped-attention-{reuse,recompute}-{a1,b1,b2,a2,av,bv}.jsonl`, `grouped-attention-abba-summary.json`, `compare_grouped_attention.py` and `grouped-attention-abba-telemetry.csv`. Native-context checked and sanitizer validation of the combined dispatch are recorded below.
+
+## Stock batch and native-context screening
+
+The first 4K-capacity screen covers 129-token prompts, eight outputs and batches 1/2/4/8/16/32 with FP32 weight scales and the Triton INT8 linear backend. Three warmups and six measured samples per workload favor FlashAttention with graphs and compilation disabled over compiled FlashAttention or compiled Triton attention. The graph-only capture list covers the batch sizes instead of inheriting the old solo-only setting. Its median API times are 71.95/72.47/89.32/109.36/155.09/224.84 ms. These are unpaired screening results, not final comparison samples. Artifacts are `clean-work/stock/vllm032-ct-triton-*-batch-screen.*`.
+
+A subsequent screen uses the extended bundle, 32768 total context, an explicit 12 GiB stock KV budget, and an added solo 8K prompt. Graph-only Triton attention leads the sampled short batches 1/2/4/32, while FlashInfer leads batches 8/16 and the 8K prompt. The 8K API medians are 451.71 ms for FlashAttention, 548.78 ms for Triton attention and 436.06 ms for FlashInfer. Inferrous's current grouped attention is still slower on this long-prefill case; no universal stock win is claimed. These results also have three warmups and six measured samples and need the final matched comparison runs. Artifacts are `vllm032-ct-triton-{fa,triton,flashinfer}-native-screen.*` and `vllm032-ct-triton-native-screen-summary.json`.
+
+B12X is absent from the official image. The separate Dockerfile installs vLLM 0.32.0's declared `b12x==1.5.1` optional dependency without changing other packages, and verifies all of its active dependency constraints. Both its default and graph-only native-context runs initially fail during the legacy CuTeDSL precompile hook because a real tensor lacks `fake_mode`. The supported `enable_cutedsl_warmup: false` setting avoids that hook and both retries complete all 63 records. Runtime compilation remains enabled; JIT warnings occur in the excluded initial warmup. The graph-only retry's median API times for short batches 1/2/4/8/16/32 and solo 8K are 80.81/80.85/81.74/93.74/143.75/227.70/451.71 ms; compiled B12X gives 102.35/102.05/103.71/130.60/167.39/260.26/489.01 ms. It does not lead these sampled workloads. Successful files are `vllm032-ct-triton-b12x-lazy{,-compiled}-native-screen.jsonl/log`; their immutable image ID is recorded in each row. Initial failures remain separate evidence and are not performance results.
+
+## Packed head groups
+
+The next head kernel decodes each losslessly packed BF16 weight once for four or eight independent output rows. Each output preserves the original lane-strided FP32 sum, warp reduction and final BF16 rounding. Two const specializations share one implementation; padded group members read an admitted row but never publish an output. The opt-in `grouped_head_shapes` test checks every complete vocabulary output for every batch size from 1 through 64, using reversed input-row selection and the real model head. All comparisons match exactly. The operator profile uses 256-thread blocks for all variants, three warmups and seven measured CUDA-event samples after cache eviction. The production original path retains its existing 128-thread launch; end-to-end comparison below tests that actual dispatch.
+
+The 32-row isolated head drops from roughly 11.6 ms with one dot per warp to 6.1 ms with four and 4.9 ms with eight. Group width eight is slower for 3–4 and 9–12 outputs, where padding dominates; those use width four. One and two outputs retain the original path. The other admitted output counts use width eight. `tuned_head: false` keeps the original interleaved head for comparison, and the PRO 6000 policy remains unchanged. The complete 64-shape test passes in 25.69 seconds; raw files are `grouped-head-all-profile.log` and the earlier four/eight-head profile files under `clean-work/kv-batch-baseline/`.
+
+A/B/B/A suites compare that final dispatch using one frozen executable, the extended bundle, 12 GiB KV, chunk 1024, no prefix caching, graph decode and verification disabled. Three warmups plus four measured samples per process give eight measured samples per variant. Each homogeneous request has 129 prompt tokens and eight outputs. A twelve-request ragged workload varies prompt and output lengths, exercising shrinking output groups and graph shapes. Separate verification probes match every full-logit hash across original/grouped heads and cached/recomputed modes. Cached work counts and full-prefix recomputation work counts also match exactly.
+
+| Workload | Original cached API | Grouped cached API | Original recomputed API | Grouped recomputed API |
+|---|---:|---:|---:|---:|
+| Batch 1 | 54.376 ms | 54.326 ms | 119.392 ms | 119.590 ms |
+| Batch 2 | 64.020 ms | 64.015 ms | 149.442 ms | 149.610 ms |
+| Batch 4 | 81.031 ms | 77.002 ms | 234.288 ms | 231.257 ms |
+| Batch 8 | 126.846 ms | 116.058 ms | 502.504 ms | 491.882 ms |
+| Batch 16 | 206.631 ms | 182.026 ms | 954.270 ms | 928.715 ms |
+| Batch 32 | 372.467 ms | 316.569 ms | 1848.993 ms | 1784.461 ms |
+| Ragged 12 | 124.569 ms | 116.958 ms | 222.747 ms | 214.488 ms |
+
+The unchanged one/two-row controls remain effectively unchanged. Cached improvements at batches 4/8/16/32 are 5.0/8.5/11.9/15.0%, and the ragged case improves 6.1%. Recomputed improvements are smaller because prefill dominates. Files are `grouped-head-{reuse,recompute}-{a1,b1,b2,a2,av,bv}.jsonl`, `grouped-head-abba-summary.json`, `compare_grouped_head.py` and `grouped-head-abba-telemetry.csv`. The ordinary release and checked suites both pass 16 tests (26.55/27.08 seconds), with four opt-in long-context/profiling tests explicitly ignored.
+
+The expanded projection profile also tests the existing TMA kernel below its production threshold. It is slower at 16–64 rows for the sampled shapes, and slower for Q/O/down at 128 rows. The 128-row gate/up case is promising (about 42.5 µs versus 75.1 µs with tiled projection), but is not yet retained; it requires a separate end-to-end experiment. Raw data are `projection-small-tma-profile.log/json`.
+
+## Combined validation and remaining profile
+
+The native-context model test passes with grouped attention and heads in release (159.08 seconds) and checked release (215.81 seconds). Diagnostic cold/warm/recomputed times are 45.947/0.291/103.867 seconds and 64.051/0.373/142.394 seconds respectively. All full-logit hashes remain identical across cached, prefix-reused and fully recomputed ragged 8K/16K/near-32K requests and across chunk sizes. These different test workloads are correctness checks, not a paired performance comparison. Logs are `grouped-native-{release,checked}.log`.
+
+Compute Sanitizer reports zero memory errors and zero race hazards/warnings for both paged operator tests, including the grouped native-context path. A full ragged twelve-request model run also reports zero memory errors and matches all 56 full-logit hashes and selected tokens against the uninstrumented verification run. Logs are `grouped-paged-memcheck.log`, `grouped-paged-racecheck.log` and `grouped-ragged-memcheck.log`.
+
+The [CUPTI collector](../profiling.md) provides kernel timestamps without changing driver settings. Its first three-repetition batch-32 trace has 23,436 records with zero dropped or invalid intervals. Of the eager kernel time, `linear_large` consumes 69.1%, `linear_tiled` 5.6%, SwiGLU 5.3% and the two grouped attention kernels 7.6% combined. Of graph kernel time, `linear_tiled` consumes 56.0% and the eight-row packed head 33.9%. These phases describe launch mechanisms: the graph also runs the final 32-row prefill step in this workload. The profile includes all traced repetitions, and its instrumented API times are not benchmark results. All these kernels report zero local-memory bytes per thread. Artifacts are `grouped-b32-kernels.csv` and `grouped-b32-kernel-summary.json`.
+
+The remaining short-batch gap is therefore concentrated in projections and the head. Candidate experiments are overlapping TMA loads with projection compute and improving input reuse in grouped heads. The longer-context stock gap also requires further attention work. The full scenario matrix and universal stock-performance requirement remain open.

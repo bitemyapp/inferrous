@@ -26,6 +26,10 @@ The extension preserves all original RoPE bytes and appends positions through 32
 
 The output records the actual GPU name, exact engine configuration, cache mode, request order, per-request token IDs and timings, processed token rows, reused prefix token rows and batch elapsed time. `verify_logits: true` additionally copies and hashes every vocabulary logit for correctness comparisons. Performance profiles use `false` and return an empty hash list. Timing reports must state which setting they used. Prefix cache hits occur only at 64-token boundaries; the last prompt token is always evaluated to obtain the output head. `tuned_projections: false` selects the original projection dispatch for paired comparisons. The RTX 5090 profile enables its measured small-batch dispatch; PRO 6000 and the legacy engine retain the original selection.
 
+`tuned_attention: false` selects the original paged score/value kernels. The RTX 5090 policy enables sharing staged K/V data across four query heads at measured profitable row counts, preserving exact accumulation order. The PRO 6000 configuration keeps the original kernels. The [round 7 record](optimization/round-7.md) contains the operator profile, paired model measurements and current validation boundary for these settings.
+
+`tuned_head: false` selects the original interleaved packed head. The RTX 5090 policy shares lossless weight reconstruction across four or eight output rows when profitable, retaining the original path for one or two outputs. Partial groups and shrinking ragged batches preserve exact outputs. The PRO 6000 profile leaves this tuning disabled.
+
 ## Rust ownership
 
 `BatchEngine::session` creates a sequence borrowing its engine. `generate_sessions` accepts mutable sessions and corresponding `SessionOptions`; `append` adds new user tokens, and `fork` shares initialized complete pages while rebuilding any partial tail privately. The borrow prevents the engine's device allocations from being freed while sessions exist. Dropping a session releases its page references. `clear_prefixes` releases the automatic prefix cache; independently owned sessions remain valid.

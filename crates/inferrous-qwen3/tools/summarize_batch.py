@@ -31,9 +31,9 @@ def identity(record):
                     binary_sha256=record["binary_sha256"], config=record["engine_config"],
                     cache_mode=record["cache_mode"], workload=record["workload"], requests=record["requests"])
     fields = ["engine", "model_root", "device_name", "versions", "environment", "eager", "linear_backend",
-              "attention_backend", "graph_size_one", "graph_capture_sizes", "graphs_without_compile",
+              "attention_backend", "graph_size_one", "graph_capture_sizes", "graphs_without_compile", "disable_cutedsl_warmup",
               "quantization", "weight_scale_dtype", "max_context", "max_num_seqs", "hardware_profile",
-              "memory_fraction", "prefix_cache", "cache_mode", "workload", "requests"]
+              "memory_fraction", "kv_cache_bytes", "prefix_cache", "cache_mode", "workload", "requests"]
     return {field: record.get(field) for field in fields}
 
 

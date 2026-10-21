@@ -66,6 +66,10 @@ def main():
                                    for r in requests)
                     if batch["reused_tokens"] != 0 or batch["processed_tokens"] != expected:
                         raise ValueError(f"{name}: invalid recomputation work count")
+                else:
+                    expected = sum(len(r["prompt_ids"]) + r["max_tokens"] - 1 for r in requests)
+                    if batch["processed_tokens"] + batch["reused_tokens"] != expected:
+                        raise ValueError(f"{name}: invalid cached work count")
                 record["binary_sha256"] = binary_sha256
                 output.write(json.dumps(record) + "\n")
                 output.flush()

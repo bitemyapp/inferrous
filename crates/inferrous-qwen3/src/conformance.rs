@@ -954,6 +954,44 @@ fn paged_attention_matches_contiguous_ragged_queries() -> anyhow::Result<()> {
         )?;
     }
     let actual = output.to_host_vec(&stream)?;
+    let probabilities = scores.to_host_vec(&stream)?;
+    // The grouped path shares K/V staging across all four GQA heads. Compare
+    // its complete probability/output tensors before checking the independent
+    // contiguous implementation below, including shuffled pages and tails.
+    unsafe {
+        module.attention_scores_grouped(
+            &stream,
+            rows(queries.len() * 8 * 64, 128),
+            &q_device,
+            &k_device,
+            &info,
+            &page_table,
+            64,
+            stride as u32,
+            64,
+            &mut scores,
+        )?;
+        module.attention_softmax_paged(
+            &stream,
+            rows(queries.len() * 32, 128),
+            &mut scores,
+            &info,
+            stride as u32,
+        )?;
+        module.attention_values_grouped(
+            &stream,
+            rows(queries.len() * 8 * 4, 32),
+            &scores,
+            &v_device,
+            &info,
+            &page_table,
+            64,
+            stride as u32,
+            &mut output,
+        )?;
+    }
+    assert_eq!(scores.to_host_vec(&stream)?, probabilities);
+    assert_eq!(output.to_host_vec(&stream)?, actual);
     let hint = DeviceBuffer::<i8>::zeroed(&stream, 1)?;
     for (row, &(slot, position)) in queries.iter().enumerate() {
         let q = DeviceBuffer::from_host(&stream, &q[row * 4096..(row + 1) * 4096])?;
@@ -1051,6 +1089,39 @@ fn paged_attention_reaches_native_context() -> anyhow::Result<()> {
         )?;
     }
     let actual = output.to_host_vec(&stream)?;
+    unsafe {
+        module.attention_scores_grouped(
+            &stream,
+            rows(8 * 512, 128),
+            &q,
+            &k,
+            &info,
+            &table,
+            512,
+            stride as u32,
+            512,
+            &mut scores,
+        )?;
+        module.attention_softmax_paged(
+            &stream,
+            rows(32, 128),
+            &mut scores,
+            &info,
+            stride as u32,
+        )?;
+        module.attention_values_grouped(
+            &stream,
+            rows(8 * 4, 32),
+            &scores,
+            &v,
+            &info,
+            &table,
+            512,
+            stride as u32,
+            &mut output,
+        )?;
+    }
+    assert_eq!(output.to_host_vec(&stream)?, actual);
     for (i, value) in actual.into_iter().enumerate() {
         let kv_coordinate = (i / 128 / 4) * 128 + i % 128;
         let expected = ((kv_coordinate % 97) as f32 - 48.0) / 16.0;

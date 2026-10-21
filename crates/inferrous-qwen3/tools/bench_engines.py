@@ -23,12 +23,14 @@ def main():
     ap.add_argument("--max-context", type=int, default=4096)
     ap.add_argument("--max-num-seqs", type=int, default=1)
     ap.add_argument("--memory-fraction", type=float)
+    ap.add_argument("--kv-cache-bytes", type=int)
     ap.add_argument("--prefix-cache", action="store_true")
     ap.add_argument("--cache-mode", choices=["reuse", "recompute"], default="reuse")
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--graph-size-one", action="store_true")
     ap.add_argument("--graph-capture-sizes", type=int, nargs="+")
     ap.add_argument("--graphs-without-compile", action="store_true")
+    ap.add_argument("--disable-cutedsl-warmup", action="store_true")
     ap.add_argument("--linear-backend", choices=["auto", "triton"], default="auto")
     ap.add_argument("--quantization", choices=["compressed-tensors", "humming"], default="compressed-tensors")
     ap.add_argument("--attention-backend", choices=["FLASH_ATTN", "TRITON_ATTN", "B12X", "FLASHINFER"], default="FLASH_ATTN")
@@ -43,6 +45,12 @@ def main():
         ap.error("repeat must be positive")
     if args.max_context < 1 or args.max_num_seqs < 1 or not 0 < args.memory_fraction < 1:
         ap.error("invalid context, sequence count or memory fraction")
+    if args.kv_cache_bytes is not None and (args.kv_cache_bytes < 1 or args.engine != "vllm"):
+        ap.error("explicit KV byte budgets require vLLM and a positive value")
+    if args.disable_cutedsl_warmup and args.engine != "vllm":
+        ap.error("the CuTeDSL warmup setting requires vLLM")
+    if args.eager and (args.graph_size_one or args.graph_capture_sizes or args.graphs_without_compile):
+        ap.error("graph configuration cannot accompany eager execution")
     if args.cache_mode == "recompute" and args.prefix_cache:
         ap.error("recompute mode requires prefix caching disabled")
     if args.graph_capture_sizes is not None and (args.graph_size_one or any(size < 1 for size in args.graph_capture_sizes)):
@@ -78,15 +86,19 @@ def main():
             print("Humming effective weight scale dtype:", scale_dtype, flush=True)
         extra = {"compilation_config": {"cudagraph_capture_sizes": capture_sizes}} if capture_sizes else {}
         if args.graphs_without_compile:
-            assert not args.eager
             extra["compilation_config"] = dict(mode=0, cudagraph_mode="FULL", cudagraph_capture_sizes=capture_sizes, custom_ops=["all"])
         if args.attention_backend == "B12X":
             extra["block_size"] = 128
+        if args.kv_cache_bytes is not None:
+            extra["kv_cache_memory_bytes"] = args.kv_cache_bytes
+        kernels = {"linear_backend_per_quant": {"int8_w8a8": args.linear_backend}}
+        if args.disable_cutedsl_warmup:
+            kernels["enable_cutedsl_warmup"] = False
         engine = LLM(model=str(args.model.resolve()), dtype="bfloat16",
                      quantization=args.quantization, max_model_len=args.max_context,
                      max_num_seqs=args.max_num_seqs, gpu_memory_utilization=args.memory_fraction,
                      enable_prefix_caching=args.prefix_cache, enforce_eager=args.eager,
-                     kernel_config={"linear_backend_per_quant": {"int8_w8a8": args.linear_backend}},
+                     kernel_config=kernels,
                      attention_backend=args.attention_backend,
                      disable_log_stats=False, seed=0, **extra)
     else:
@@ -171,11 +183,13 @@ def main():
                               graph_size_one=args.graph_size_one,
                               graph_capture_sizes=capture_sizes,
                               graphs_without_compile=args.graphs_without_compile,
+                              disable_cutedsl_warmup=args.disable_cutedsl_warmup,
                               quantization=args.quantization if args.engine == "vllm" else args.sglang_quantization,
                               weight_scale_dtype=scale_dtype, device_name=device_name,
                               max_context=args.max_context, max_num_seqs=args.max_num_seqs,
                               hardware_profile=args.hardware_profile,
                               memory_fraction=args.memory_fraction, prefix_cache=args.prefix_cache,
+                              kv_cache_bytes=args.kv_cache_bytes,
                               cache_mode=args.cache_mode, workload=name, requests=requests, run=run,
                               request_seconds=seconds, recompute_steps=steps,
                               generations=[dict(token_ids=ids, backend_metrics=meta) for ids, meta in outputs])

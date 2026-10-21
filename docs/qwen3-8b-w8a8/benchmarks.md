@@ -149,6 +149,8 @@ Use a new output path for every run. Increasing context requires a matching work
 
 For graph-only stock screening, add `--graphs-without-compile`. Its default capture sizes now cover powers of two through the configured sequence capacity, plus that capacity itself; it no longer silently captures only batch 1 for a batched run. `--graph-capture-sizes 1 2 4 8 16 32` makes the list explicit, while `--graph-size-one` retains the original solo experiment. Raw records include the chosen sizes and immutable container image identifier.
 
+For matched KV capacity, vLLM accepts `--kv-cache-bytes 12884901888` for the RTX 5090 profile's 12 GiB budget. This explicitly controls KV allocation instead of deriving it from the memory fraction; the raw record retains both arguments. `--disable-cutedsl-warmup` selects vLLM's supported `enable_cutedsl_warmup: false` setting for diagnosing its legacy precompile hook. It does not disable runtime kernel compilation or the benchmark's excluded warmup repetitions. Record the flag and check whether JIT work remains in measured repetitions.
+
 The official vLLM image omits B12X. This optional stock variant installs exactly the `b12x==1.5.1` extra declared by vLLM 0.32.0, retaining the base image's other packages and unmodified engine code:
 
 ```sh

@@ -8,5 +8,7 @@
   "verify_logits": false,
   "cuda_graphs": true,
   "tuned_projections": false,
+  "tuned_attention": false,
+  "tuned_head": false,
   "score_scratch_bytes": 4294967296
 }

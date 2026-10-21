@@ -155,6 +155,182 @@ fn stage_values_paged(
 }
 
 #[inline(always)]
+fn stage_values_grouped(
+    tile: *mut u32,
+    probability: *mut f32,
+    scores: &[f32],
+    v: &[u16],
+    query: usize,
+    stride: usize,
+    page: usize,
+    kv: usize,
+    column: usize,
+    t: usize,
+    base: usize,
+    end: usize,
+) {
+    let slot = base / 64 % 2;
+    // One complete warp owns four probability rows and a shared 64x32 V tile.
+    // Every head is in the same GQA group, hence has the same V coordinates.
+    unsafe {
+        let mut head = 0;
+        while head < 4 {
+            if base + t < end {
+                *probability.add(slot * 256 + head * 64 + t) =
+                    scores[(query + head) * stride + base + t];
+            }
+            if base + t + 32 < end {
+                *probability.add(slot * 256 + head * 64 + t + 32) =
+                    scores[(query + head) * stride + base + t + 32];
+            }
+            head += 1;
+        }
+        let mut piece = 0;
+        while piece < 8 {
+            let i = t + piece * 32;
+            cuda_device::async_copy::cp_async_ca_16(
+                tile.add(slot * 1024 + i * 4),
+                v.as_ptr()
+                    .add((page * 64 + i / 4) * 1024 + kv * 128 + column + i % 4 * 8)
+                    .cast::<u32>(),
+            );
+            piece += 1;
+        }
+        cuda_device::async_copy::cp_async_commit_group();
+    }
+}
+
+#[inline(always)]
+fn head_add_four(x: &[f32], starts: [usize; 4], sums: [f32; 4], j: usize, weight: f32) -> [f32; 4] {
+    [
+        add(sums[0], mul(x[starts[0] + j], weight)),
+        add(sums[1], mul(x[starts[1] + j], weight)),
+        add(sums[2], mul(x[starts[2] + j], weight)),
+        add(sums[3], mul(x[starts[3] + j], weight)),
+    ]
+}
+
+#[inline(always)]
+fn head_reduce_four(mut sums: [f32; 4]) -> [f32; 4] {
+    let mut d = 16;
+    while d > 0 {
+        sums = [
+            add(
+                sums[0],
+                f32::from_bits(warp::shuffle_down(sums[0].to_bits(), d)),
+            ),
+            add(
+                sums[1],
+                f32::from_bits(warp::shuffle_down(sums[1].to_bits(), d)),
+            ),
+            add(
+                sums[2],
+                f32::from_bits(warp::shuffle_down(sums[2].to_bits(), d)),
+            ),
+            add(
+                sums[3],
+                f32::from_bits(warp::shuffle_down(sums[3].to_bits(), d)),
+            ),
+        ];
+        d /= 2;
+    }
+    sums
+}
+
+/// Const specialization keeps the hot accumulators in registers for both widths.
+#[inline(always)]
+fn head_packed_group<const EIGHT: bool>(
+    x: &[f32],
+    output_rows: &[u32],
+    words: &[u32],
+    offsets: &[u32],
+    exceptions: &[u16],
+    mut out: DisjointSlice<f32>,
+) {
+    dependency_wait();
+    let tid = thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+        + thread::threadIdx_x() as usize;
+    let lane = tid % 32;
+    let index = tid / 32;
+    let width = if EIGHT { 8 } else { 4 };
+    let groups = output_rows.len().div_ceil(width);
+    let batch = index % groups * width;
+    let row = index / groups;
+    if row >= 151936 {
+        return;
+    }
+    let last = output_rows.len() - 1;
+    // Padded members evaluate a valid row but never publish its result.
+    let starts0 = [
+        output_rows[batch] as usize * 4096,
+        output_rows[(batch + 1).min(last)] as usize * 4096,
+        output_rows[(batch + 2).min(last)] as usize * 4096,
+        output_rows[(batch + 3).min(last)] as usize * 4096,
+    ];
+    let starts1 = if EIGHT {
+        [
+            output_rows[(batch + 4).min(last)] as usize * 4096,
+            output_rows[(batch + 5).min(last)] as usize * 4096,
+            output_rows[(batch + 6).min(last)] as usize * 4096,
+            output_rows[(batch + 7).min(last)] as usize * 4096,
+        ]
+    } else {
+        [0; 4]
+    };
+    let mut sums0 = [0.0; 4];
+    let mut sums1 = [0.0; 4];
+    let mut group = 0;
+    while group < 16 {
+        let chunk = row * 16 + group;
+        let word = chunk * 96 + lane;
+        let w0 = words[word];
+        let w1 = words[word + 32];
+        let w2 = words[word + 64];
+        let j = group * 256 + lane;
+        // Spell out the eight packed fragments, preserving the lane's original
+        // term order. Each reconstruction is shared by four or eight dots.
+        macro_rules! term {
+            ($code:expr, $offset:expr) => {{
+                let weight = widen(unpack_code($code, offsets, exceptions, chunk));
+                sums0 = head_add_four(x, starts0, sums0, j + $offset, weight);
+                if EIGHT {
+                    sums1 = head_add_four(x, starts1, sums1, j + $offset, weight);
+                }
+            }};
+        }
+        term!(w0, 0);
+        term!(w0 >> 12, 32);
+        term!((w0 >> 24) | (w1 << 8), 64);
+        term!(w1 >> 4, 96);
+        term!(w1 >> 16, 128);
+        term!((w1 >> 28) | (w2 << 4), 160);
+        term!(w2 >> 8, 192);
+        term!(w2 >> 20, 224);
+        group += 1;
+    }
+    sums0 = head_reduce_four(sums0);
+    if EIGHT {
+        sums1 = head_reduce_four(sums1);
+    }
+    if lane == 0 {
+        let mut b = 0;
+        while b < 4 {
+            if batch + b < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b) * 151936 + row) = bf(sums0[b]);
+                }
+            }
+            if EIGHT && batch + b + 4 < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b + 4) * 151936 + row) = bf(sums1[b]);
+                }
+            }
+            b += 1;
+        }
+    }
+}
+
+#[inline(always)]
 fn best_warp(mut value: f32, mut index: u32, mut bad: u32) -> (f32, u32, u32) {
     let mut d = 16;
     while d > 0 {
@@ -2591,6 +2767,84 @@ pub mod device {
         }
     }
 
+    /// Four GQA heads share each staged key tile while retaining each dot's order.
+    #[kernel]
+    pub fn attention_scores_grouped(
+        q: &[f32],
+        k: &[u16],
+        row_info: &[u32],
+        page_table: &[u32],
+        pages_per_sequence: u32,
+        stride: u32,
+        tiles: u32,
+        mut scores: DisjointSlice<f32>,
+    ) {
+        dependency_wait();
+        static mut QUERY: SharedArray<f32, 512> = SharedArray::UNINIT;
+        static mut TILE: SharedArray<u32, 4096, 16> = SharedArray::UNINIT;
+        let block = thread::blockIdx_x() as usize;
+        let group = block / tiles as usize;
+        let query = group * 4;
+        let base = block % tiles as usize * 64;
+        let t = thread::threadIdx_x() as usize;
+        let end = row_info[group / 8 * 2 + 1] as usize + 1;
+        if base >= end {
+            return;
+        }
+        let slot = row_info[group / 8 * 2] as usize;
+        let page = page_table[slot * pages_per_sequence as usize + base / 64] as usize;
+        let kv = group % 8;
+        let queries = unsafe { SharedArray::as_raw_mut_ptr(&raw mut QUERY) };
+        let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+        let halves = tile.cast::<u16>();
+        // SAFETY: 128 threads stage four complete heads and one 64-token key
+        // page. The table and causal tail have the same bounds as the scalar
+        // paged path. All threads wait before any staged value is consumed.
+        unsafe {
+            let mut head = 0;
+            while head < 4 {
+                *queries.add(head * 128 + t) = q[(query + head) * 128 + t];
+                head += 1;
+            }
+            let mut piece = 0;
+            while piece < 8 {
+                let i = t + piece * 128;
+                cuda_device::async_copy::cp_async_ca_16(
+                    tile.add(i * 4),
+                    k.as_ptr()
+                        .add(page * 65536 + (kv * 128 + i / 8) * 64 + i % 8 * 8)
+                        .cast::<u32>(),
+                );
+                piece += 1;
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+            cuda_device::async_copy::cp_async_wait_all();
+        }
+        thread::sync_threads();
+        if t < 64 && base + t < end {
+            let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
+            let mut c = 0;
+            while c < 128 {
+                let key = widen(unsafe { *halves.add(c * 64 + t) });
+                s0 = add(s0, mul(unsafe { *queries.add(c) }, key));
+                s1 = add(s1, mul(unsafe { *queries.add(128 + c) }, key));
+                s2 = add(s2, mul(unsafe { *queries.add(256 + c) }, key));
+                s3 = add(s3, mul(unsafe { *queries.add(384 + c) }, key));
+                c += 1;
+            }
+            let offset = query * stride as usize + base + t;
+            unsafe {
+                *scores.get_unchecked_mut(offset) = mul(s0, 0.08838834764831845_f32);
+                *scores.get_unchecked_mut(offset + stride as usize) =
+                    mul(s1, 0.08838834764831845_f32);
+                *scores.get_unchecked_mut(offset + 2 * stride as usize) =
+                    mul(s2, 0.08838834764831845_f32);
+                *scores.get_unchecked_mut(offset + 3 * stride as usize) =
+                    mul(s3, 0.08838834764831845_f32);
+            }
+        }
+    }
+
     /// Fixed per-query softmax tree, independent of cache layout and batch size.
     #[kernel]
     pub fn attention_softmax_paged(mut scores: DisjointSlice<f32>, row_info: &[u32], stride: u32) {
@@ -2744,6 +2998,94 @@ pub mod device {
             *out.get_unchecked_mut(query * 128 + column + t) = bf(sum);
         }
     }
+    /// Four independent ordered PV sums reuse a single staged value tile.
+    #[kernel]
+    pub fn attention_values_grouped(
+        scores: &[f32],
+        v: &[u16],
+        row_info: &[u32],
+        page_table: &[u32],
+        pages_per_sequence: u32,
+        stride: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        dependency_wait();
+        static mut TILE: SharedArray<u32, 2048, 16> = SharedArray::UNINIT;
+        static mut PROB: SharedArray<f32, 512> = SharedArray::UNINIT;
+        let block = thread::blockIdx_x() as usize;
+        let group = block / 4;
+        let query = group * 4;
+        let column = block % 4 * 32;
+        let t = thread::threadIdx_x() as usize;
+        let slot = row_info[group / 8 * 2] as usize;
+        let end = row_info[group / 8 * 2 + 1] as usize + 1;
+        let kv = group % 8;
+        let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+        let halves = tile.cast::<u16>();
+        let probability = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PROB) };
+        stage_values_grouped(
+            tile,
+            probability,
+            scores,
+            v,
+            query,
+            stride as usize,
+            page_table[slot * pages_per_sequence as usize] as usize,
+            kv,
+            column,
+            t,
+            0,
+            end,
+        );
+        let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
+        let mut base = 0;
+        while base < end {
+            unsafe {
+                cuda_device::async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            if base + 64 < end {
+                let page = page_table[slot * pages_per_sequence as usize + base / 64 + 1] as usize;
+                stage_values_grouped(
+                    tile,
+                    probability,
+                    scores,
+                    v,
+                    query,
+                    stride as usize,
+                    page,
+                    kv,
+                    column,
+                    t,
+                    base + 64,
+                    end,
+                );
+            }
+            let shared_slot = base / 64 % 2;
+            let probs = unsafe { probability.add(shared_slot * 256) };
+            let mut j = 0;
+            let count = (end - base).min(64);
+            #[unroll(8)]
+            while j < count {
+                let value = widen(unsafe { *halves.add(shared_slot * 2048 + j * 32 + t) });
+                s0 = add(s0, mul(unsafe { *probs.add(j) }, value));
+                s1 = add(s1, mul(unsafe { *probs.add(64 + j) }, value));
+                s2 = add(s2, mul(unsafe { *probs.add(128 + j) }, value));
+                s3 = add(s3, mul(unsafe { *probs.add(192 + j) }, value));
+                j += 1;
+            }
+            thread::sync_threads();
+            base += 64;
+        }
+        let offset = query * 128 + column + t;
+        unsafe {
+            *out.get_unchecked_mut(offset) = bf(s0);
+            *out.get_unchecked_mut(offset + 128) = bf(s1);
+            *out.get_unchecked_mut(offset + 256) = bf(s2);
+            *out.get_unchecked_mut(offset + 384) = bf(s3);
+        }
+    }
+
     #[kernel]
     pub fn head_packed_rows(
         x: &[f32],
@@ -2866,6 +3208,32 @@ pub mod device {
             }
         }
     }
+    /// A warp shares packed-weight reconstruction across four exact head dots.
+    #[kernel]
+    pub fn head_packed_four(
+        x: &[f32],
+        output_rows: &[u32],
+        words: &[u32],
+        offsets: &[u32],
+        exceptions: &[u16],
+        out: DisjointSlice<f32>,
+    ) {
+        head_packed_group::<false>(x, output_rows, words, offsets, exceptions, out);
+    }
+
+    /// Eight-row specialization for larger batches.
+    #[kernel]
+    pub fn head_packed_eight(
+        x: &[f32],
+        output_rows: &[u32],
+        words: &[u32],
+        offsets: &[u32],
+        exceptions: &[u16],
+        out: DisjointSlice<f32>,
+    ) {
+        head_packed_group::<true>(x, output_rows, words, offsets, exceptions, out);
+    }
+
     #[kernel]
     pub fn select_token_rows(x: &[f32], mut out: DisjointSlice<u32>) {
         static mut PARTIAL: SharedArray<u32, 96> = SharedArray::UNINIT;

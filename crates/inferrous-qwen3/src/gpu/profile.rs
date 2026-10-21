@@ -2,6 +2,240 @@
 use super::*;
 
 #[test]
+#[ignore = "GPU head timing experiment; run alone with --nocapture and a model bundle"]
+fn grouped_head_shapes() -> Result<()> {
+    let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE").expect("CLEAN_MODEL_BUNDLE");
+    let model = Model::load(Path::new(&bundle))?;
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    let head = PackedHead::new(&stream, &model.head)?;
+    let start = context.new_event(Some(0))?;
+    let end = context.new_event(Some(0))?;
+    let device_name = context.device_name()?;
+    for nr in 1_usize..=64 {
+        let input: Vec<f32> = (0..(nr + 2) * HIDDEN)
+            .map(|i| ((i * 37 + 11) % 255) as f32 / 128.0 - 1.0)
+            .collect();
+        let input = DeviceBuffer::from_host(&stream, &input)?;
+        let selected: Vec<u32> = (0..nr).map(|i| (nr - i) as u32).collect();
+        let selected = DeviceBuffer::from_host(&stream, &selected)?;
+        let mut out = DeviceBuffer::<f32>::zeroed(&stream, nr * VOCAB)?;
+        let mut expected = None;
+        for group_size in [1_usize, 4, 8] {
+            stream.synchronize()?;
+            // SAFETY: selected rows are in bounds, every output has a distinct
+            // warp owner, and graph/allocation lifetimes are nested and fenced.
+            let graph = unsafe {
+                Graph::capture(&stream, false, || {
+                    if group_size == 8 {
+                        module.head_packed_eight(
+                            &stream,
+                            rows((nr.div_ceil(8) * VOCAB).div_ceil(8), 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                        )?;
+                    } else if group_size == 4 {
+                        module.head_packed_four(
+                            &stream,
+                            rows((nr.div_ceil(4) * VOCAB).div_ceil(8), 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                        )?;
+                    } else {
+                        module.head_packed_rows(
+                            &stream,
+                            rows((nr * VOCAB).div_ceil(8), 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                            0,
+                        )?;
+                    }
+                    Ok(())
+                })?
+            };
+            let mut times = Vec::new();
+            for repetition in 0..10 {
+                let _eviction = DeviceBuffer::<u8>::zeroed(&stream, 256 << 20)?;
+                start.record(&stream)?;
+                unsafe {
+                    graph.launch()?;
+                }
+                end.record(&stream)?;
+                let milliseconds = start.elapsed_ms(&end)?;
+                if repetition >= 3 {
+                    times.push(milliseconds);
+                }
+            }
+            let actual = out.to_host_vec(&stream)?;
+            if let Some(expected) = &expected {
+                assert_eq!(&actual, expected, "head {nr} rows");
+            } else {
+                expected = Some(actual);
+            }
+            println!(
+                "HEAD {}",
+                serde_json::json!({"device":device_name, "model_root":model.root,
+                "rows":nr, "group_size":group_size, "milliseconds":times})
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU attention timing experiment; run alone with --nocapture"]
+fn grouped_attention_shapes() -> Result<()> {
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    let start = context.new_event(Some(0))?;
+    let end = context.new_event(Some(0))?;
+    let device_name = context.device_name()?;
+    for stride in [64_usize, 512, 4096, 32768] {
+        let pages = stride / 64;
+        let table: Vec<u32> = (0..pages as u32).rev().collect();
+        let table = DeviceBuffer::from_host(&stream, &table)?;
+        let values: Vec<u16> = (0..stride * 1024)
+            .map(|i| ((((i * 37 + 11) % 127) as f32 - 63.0) / 64.0).to_bits())
+            .map(|bits| (bits >> 16) as u16)
+            .collect();
+        let k = DeviceBuffer::from_host(&stream, &values)?;
+        let v = DeviceBuffer::from_host(&stream, &values)?;
+        for nr in [1, 2, 4, 8, 16, 64, 256] {
+            if nr > stride {
+                continue;
+            }
+            let info: Vec<u32> = (0..nr)
+                .flat_map(|row| [0, (stride - nr + row) as u32])
+                .collect();
+            let info = DeviceBuffer::from_host(&stream, &info)?;
+            let q: Vec<f32> = (0..nr * 4096)
+                .map(|i| ((i * 7 % 31) as f32 - 15.0) / 16.0)
+                .collect();
+            let q = DeviceBuffer::from_host(&stream, &q)?;
+            let mut scores = DeviceBuffer::<f32>::zeroed(&stream, nr * 32 * stride)?;
+            let mut out = DeviceBuffer::<f32>::zeroed(&stream, nr * 4096)?;
+            let mut expected = None;
+            for (grouped_scores, grouped_values) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                stream.synchronize()?;
+                // SAFETY: every query uses one fully initialized sequence; the
+                // reversed table covers precisely the allocated physical pages.
+                let graph = unsafe {
+                    Graph::capture(&stream, false, || {
+                        if grouped_scores {
+                            module.attention_scores_grouped(
+                                &stream,
+                                rows(nr * 8 * pages, 128),
+                                &q,
+                                &k,
+                                &info,
+                                &table,
+                                pages as u32,
+                                stride as u32,
+                                pages as u32,
+                                &mut scores,
+                            )?;
+                        } else {
+                            module.attention_scores_paged(
+                                &stream,
+                                rows(nr * 32 * pages, 128),
+                                &q,
+                                &k,
+                                &info,
+                                &table,
+                                pages as u32,
+                                stride as u32,
+                                pages as u32,
+                                &mut scores,
+                            )?;
+                        }
+                        module.attention_softmax_paged(
+                            &stream,
+                            rows(nr * 32, 128),
+                            &mut scores,
+                            &info,
+                            stride as u32,
+                        )?;
+                        if grouped_values {
+                            module.attention_values_grouped(
+                                &stream,
+                                rows(nr * 8 * 4, 32),
+                                &scores,
+                                &v,
+                                &info,
+                                &table,
+                                pages as u32,
+                                stride as u32,
+                                &mut out,
+                            )?;
+                        } else {
+                            module.attention_values_paged(
+                                &stream,
+                                rows(nr * 32 * 4, 32),
+                                &scores,
+                                &v,
+                                &info,
+                                &table,
+                                pages as u32,
+                                stride as u32,
+                                &mut out,
+                            )?;
+                        }
+                        Ok(())
+                    })?
+                };
+                let mut times = Vec::new();
+                for repetition in 0..10 {
+                    // Evict the previous invocation's cache lines before timing.
+                    // Real model layers have intervening projection weight reads.
+                    let _eviction = DeviceBuffer::<u8>::zeroed(&stream, 256 << 20)?;
+                    start.record(&stream)?;
+                    unsafe {
+                        graph.launch()?;
+                    }
+                    end.record(&stream)?;
+                    let milliseconds = start.elapsed_ms(&end)?;
+                    if repetition >= 3 {
+                        times.push(milliseconds);
+                    }
+                }
+                let actual = out.to_host_vec(&stream)?;
+                if let Some(expected) = &expected {
+                    assert_eq!(
+                        &actual, expected,
+                        "attention {nr}x{stride} grouped {grouped_scores}/{grouped_values}"
+                    );
+                } else {
+                    expected = Some(actual);
+                }
+                println!(
+                    "ATTENTION {}",
+                    serde_json::json!({"device":device_name,
+                    "rows":nr, "stride":stride, "grouped_scores":grouped_scores,
+                    "grouped_values":grouped_values, "milliseconds":times})
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "GPU projection timing experiment; run alone with --nocapture"]
 fn projection_shapes() -> Result<()> {
     let context = CudaContext::new(0)?;
@@ -36,7 +270,7 @@ fn projection_shapes() -> Result<()> {
                 .collect();
             let q = DeviceBuffer::from_host(&stream, &input)?;
             let scales = DeviceBuffer::from_host(&stream, &vec![0.003_f32; nr])?;
-            let map = if nr >= 256 {
+            let map = if nr >= 16 {
                 Some(crate::tensor::map(&stream, &q, nr, k, 64)?)
             } else {
                 None
@@ -57,7 +291,7 @@ fn projection_shapes() -> Result<()> {
             }
             let expected = out.to_host_vec(&stream)?;
             for variant in ["dp4a", "splitk", "tiled", "large"] {
-                if (variant == "dp4a" && nr > 16) || (variant == "large" && nr < 256) {
+                if (variant == "dp4a" && nr > 16) || (variant == "large" && nr < 16) {
                     continue;
                 }
                 stream.synchronize()?;

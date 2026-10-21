@@ -602,6 +602,13 @@ impl BatchEngine {
         };
         let w = &mut step.w;
         let (nr, outputs, stride) = step.shape;
+        let tuned_attention = self.config.hardware == crate::config::HardwareProfile::Rtx5090
+            && self.config.tuned_attention;
+        // Grouped PV loses occupancy at small batch sizes. QK has independent
+        // key-page tiles and can profit from grouping even for long solo decode.
+        let grouped_scores =
+            tuned_attention && (nr >= 16 || (nr >= 8 && stride >= 512) || stride >= 4096);
+        let grouped_values = tuned_attention && nr >= 16;
         // SAFETY: admission validates all tokens, row positions and page leases.
         // Every producer/consumer is serialized on one stream. Different rows
         // write distinct sequence positions, and all scratch allocations match
@@ -664,18 +671,33 @@ impl BatchEngine {
                     &mut cache.k,
                     &mut cache.v,
                 )?;
-                gpu.module.attention_scores_paged(
-                    &gpu.stream,
-                    rows(nr * 32 * (stride / 64), 128),
-                    &w.q,
-                    &cache.k,
-                    &step.info,
-                    &step.table,
-                    pages_per_sequence as u32,
-                    stride as u32,
-                    (stride / 64) as u32,
-                    &mut w.scores,
-                )?;
+                if grouped_scores {
+                    gpu.module.attention_scores_grouped(
+                        &gpu.stream,
+                        rows(nr * 8 * (stride / 64), 128),
+                        &w.q,
+                        &cache.k,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        (stride / 64) as u32,
+                        &mut w.scores,
+                    )?;
+                } else {
+                    gpu.module.attention_scores_paged(
+                        &gpu.stream,
+                        rows(nr * 32 * (stride / 64), 128),
+                        &w.q,
+                        &cache.k,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        (stride / 64) as u32,
+                        &mut w.scores,
+                    )?;
+                }
                 gpu.module.attention_softmax_paged(
                     &gpu.stream,
                     rows(nr * 32, 128),
@@ -683,17 +705,31 @@ impl BatchEngine {
                     &step.info,
                     stride as u32,
                 )?;
-                gpu.module.attention_values_paged(
-                    &gpu.stream,
-                    rows(nr * 32 * 4, 32),
-                    &w.scores,
-                    &cache.v,
-                    &step.info,
-                    &step.table,
-                    pages_per_sequence as u32,
-                    stride as u32,
-                    &mut w.attention,
-                )?;
+                if grouped_values {
+                    gpu.module.attention_values_grouped(
+                        &gpu.stream,
+                        rows(nr * 8 * 4, 32),
+                        &w.scores,
+                        &cache.v,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        &mut w.attention,
+                    )?;
+                } else {
+                    gpu.module.attention_values_paged(
+                        &gpu.stream,
+                        rows(nr * 32 * 4, 32),
+                        &w.scores,
+                        &cache.v,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        &mut w.attention,
+                    )?;
+                }
             }
             gpu.linear_residual(
                 &w.attention,
@@ -782,17 +818,50 @@ impl BatchEngine {
         if outputs > 0 {
             gpu.norm(&w.hidden, &gpu.final_gain, &mut w.norm)?;
             unsafe {
-                gpu.module.head_packed_rows(
-                    &gpu.stream,
-                    cfg(outputs * VOCAB * 32),
-                    &w.norm,
-                    &step.outputs,
-                    &gpu.head.words,
-                    &gpu.head.offsets,
-                    &gpu.head.exceptions,
-                    &mut w.logits,
-                    0,
-                )?;
+                let head_group = if self.config.hardware == crate::config::HardwareProfile::Rtx5090
+                    && self.config.tuned_head
+                {
+                    match outputs {
+                        0..=2 => 1,
+                        3..=4 | 9..=12 => 4,
+                        _ => 8,
+                    }
+                } else {
+                    1
+                };
+                match head_group {
+                    4 => gpu.module.head_packed_four(
+                        &gpu.stream,
+                        rows((outputs.div_ceil(4) * VOCAB).div_ceil(8), 256),
+                        &w.norm,
+                        &step.outputs,
+                        &gpu.head.words,
+                        &gpu.head.offsets,
+                        &gpu.head.exceptions,
+                        &mut w.logits,
+                    )?,
+                    8 => gpu.module.head_packed_eight(
+                        &gpu.stream,
+                        rows((outputs.div_ceil(8) * VOCAB).div_ceil(8), 256),
+                        &w.norm,
+                        &step.outputs,
+                        &gpu.head.words,
+                        &gpu.head.offsets,
+                        &gpu.head.exceptions,
+                        &mut w.logits,
+                    )?,
+                    _ => gpu.module.head_packed_rows(
+                        &gpu.stream,
+                        cfg(outputs * VOCAB * 32),
+                        &w.norm,
+                        &step.outputs,
+                        &gpu.head.words,
+                        &gpu.head.offsets,
+                        &gpu.head.exceptions,
+                        &mut w.logits,
+                        0,
+                    )?,
+                }
                 gpu.module.select_token_rows(
                     &gpu.stream,
                     rows(outputs, 1024),

@@ -52,6 +52,12 @@ pub struct EngineConfig {
     /// Permit the measured hardware-specific projection dispatch. Disable for A/B runs.
     #[serde(default = "enabled")]
     pub tuned_projections: bool,
+    /// Share K/V staging between GQA heads at measured profitable row counts.
+    #[serde(default = "enabled")]
+    pub tuned_attention: bool,
+    /// Reuse packed head reconstruction across output rows on the RTX 5090.
+    #[serde(default = "enabled")]
+    pub tuned_head: bool,
 }
 
 fn enabled() -> bool {
@@ -80,6 +86,8 @@ impl EngineConfig {
             verify_logits: true,
             cuda_graphs: true,
             tuned_projections: hardware == HardwareProfile::Rtx5090,
+            tuned_attention: hardware == HardwareProfile::Rtx5090,
+            tuned_head: hardware == HardwareProfile::Rtx5090,
         }
     }
 
