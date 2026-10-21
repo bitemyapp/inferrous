@@ -130,6 +130,16 @@ The final 512-token profile attributes 61.4% of GPU time to decode projections, 
 
 `tools/bench_batch.py` runs the paged engine using a JSON object mapping workload names to request arrays. Each array may contain homogeneous or ragged prompts and different positive output limits; timing workloads use empty stop lists. It records every repetition, verifies complete deterministic outputs, and checks the exact processed-token count for full recomputation. The [session guide](sessions.md) describes configuration, native-context preparation and timing boundaries.
 
+Run separate correctness probes with `verify_logits: true`, then compare all binaries and cache modes with `tools/check_batch_regression.py`. Supply the exact workload manifest and expected repetition count. The checker rejects missing workloads, duplicate/reordered runs, mixed model/device/configuration identities within a file, disabled or incomplete hashes, changed requests and incorrect cached/recomputed token accounting. It compares every token, full-vocabulary logit hash and finish reason across all inputs; a matching selected token cannot hide changed logits. The report includes input-file and executable SHA-256 identities. Run this and all other tests/benchmarks on `ssh wx-workstation` for the current PRO 6000 work.
+
+```sh
+python3 crates/inferrous-qwen3/tools/check_batch_regression.py \
+  path/to/original-reuse.jsonl path/to/candidate-reuse.jsonl \
+  path/to/original-recompute.jsonl path/to/candidate-recompute.jsonl \
+  --workloads path/to/verification-workloads.json --repeat 1 \
+  --output path/to/new-hash-verification.json
+```
+
 `tools/bench_engines.py` accepts the same named arrays, while retaining compatibility with the earlier single-request workload objects. `--cache-mode reuse` uses ordinary multi-token generation. `--cache-mode recompute` submits the entire growing prefix as a new one-token request at each step, retires finished sequences, and requires prefix caching disabled. It retains each step's submitted lengths, elapsed times and backend metrics. Two host unit tests verify those submission sequences independently of a GPU. Run them with `python -m unittest discover -s crates/inferrous-qwen3/tools/tests -v` inside the Nix shell.
 
 The pinned stock containers are launched with `tools/stock_container.sh`, which supports `vllm` and `sglang` and mounts the host driver on NixOS without installing a system container runtime. The current vLLM compressed-tensors automatic INT8 backend rejects SM120; select its supported Triton backend explicitly. For example, from the repository root:

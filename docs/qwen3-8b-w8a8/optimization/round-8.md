@@ -22,12 +22,29 @@ Explicit tuning flags now work on either validated hardware profile, allowing th
 
 The operator profile compares original, grouped and tiled attention. For 256 rows, the measured median combined QK/softmax/PV time at strides 512/4096/32768 is respectively 0.340/3.355/33.905 ms for original kernels, 0.145/1.460/16.649 ms for grouped kernels, and 0.112/1.120/13.626 ms for tiled kernels. These isolated diagnostic samples do not establish model-level improvements. All operator outputs agree exactly. Artifact: `tiled-operator-profile.log`.
 
+## Cached paired pilot
+
+The completed cached A/B/B/A has six measured samples per variant and shape, after three warmups per process. Every one of the 151 full-logit hashes in the separate two-output cached verification suite agrees. The table uses the timing workloads described above, including eight outputs for the solo 8K case. The candidate combines tiled prefill with the opt-in projection, grouped-attention and staged-head policies; these measurements do not attribute the combined gain to any single kernel change. Artifact: `paired-reuse-summary.json`.
+
+| Workload | Original API median | Candidate API median | Reduction |
+|---|---:|---:|---:|
+| Batch 1, prompt 129 | 60.951 ms | 58.686 ms | 3.7% |
+| Batch 2, prompt 129 | 91.047 ms | 72.606 ms | 20.3% |
+| Batch 4, prompt 129 | 120.802 ms | 94.908 ms | 21.4% |
+| Batch 8, prompt 129 | 181.098 ms | 137.263 ms | 24.2% |
+| Batch 16, prompt 129 | 306.638 ms | 214.756 ms | 30.0% |
+| Batch 32, prompt 129 | 528.375 ms | 375.259 ms | 29.0% |
+| Ragged 12 | 175.818 ms | 137.594 ms | 21.7% |
+| Solo 8K, eight outputs | 5372.336 ms | 2146.259 ms | 60.0% |
+
+These pilots do not establish the final twenty-sample stock ranking, and true-recomputation timings/verification remain in progress.
+
 ## Validation checkpoint
 
 | Check | Evidence | Status |
 |---|---|---|
 | Starting implementation, release GPU suite | `release-tests.log` | 16 passed, 4 ignored; 28.96 s |
-| Python benchmark harness tests | `python3 -m unittest discover -s crates/inferrous-qwen3/tools/tests -v` on workstation | 5 passed |
+| Python benchmark harness tests | `harness-tests.log` on workstation | 11 passed, including six completeness/cross-mode regression-checker tests |
 | Tiled operators against paged and independent contiguous implementations | `tiled-operator-test.log` | Passed; partial groups, shuffled pages, ragged slots, page crossings and complete output/probability tensors |
 | Integrated tiled candidate, release GPU suite | `tiled-release-tests.log` | 18 passed, 4 ignored; 39.94 s |
 | New full-model tiled test | Included in release suite | Exact full-logit hashes across 64/512-row chunks, eager/graph execution, cold/warm prefixes and full recomputation |
@@ -36,5 +53,7 @@ The operator profile compares original, grouped and tiled attention. For 256 row
 | Tiled operator memcheck/racecheck and full ragged-model racecheck | `tiled-operators-*.log`, `tiled-ragged-racecheck.*` | Queued; complete zero-error summaries required |
 
 `run_paired.py` records distinct frozen binary identities, runs original/candidate/candidate/original for both cache modes, and captures GPU clocks, utilization, memory, temperature and power. Each arm has three excluded warmups and three measured samples, yielding six measured samples per variant. Separate verification probes enable full-logit hashing and limit outputs to two; their timings must not be mixed with eight-output performance samples. Recompute probes independently validate the exact submitted-token count. The final twenty-sample, full-shape matrix and stock ranking remain outstanding.
+
+The maintained `tools/check_batch_regression.py` additionally checks the complete expected workload/repetition set and compares outputs across binaries and cache modes together, retaining raw-file SHA-256 identities in its report. Its initial cached report, `cached-hash-verification.json`, confirms all eight workloads and 151 hashes per repetition. The four-input cross-mode report remains pending until recomputation probes finish.
 
 The pinned vLLM 0.32.0 container is downloaded and its PyTorch/vLLM imports succeed. The stock Triton INT8/Triton attention graph screen is queued after validation with matching requests, 32K context, 32 sequence slots and 12 GiB KV. Import success alone is not evidence of working model inference or competitive performance. Additional eligible stock configurations, true uncached results, larger capacity, warm prefixes, sustained outputs and the full final acceptance audit remain required.
