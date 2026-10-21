@@ -90,6 +90,13 @@ def collect(inputs, workloads, local, warmup, minimum):
         counts = {len(numbers) for numbers in runs.values()}
         if len(counts) != 1 or any(numbers != list(range(len(numbers))) for numbers in runs.values()):
             raise ValueError(f"{name}: missing, reordered or duplicate repetitions")
+        # Both harnesses keep one resident engine and visit sorted workloads.
+        # Per-workload repetition checks alone permit a changed prefix history,
+        # including interleaved workloads or reordered concatenated fragments.
+        repetitions = next(iter(counts))
+        if [(record["workload"], record["run"]) for record in records] != [
+                (workload, run) for workload in sorted(workloads) for run in range(repetitions)]:
+            raise ValueError(f"{name}: workload order differs from the resident-suite protocol")
     for group in groups.values():
         for workload in workloads:
             if len(group["workloads"][workload]) < minimum:

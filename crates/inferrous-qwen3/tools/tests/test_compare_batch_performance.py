@@ -73,6 +73,21 @@ class PerformanceComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repetitions"):
             self.report()
 
+    def test_resident_suite_order_cannot_change_cache_history(self):
+        # Every workload still has all repetitions in order. Changing only the
+        # order between workloads must not evade the resident-suite contract.
+        for arm in ["local", "slow", "fast"]:
+            for ordering in ["reversed-workloads", "interleaved"]:
+                with self.subTest(arm=arm, ordering=ordering):
+                    self.setUp()
+                    records = getattr(self, arm)
+                    if ordering == "reversed-workloads":
+                        records.sort(key=lambda r: r["workload"], reverse=True)
+                    else:
+                        records.sort(key=lambda r: (r["run"], r["workload"]))
+                    with self.assertRaisesRegex(ValueError, "workload order"):
+                        self.report()
+
     def test_recompute_requires_actual_growing_prefix_submissions(self):
         for record in self.local:
             record["cache_mode"] = "recompute"
