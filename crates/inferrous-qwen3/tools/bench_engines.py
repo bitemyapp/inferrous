@@ -144,7 +144,9 @@ def main():
         return [(r.get("output_ids", []), r["meta_info"]) for r in results]
 
     with args.output.open("x") as f:
-        for name, value in workloads.items():
+        # Match the Rust BTreeMap suite's order, including prefix-cache history.
+        for name in sorted(workloads):
+            value = workloads[name]
             requests = value if isinstance(value, list) else [value]
             for run in range(args.repeat):
                 start = time.perf_counter()

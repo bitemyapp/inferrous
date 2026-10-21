@@ -128,6 +128,18 @@ The final 512-token profile attributes 61.4% of GPU time to decode projections, 
 
 ## Paged and stock batch harnesses
 
+Generate the complete native-context matrix on `wx-workstation` with the selected hardware configuration:
+
+```sh
+python3 crates/inferrous-qwen3/tools/make_batch_matrix.py \
+  --config configs/qwen3-8b-w8a8/rtx-pro-6000.json \
+  --output clean-work/new-comparison-matrix
+```
+
+The new directory contains one shared workload file, cold/prefix-enabled configurations, an explicit manifest and capacity-rejection probes. The 96 homogeneous cases cross prompts 5/129/512/2K/4K/8K/16K/near-32K with batches 1/2/4/8/16/32 and output counts 2/32. Near-native prompts reserve their requested outputs within 32,768 tokens. Two ragged cases and one page-growth case bring the total to 99 scenarios, each required in cold reuse, prefix-enabled reuse and true recomputation. Cases exceeding simultaneous residency are retained and annotated with predicted cold admission waves, rather than silently omitted; actual admission and memory behavior still require runtime evidence. Prefix-enabled results must report real cache reuse, including eviction or zero-hit cases. The generator uses the provided KV budget and kernel flags, sets batch capacity 32 and disables logit hashing for timing. It does not select a winning kernel policy or run a benchmark.
+
+Both harnesses traverse workload names in sorted order, matching Rust's `BTreeMap`, so input JSON insertion order cannot change prefix-cache history between engines. Three warmups and twenty measured repetitions are required for final timing tables; generated inputs, passing harness tests and tuning pilots do not satisfy that measurement gate.
+
 `tools/bench_batch.py` runs the paged engine using a JSON object mapping workload names to request arrays. Each array may contain homogeneous or ragged prompts and different positive output limits; timing workloads use empty stop lists. It records every repetition, verifies complete deterministic outputs, and checks the exact processed-token count for full recomputation. The [session guide](sessions.md) describes configuration, native-context preparation and timing boundaries.
 
 Run separate correctness probes with `verify_logits: true`, then compare all binaries and cache modes with `tools/check_batch_regression.py`. Supply the exact workload manifest and expected repetition count. The checker rejects missing workloads, duplicate/reordered runs, mixed model/device/configuration identities within a file, disabled or incomplete hashes, changed requests and incorrect cached/recomputed token accounting. It compares every token, full-vocabulary logit hash and finish reason across all inputs; a matching selected token cannot hide changed logits. The report includes input-file and executable SHA-256 identities. Run this and all other tests/benchmarks on `ssh wx-workstation` for the current PRO 6000 work.

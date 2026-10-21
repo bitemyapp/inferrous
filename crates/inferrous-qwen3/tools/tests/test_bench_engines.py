@@ -14,7 +14,7 @@ spec.loader.exec_module(harness)
 
 
 class StockHarnessTests(unittest.TestCase):
-    def run_harness(self, mode):
+    def run_harness(self, mode, names=("ragged",)):
         calls = []
 
         class Engine:
@@ -35,7 +35,7 @@ class StockHarnessTests(unittest.TestCase):
             (root / "manifest.json").write_text('{}')
             requests = [dict(prompt_ids=[1, 2], max_tokens=3, stop_ids=[]),
                         dict(prompt_ids=[10], max_tokens=1, stop_ids=[])]
-            (root / "requests.json").write_text(json.dumps({"ragged": requests}))
+            (root / "requests.json").write_text(json.dumps({name: requests for name in names}))
             output = root / "out.jsonl"
             argv = ["bench_engines.py", "vllm", "--model", str(root / "hf"), "--requests", str(root / "requests.json"),
                     "--output", str(output), "--hardware-profile", "rtx5090", "--repeat", "2", "--cache-mode", mode]
@@ -60,6 +60,11 @@ class StockHarnessTests(unittest.TestCase):
         calls, records = self.run_harness("reuse")
         self.assertEqual(calls, [[([1, 2], 3), ([10], 1)]] * 2)
         self.assertEqual(records[0]["recompute_steps"], [])
+
+    def test_workload_order_matches_rust_even_when_input_is_unsorted(self):
+        _, records = self.run_harness("reuse", names=("z-last", "a-first"))
+        self.assertEqual([(r["workload"], r["run"]) for r in records],
+                         [("a-first", 0), ("a-first", 1), ("z-last", 0), ("z-last", 1)])
 
 
 if __name__ == "__main__":
