@@ -3396,6 +3396,243 @@ pub mod device {
             *out.get_unchecked_mut(query * 128 + column + t) = bf(sum);
         }
     }
+    /// Four prompt rows share a 64-key tile. A pair of warps owns each row's
+    /// four GQA dots; all 256 threads contribute to the shared Q/K staging.
+    #[kernel]
+    pub fn attention_scores_tiled(
+        q: &[f32],
+        k: &[u16],
+        row_info: &[u32],
+        page_table: &[u32],
+        pages_per_sequence: u32,
+        stride: u32,
+        tiles: u32,
+        query_tiles: &[u32],
+        mut scores: DisjointSlice<f32>,
+    ) {
+        dependency_wait();
+        static mut QUERY: SharedArray<f32, 2048> = SharedArray::UNINIT;
+        static mut TILE: SharedArray<u32, 4096, 16> = SharedArray::UNINIT;
+        let block = thread::blockIdx_x() as usize;
+        let group = block / tiles as usize;
+        let first_row = query_tiles[group / 8 * 2] as usize;
+        let count = query_tiles[group / 8 * 2 + 1] as usize;
+        let kv = group % 8;
+        let base = block % tiles as usize * 64;
+        let max_end = row_info[(first_row + count - 1) * 2 + 1] as usize + 1;
+        if base >= max_end {
+            return;
+        }
+        let slot = row_info[first_row * 2] as usize;
+        let page = page_table[slot * pages_per_sequence as usize + base / 64] as usize;
+        let t = thread::threadIdx_x() as usize;
+        let member = t / 64;
+        let row = first_row + member.min(count - 1);
+        let end = row_info[row * 2 + 1] as usize + 1;
+        let key_index = t % 64;
+        let queries = unsafe { SharedArray::as_raw_mut_ptr(&raw mut QUERY) };
+        let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+        let halves = tile.cast::<u16>();
+        unsafe {
+            let mut piece = 0;
+            while piece < 8 {
+                let i = t + piece * 256;
+                let input_row = first_row + (i / 512).min(count - 1);
+                *queries.add(i) = q[(input_row * 32 + kv * 4) * 128 + i % 512];
+                piece += 1;
+            }
+            let mut piece = 0;
+            while piece < 4 {
+                let i = t + piece * 256;
+                cuda_device::async_copy::cp_async_ca_16(
+                    tile.add(i * 4),
+                    k.as_ptr()
+                        .add(page * 65536 + (kv * 128 + i / 8) * 64 + i % 8 * 8)
+                        .cast::<u32>(),
+                );
+                piece += 1;
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+            cuda_device::async_copy::cp_async_wait_all();
+        }
+        thread::sync_threads();
+        if member < count && base + key_index < end {
+            let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
+            let query = unsafe { queries.add(member * 512) };
+            let mut c = 0;
+            while c < 128 {
+                let key = widen(unsafe { *halves.add(c * 64 + key_index) });
+                s0 = add(s0, mul(unsafe { *query.add(c) }, key));
+                s1 = add(s1, mul(unsafe { *query.add(128 + c) }, key));
+                s2 = add(s2, mul(unsafe { *query.add(256 + c) }, key));
+                s3 = add(s3, mul(unsafe { *query.add(384 + c) }, key));
+                c += 1;
+            }
+            let offset = (row * 32 + kv * 4) * stride as usize + base + key_index;
+            unsafe {
+                *scores.get_unchecked_mut(offset) = mul(s0, 0.08838834764831845_f32);
+                *scores.get_unchecked_mut(offset + stride as usize) =
+                    mul(s1, 0.08838834764831845_f32);
+                *scores.get_unchecked_mut(offset + 2 * stride as usize) =
+                    mul(s2, 0.08838834764831845_f32);
+                *scores.get_unchecked_mut(offset + 3 * stride as usize) =
+                    mul(s3, 0.08838834764831845_f32);
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn stage_values_tiled(
+        tile: *mut u32,
+        probability: *mut f32,
+        scores: &[f32],
+        v: &[u16],
+        row_info: &[u32],
+        first_row: usize,
+        row_count: usize,
+        stride: usize,
+        page: usize,
+        kv: usize,
+        column: usize,
+        t: usize,
+        base: usize,
+    ) {
+        let slot = base / 64 % 2;
+        unsafe {
+            let mut piece = 0;
+            while piece < 2 {
+                let i = t * 8 + piece * 1024;
+                cuda_device::async_copy::cp_async_ca_16(
+                    tile.add(slot * 1024 + i / 2),
+                    v.as_ptr()
+                        .add(page * 65536 + i / 32 * 1024 + kv * 128 + column + i % 32)
+                        .cast::<u32>(),
+                );
+                let i = t * 4 + piece * 512;
+                let head = i / 64;
+                let row = first_row + (head / 4).min(row_count - 1);
+                let end = row_info[row * 2 + 1] as usize + 1;
+                let token = base + i % 64;
+                let bytes = end.saturating_sub(token).min(4) * 4;
+                let source = if bytes == 0 {
+                    0
+                } else {
+                    (row * 32 + kv * 4 + head % 4) * stride + token
+                };
+                cuda_device::async_copy::cp_async_ca_zfill_16(
+                    probability.add(slot * 1024 + i).cast::<u32>(),
+                    scores.as_ptr().add(source).cast::<u8>(),
+                    bytes as u32,
+                );
+                piece += 1;
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+        }
+    }
+
+    /// Four prompt rows from one sequence share each staged V tile. Query tiles
+    /// are contiguous host-validated (first row, count) pairs; 1 <= count <= 4.
+    #[kernel]
+    pub fn attention_values_tiled(
+        scores: &[f32],
+        v: &[u16],
+        row_info: &[u32],
+        page_table: &[u32],
+        pages_per_sequence: u32,
+        stride: u32,
+        query_tiles: &[u32],
+        mut out: DisjointSlice<f32>,
+    ) {
+        dependency_wait();
+        static mut TILE: SharedArray<u32, 2048, 16> = SharedArray::UNINIT;
+        static mut PROB: SharedArray<f32, 2048, 16> = SharedArray::UNINIT;
+        let block = thread::blockIdx_x() as usize;
+        let tile_index = block / 32;
+        let first_row = query_tiles[tile_index * 2] as usize;
+        let count = query_tiles[tile_index * 2 + 1] as usize;
+        let kv = block / 4 % 8;
+        let column = block % 4 * 32;
+        let t = thread::threadIdx_x() as usize;
+        let member = t / 32;
+        let lane = t % 32;
+        let row = first_row + member.min(count - 1);
+        let slot = row_info[first_row * 2] as usize;
+        let end = row_info[row * 2 + 1] as usize + 1;
+        let max_end = row_info[(first_row + count - 1) * 2 + 1] as usize + 1;
+        let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+        let halves = tile.cast::<u16>();
+        let probability = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PROB) };
+        unsafe {
+            stage_values_tiled(
+                tile,
+                probability,
+                scores,
+                v,
+                row_info,
+                first_row,
+                count,
+                stride as usize,
+                page_table[slot * pages_per_sequence as usize] as usize,
+                kv,
+                column,
+                t,
+                0,
+            );
+        }
+        let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
+        let mut base = 0;
+        while base < max_end {
+            unsafe {
+                cuda_device::async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            if base + 64 < max_end {
+                let page = page_table[slot * pages_per_sequence as usize + base / 64 + 1] as usize;
+                unsafe {
+                    stage_values_tiled(
+                        tile,
+                        probability,
+                        scores,
+                        v,
+                        row_info,
+                        first_row,
+                        count,
+                        stride as usize,
+                        page,
+                        kv,
+                        column,
+                        t,
+                        base + 64,
+                    );
+                }
+            }
+            let shared_slot = base / 64 % 2;
+            let probs = unsafe { probability.add(shared_slot * 1024 + member * 256) };
+            let mut j = 0;
+            let key_count = end.saturating_sub(base).min(64);
+            #[unroll(8)]
+            while j < key_count {
+                let value = widen(unsafe { *halves.add(shared_slot * 2048 + j * 32 + lane) });
+                s0 = add(s0, mul(unsafe { *probs.add(j) }, value));
+                s1 = add(s1, mul(unsafe { *probs.add(64 + j) }, value));
+                s2 = add(s2, mul(unsafe { *probs.add(128 + j) }, value));
+                s3 = add(s3, mul(unsafe { *probs.add(192 + j) }, value));
+                j += 1;
+            }
+            thread::sync_threads();
+            base += 64;
+        }
+        if member < count {
+            let offset = (row * 32 + kv * 4) * 128 + column + lane;
+            unsafe {
+                *out.get_unchecked_mut(offset) = bf(s0);
+                *out.get_unchecked_mut(offset + 128) = bf(s1);
+                *out.get_unchecked_mut(offset + 256) = bf(s2);
+                *out.get_unchecked_mut(offset + 384) = bf(s3);
+            }
+        }
+    }
+
     /// Four independent ordered PV sums reuse a single staged value tile.
     #[kernel]
     pub fn attention_values_grouped(

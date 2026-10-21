@@ -84,7 +84,7 @@ struct Matrix {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ProjectionPolicy {
     Original,
-    Rtx5090,
+    TunedBatch,
 }
 struct PackedHead {
     words: DeviceBuffer<u32>,
@@ -512,9 +512,9 @@ impl GpuModel {
         // Cold-weight CUDA-event measurements on the 5090 favor wider tiles
         // for small MLP batches and DP4A for two to four down-projection rows.
         // Keep the original PRO 6000/legacy dispatch independently selectable.
-        let tuned_tiled = policy == ProjectionPolicy::Rtx5090
+        let tuned_tiled = policy == ProjectionPolicy::TunedBatch
             && ((nr >= 4 && w.n == 12288) || (nr >= 5 && w.k == 12288));
-        let tuned = policy == ProjectionPolicy::Rtx5090;
+        let tuned = policy == ProjectionPolicy::TunedBatch;
         let tuned_dp4a = tuned && ((w.k == 12288 && nr <= 4) || (w.n == 1024 && nr <= 4));
         let pipelined_large = tuned
             && ((w.n == 4096 && nr >= 256)

@@ -2,6 +2,8 @@
 
 The Nix shell includes CUDA 13.4 CUPTI headers and libraries. `tools/profile_kernels.sh` builds a small host-only C activity collector and loads it into the requested executable. All inference kernels remain Rust. Profiling is opt-in; ordinary builds and benchmarks do not load the collector. It works with the workstation's existing driver settings and collects activity timestamps without requesting hardware performance counters.
 
+On `wx-workstation`, set `CUDA_HOME=/usr/local/cuda-13.1`. The wrapper supports both `lib` and `lib64` toolkit layouts and selects the current kernel activity record declared by that toolkit's primary CUPTI header. The collector rejects a header/runtime API version mismatch before collecting records. CUDA 13.1 on the RTX PRO 6000 has been exercised with complete batch-32 and 8K traces; these are separate from the RTX 5090 traces below.
+
 Choose a fresh output path and a request array described in the [session guide](sessions.md). For cold-prefix profiling, copy the appropriate hardware configuration and set `prefix_cache_entries: 0`; record whether logit verification and CUDA graphs are enabled.
 
 ```sh

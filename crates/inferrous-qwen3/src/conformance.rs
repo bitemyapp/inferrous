@@ -961,7 +961,26 @@ fn paged_attention_matches_contiguous_ragged_queries() -> anyhow::Result<()> {
             DeviceBuffer::from_host(&stream, &v)?,
         ));
     }
-    let queries: [(usize, usize); 6] = [(1, 4095), (0, 0), (1, 64), (0, 129), (0, 63), (1, 512)];
+    // Partial query groups, page crossings, shuffled slots and a native 4K tail.
+    let queries: [(usize, usize); 17] = [
+        (1, 4095),
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 62),
+        (1, 63),
+        (1, 64),
+        (0, 128),
+        (0, 129),
+        (1, 511),
+        (1, 512),
+        (1, 513),
+        (1, 514),
+        (1, 515),
+        (1, 516),
+        (0, 63),
+    ];
     let info: Vec<u32> = queries
         .iter()
         .flat_map(|&(slot, pos)| [slot as u32, pos as u32])
@@ -1044,6 +1063,46 @@ fn paged_attention_matches_contiguous_ragged_queries() -> anyhow::Result<()> {
             &page_table,
             64,
             stride as u32,
+            &mut output,
+        )?;
+    }
+    assert_eq!(scores.to_host_vec(&stream)?, probabilities);
+    assert_eq!(output.to_host_vec(&stream)?, actual);
+    let query_tiles =
+        DeviceBuffer::from_host(&stream, &[0_u32, 1, 1, 4, 5, 3, 8, 2, 10, 4, 14, 2, 16, 1])?;
+    // SAFETY: these seven groups partition every query, each contains one to
+    // four consecutive positions from one slot, and the page table is unchanged.
+    unsafe {
+        module.attention_scores_tiled(
+            &stream,
+            rows(7 * 8 * 64, 256),
+            &q_device,
+            &k_device,
+            &info,
+            &page_table,
+            64,
+            stride as u32,
+            64,
+            &query_tiles,
+            &mut scores,
+        )?;
+        module.attention_softmax_paged(
+            &stream,
+            rows(queries.len() * 32, 128),
+            &mut scores,
+            &info,
+            stride as u32,
+        )?;
+        module.attention_values_tiled(
+            &stream,
+            rows(7 * 8 * 4, 128),
+            &scores,
+            &v_device,
+            &info,
+            &page_table,
+            64,
+            stride as u32,
+            &query_tiles,
             &mut output,
         )?;
     }

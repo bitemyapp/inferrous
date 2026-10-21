@@ -55,7 +55,10 @@ pub struct EngineConfig {
     /// Share K/V staging between GQA heads at measured profitable row counts.
     #[serde(default = "enabled")]
     pub tuned_attention: bool,
-    /// Reuse packed head reconstruction across output rows on the RTX 5090.
+    /// Share prefill K/V tiles across consecutive query rows; opt-in experiment.
+    #[serde(default)]
+    pub tiled_attention: bool,
+    /// Reuse packed head reconstruction across output rows.
     #[serde(default = "enabled")]
     pub tuned_head: bool,
 }
@@ -87,6 +90,7 @@ impl EngineConfig {
             cuda_graphs: true,
             tuned_projections: hardware == HardwareProfile::Rtx5090,
             tuned_attention: hardware == HardwareProfile::Rtx5090,
+            tiled_attention: false,
             tuned_head: hardware == HardwareProfile::Rtx5090,
         }
     }

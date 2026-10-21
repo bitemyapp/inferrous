@@ -1,4 +1,4 @@
-// Host-only CUPTI activity collection for the pinned CUDA 13.4 toolchain.
+// Host-only CUPTI activity collection using the toolkit's current record layout.
 // This adds no inference kernels and is loaded only by profile_kernels.sh.
 #define _POSIX_C_SOURCE 200112L
 #include <cupti.h>
@@ -50,7 +50,7 @@ static void CUPTIAPI complete_buffer(CUcontext context, uint32_t stream, uint8_t
     CUptiResult status;
     while ((status = cuptiActivityGetNextRecord(buffer, valid_size, &record)) == CUPTI_SUCCESS) {
         if (record->kind != CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) continue;
-        const CUpti_ActivityKernel13 *kernel = (const CUpti_ActivityKernel13 *)record;
+        const INFERROUS_ACTIVITY_KERNEL *kernel = (const INFERROUS_ACTIVITY_KERNEL *)record;
         ++records;
         if (kernel->start == 0 || kernel->end <= kernel->start) ++invalid_intervals;
         csv_name(kernel->name);
@@ -97,6 +97,11 @@ __attribute__((constructor)) static void initialize(void) {
     const char *binary_sha = getenv("INFERROUS_TRACE_BINARY_SHA256");
     uint32_t version = 0;
     check(cuptiGetVersion(&version), "read CUPTI version");
+    if (version != CUPTI_API_VERSION) {
+        fprintf(stderr, "kernel trace: CUPTI header/runtime version mismatch: %u/%u\n",
+                (unsigned)CUPTI_API_VERSION, version);
+        _Exit(2);
+    }
     fprintf(trace, "# binary_sha256=%s cupti_api_version=%u\n", binary_sha ? binary_sha : "unknown", version);
     fputs("name,start_ns,end_ns,device,context,stream,grid_x,grid_y,grid_z,block_x,block_y,block_z,registers,static_shared,dynamic_shared,local_per_thread,graph_id,graph_node\n", trace);
     check(cuptiActivityRegisterCallbacks(request_buffer, complete_buffer), "register buffers");

@@ -68,6 +68,30 @@ struct Prefix {
     cache: CacheLease,
 }
 
+/// Partition packed rows without ever sharing a tile across sequence slots or
+/// nonconsecutive positions. Each pair is (first row, count), with count <= 4.
+fn query_tiles(info: &[u32]) -> Result<Vec<u32>> {
+    ensure!(info.len() % 2 == 0, "incomplete query row metadata");
+    ensure!(info.len() / 2 <= 1024, "too many query rows");
+    let mut tiles = Vec::new();
+    let mut first = 0;
+    while first < info.len() / 2 {
+        let mut count = 1;
+        while count < 4 && first + count < info.len() / 2 {
+            let row = first + count;
+            if info[row * 2] != info[first * 2]
+                || info[(row - 1) * 2 + 1].checked_add(1) != Some(info[row * 2 + 1])
+            {
+                break;
+            }
+            count += 1;
+        }
+        tiles.extend([first as u32, count as u32]);
+        first += count;
+    }
+    Ok(tiles)
+}
+
 struct Step {
     // Captured storage must be destroyed before any of its allocations.
     graph: Option<Graph>,
@@ -75,6 +99,8 @@ struct Step {
     w: Workspace,
     input: DeviceBuffer<u32>,
     info: DeviceBuffer<u32>,
+    query_tiles: DeviceBuffer<u32>,
+    query_tile_count: usize,
     table: DeviceBuffer<u32>,
     outputs: DeviceBuffer<u32>,
     stream: Arc<CudaStream>,
@@ -92,6 +118,8 @@ impl Step {
             w: Workspace::with_shape(stream, n, output_rows.max(1), stride)?,
             input: DeviceBuffer::zeroed(stream, n)?,
             info: DeviceBuffer::zeroed(stream, n * 2)?,
+            query_tiles: DeviceBuffer::zeroed(stream, n * 2)?,
+            query_tile_count: 0,
             table: DeviceBuffer::zeroed(stream, table_len)?,
             outputs: DeviceBuffer::zeroed(stream, output_rows.max(1))?,
             stream: stream.clone(),
@@ -497,6 +525,13 @@ impl BatchEngine {
                 let step = storage.as_mut().expect("allocated above");
                 step.input.copy_from_host(&self.gpu.stream, &input)?;
                 step.info.copy_from_host(&self.gpu.stream, &info)?;
+                step.query_tile_count = input.len();
+                if self.config.tiled_attention && input.len() != output_slots.len() {
+                    let mut tiles = query_tiles(&info)?;
+                    step.query_tile_count = tiles.len() / 2;
+                    tiles.resize(input.len() * 2, 0);
+                    step.query_tiles.copy_from_host(&self.gpu.stream, &tiles)?;
+                }
                 step.table.copy_from_host(&self.gpu.stream, &table)?;
                 if !output_rows.is_empty() {
                     step.outputs
@@ -596,19 +631,22 @@ impl BatchEngine {
         pages_per_sequence: usize,
     ) -> Result<()> {
         let gpu = &self.gpu;
-        let policy = match (self.config.hardware, self.config.tuned_projections) {
-            (crate::config::HardwareProfile::Rtx5090, true) => ProjectionPolicy::Rtx5090,
-            _ => ProjectionPolicy::Original,
+        let policy = if self.config.tuned_projections {
+            ProjectionPolicy::TunedBatch
+        } else {
+            ProjectionPolicy::Original
         };
         let w = &mut step.w;
         let (nr, outputs, stride) = step.shape;
-        let tuned_attention = self.config.hardware == crate::config::HardwareProfile::Rtx5090
-            && self.config.tuned_attention;
+        let tuned_attention = self.config.tuned_attention;
         // Grouped PV loses occupancy at small batch sizes. QK has independent
         // key-page tiles and can profit from grouping even for long solo decode.
         let grouped_scores =
             tuned_attention && (nr >= 16 || (nr >= 8 && stride >= 512) || stride >= 4096);
         let grouped_values = tuned_attention && nr >= 16;
+        // Decode has one row per session and cannot satisfy this occupancy
+        // threshold. Only eager prefill can change the tile count/launch grid.
+        let tiled_attention = self.config.tiled_attention && nr >= 2 * step.query_tile_count;
         // SAFETY: admission validates all tokens, row positions and page leases.
         // Every producer/consumer is serialized on one stream. Different rows
         // write distinct sequence positions, and all scratch allocations match
@@ -671,7 +709,21 @@ impl BatchEngine {
                     &mut cache.k,
                     &mut cache.v,
                 )?;
-                if grouped_scores {
+                if tiled_attention {
+                    gpu.module.attention_scores_tiled(
+                        &gpu.stream,
+                        rows(step.query_tile_count * 8 * (stride / 64), 256),
+                        &w.q,
+                        &cache.k,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        (stride / 64) as u32,
+                        &step.query_tiles,
+                        &mut w.scores,
+                    )?;
+                } else if grouped_scores {
                     gpu.module.attention_scores_grouped(
                         &gpu.stream,
                         rows(nr * 8 * (stride / 64), 128),
@@ -705,7 +757,20 @@ impl BatchEngine {
                     &step.info,
                     stride as u32,
                 )?;
-                if grouped_values {
+                if tiled_attention {
+                    gpu.module.attention_values_tiled(
+                        &gpu.stream,
+                        rows(step.query_tile_count * 8 * 4, 128),
+                        &w.scores,
+                        &cache.v,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        &step.query_tiles,
+                        &mut w.attention,
+                    )?;
+                } else if grouped_values {
                     gpu.module.attention_values_grouped(
                         &gpu.stream,
                         rows(nr * 8 * 4, 32),
@@ -818,9 +883,7 @@ impl BatchEngine {
         if outputs > 0 {
             gpu.norm(&w.hidden, &gpu.final_gain, &mut w.norm)?;
             unsafe {
-                let head_group = if self.config.hardware == crate::config::HardwareProfile::Rtx5090
-                    && self.config.tuned_head
-                {
+                let head_group = if self.config.tuned_head {
                     match outputs {
                         0..=2 => 1,
                         3..=4 => 4,
@@ -891,6 +954,37 @@ mod tests {
     use crate::config::HardwareProfile;
     use anyhow::Context;
 
+    #[test]
+    fn query_tiles_preserve_sequence_and_position_boundaries() -> Result<()> {
+        assert_eq!(query_tiles(&[])?, Vec::<u32>::new());
+        assert!(query_tiles(&[0]).is_err());
+        assert!(query_tiles(&vec![0; 2050]).is_err());
+        let info = [
+            1,
+            61,
+            1,
+            62,
+            1,
+            63,
+            1,
+            64,
+            1,
+            65,
+            0,
+            66,
+            0,
+            67,
+            0,
+            69,
+            1,
+            u32::MAX,
+            1,
+            0,
+        ];
+        assert_eq!(query_tiles(&info)?, [0, 4, 4, 1, 5, 2, 7, 1, 8, 1, 9, 1]);
+        Ok(())
+    }
+
     fn request(length: usize, seed: u32, outputs: usize) -> Request {
         Request {
             prompt_ids: (0..length)
@@ -950,6 +1044,10 @@ mod tests {
         engine.clear_prefixes()?;
         engine.config.prefill_chunk = 128;
         engine.config.cuda_graphs = false;
+        engine.config.tiled_attention = true;
+        engine.config.tuned_attention = true;
+        engine.config.tuned_projections = true;
+        engine.config.tuned_head = true;
         let fresh = engine.generate(&model, &requests, CacheMode::Recompute)?;
         assert_eq!(fresh.reused_tokens, 0);
         assert_eq!(fresh.processed_tokens, 2 * (8192 + 16384 + 32766) + 3);
@@ -961,6 +1059,43 @@ mod tests {
             "native context cold {:.3}s; warm {:.3}s; recompute {:.3}s",
             cold.elapsed_seconds, warm.elapsed_seconds, fresh.elapsed_seconds
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_prefill_matches_original_across_chunks_graphs_and_cache_modes() -> Result<()> {
+        let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE")
+            .context("set CLEAN_MODEL_BUNDLE for batched model validation")?;
+        let model = Model::load(Path::new(&bundle))?;
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 4096);
+        config.max_batch = 16;
+        config.kv_cache_bytes = 512 << 20;
+        config.tuned_attention = false;
+        config.tuned_projections = false;
+        config.tuned_head = false;
+        let requests: Vec<_> = [1, 5, 65, 129, 257, 33, 128, 64, 17, 256, 67, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| request(n, i as u32, 2 + i % 3))
+            .collect();
+        let baseline = BatchEngine::new(&model, config.clone())?;
+        let expected = baseline.generate(&model, &requests, CacheMode::Reuse)?;
+        drop(baseline);
+        config.tiled_attention = true;
+        config.tuned_attention = true;
+        config.tuned_projections = true;
+        config.tuned_head = true;
+        for (chunk, graphs) in [(64, false), (512, true)] {
+            config.prefill_chunk = chunk;
+            config.cuda_graphs = graphs;
+            let engine = BatchEngine::new(&model, config.clone())?;
+            for mode in [CacheMode::Reuse, CacheMode::Reuse, CacheMode::Recompute] {
+                let actual = engine.generate(&model, &requests, mode)?;
+                for (actual, expected) in actual.generations.iter().zip(&expected.generations) {
+                    same(actual, expected);
+                }
+            }
+        }
         Ok(())
     }
 

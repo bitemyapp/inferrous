@@ -150,6 +150,12 @@ fn grouped_attention_shapes() -> Result<()> {
                 .flat_map(|row| [0, (stride - nr + row) as u32])
                 .collect();
             let info = DeviceBuffer::from_host(&stream, &info)?;
+            let query_tiles: Vec<u32> = (0..nr)
+                .step_by(4)
+                .flat_map(|first| [first as u32, (nr - first).min(4) as u32])
+                .collect();
+            let tile_count = query_tiles.len() / 2;
+            let query_tiles = DeviceBuffer::from_host(&stream, &query_tiles)?;
             let q: Vec<f32> = (0..nr * 4096)
                 .map(|i| ((i * 7 % 31) as f32 - 15.0) / 16.0)
                 .collect();
@@ -157,15 +163,33 @@ fn grouped_attention_shapes() -> Result<()> {
             let mut scores = DeviceBuffer::<f32>::zeroed(&stream, nr * 32 * stride)?;
             let mut out = DeviceBuffer::<f32>::zeroed(&stream, nr * 4096)?;
             let mut expected = None;
-            for (grouped_scores, grouped_values) in
-                [(false, false), (true, false), (false, true), (true, true)]
-            {
+            for (grouped_scores, grouped_values, tiled) in [
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (true, true, false),
+                (true, true, true),
+            ] {
                 stream.synchronize()?;
                 // SAFETY: every query uses one fully initialized sequence; the
                 // reversed table covers precisely the allocated physical pages.
                 let graph = unsafe {
                     Graph::capture(&stream, false, || {
-                        if grouped_scores {
+                        if tiled {
+                            module.attention_scores_tiled(
+                                &stream,
+                                rows(tile_count * 8 * pages, 256),
+                                &q,
+                                &k,
+                                &info,
+                                &table,
+                                pages as u32,
+                                stride as u32,
+                                pages as u32,
+                                &query_tiles,
+                                &mut scores,
+                            )?;
+                        } else if grouped_scores {
                             module.attention_scores_grouped(
                                 &stream,
                                 rows(nr * 8 * pages, 128),
@@ -199,7 +223,20 @@ fn grouped_attention_shapes() -> Result<()> {
                             &info,
                             stride as u32,
                         )?;
-                        if grouped_values {
+                        if tiled {
+                            module.attention_values_tiled(
+                                &stream,
+                                rows(tile_count * 8 * 4, 128),
+                                &scores,
+                                &v,
+                                &info,
+                                &table,
+                                pages as u32,
+                                stride as u32,
+                                &query_tiles,
+                                &mut out,
+                            )?;
+                        } else if grouped_values {
                             module.attention_values_grouped(
                                 &stream,
                                 rows(nr * 8 * 4, 32),
@@ -255,7 +292,7 @@ fn grouped_attention_shapes() -> Result<()> {
                     "ATTENTION {}",
                     serde_json::json!({"device":device_name,
                     "rows":nr, "stride":stride, "grouped_scores":grouped_scores,
-                    "grouped_values":grouped_values, "milliseconds":times})
+                    "grouped_values":grouped_values, "tiled":tiled, "milliseconds":times})
                 );
             }
         }
