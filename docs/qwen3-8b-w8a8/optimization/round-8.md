@@ -678,3 +678,30 @@ The original and pipelined large-projection racechecks meanwhile complete on the
 |---|---|---|---|---|
 | `linear_large` | 144 | 617.08 s | 11,808,100,352 | `85bbca750c7522b6016f44be488bea6f9d310de14946be2cdb0a40a016de7bd0` |
 | `linear_large_pipeline` | 216 | 678.13 s | 11,434,381,312 | `010cdaa9c4a9b2ad6569335739a3b9f1c65716134172ea0a47782d3593336b47` |
+
+### Asynchronous-copy large projections: compiled and queued
+
+The isolated `inferrous-large-async` worktree at `eebf129` replaces TMA staging with per-thread 16-byte asynchronous copies for the existing 64-by-128 integer projection tile. One variant stages a full K=128 block; another alternates two K=64 slots. Both retain eight independent integer MMA accumulators and the original ordered FP32 scales/BF16 conversion. Invalid rows and columns zero-fill, all threads wait before consuming copies, and CTA barriers protect slot reuse. Each also has a four-block launch-bound version. These are operator-only experiments with no production dispatch changes.
+
+Both release and checked builds compile on `ssh wx-workstation`. Embedded cubin inspection reports the same resources in both builds. The bounded versions reduce registers to 64 at the cost of stack use; these counts alone establish no performance improvement.
+
+| Variant | Registers | Stack bytes | Static shared bytes |
+|---|---:|---:|---:|
+| Original TMA large projection | 66 | 0 | 26,624 |
+| Full-K asynchronous copy | 80 | 0 | 25,600 |
+| Half-K asynchronous pipeline | 78 | 0 | 25,600 |
+| Full-K copy, four-block bound | 64 | 80 | 25,600 |
+| Half-K pipeline, four-block bound | 64 | 8 | 25,600 |
+
+Artifacts are under `clean-work/pro6000-baseline/large-async-v2/`. Source patch SHA-256 is `8047afb1e123268fc30cb1426232d2bd895766e8e5dbcd0a46c2fa140c0cb57b`, kernel `15f65c914f21daa198a33367dc3674ac46f266f291e6fb7092e46c171fd8f702`, release executable `f05ba030df75301a55cffc4e6fa525cdf2456cde5bacb51f94858cfffb1423f7`, and checked executable `136429c4fbf7b4e5717204abf30b911651f082a2d9ff4550e32e6be9bafbee36`. Release/checked build receipts are `d61d37a1d061fb7555c16ac2c9cfa2b81b1eb8e75a2f2cd41ebd37dc84c534e5` / `7b98216ac0030e975f9538d1c780ddd9276b4ef194bfa510cdb760e4a0d0e0bd`; embedded-resource manifests are `a655d0648b61fe0acb09bd14a2b6ffc52fe0a9385b317c690e228844defd0710` / `6d6079c84f3fcf4cb9a759eda55120bca9f5a49a24306b7c32dea21092ee9c73`. The preceding two-variant v1 build remains preserved separately and has no GPU results.
+
+The new conformance test prepares 160 comparisons: twenty shape/pattern cases, four kernels, and eager/graph launches. Expected outputs use independent host signed-64-bit dot products, checked signed-32-bit range, ordered FP32 scaling and explicit BF16 ties-to-even rounding; trailing sentinels check output bounds. Shapes cross row-tile boundaries through 257 rows, column tails at 129/257, K=128/384, maximum/minimum signed input patterns at K=12,288 and a 4,096-wide fixture. The serial queue requires both builds to pass every comparison and the existing seventeen-fixture test, followed by release memcheck/racecheck with complete zero-error summaries. Only then may it run the 364-record projection timing screen over 44 shapes, with seven measured events after three warmups, 32 distinct weight allocations and full output agreement with DP4A. This is an unpaired operator screen; retention would still require model-level validation and paired performance evidence.
+
+The first waiting runner used an unsupported bulk-copy sanitizer option. A remote `--help` preflight caught it before any GPU command; only that new waiter was stopped, its empty validation directory and cancellation receipt preserved. Corrected `run-v2.py` uses `--check-bulk-copy yes` and leaves the existing GPU campaign and numerical waiter untouched. The runner's parser accepts complete synthetic reference/profile records and rejects eleven incomplete, duplicate, warning or invalid-timing cases; its parser functions are unchanged in v2. Runner SHA-256 is `42be882201ac6f84db1767ff3546f7d891dab692e6fd450856575dbd9e9f24e4`, identity manifest `393a684d7c01bfa10c44eaa5927de2537291fd6be1cc1adfe2be647b1c793388`, and v2 preflight receipt `f41ce8d6f821610afd5f19c3536d8e0f34ce6272e91905df2ea0db286ae70bf9`. It waits for the existing fixed-attention diagnostic's exact process identity and terminal summary, then requires the successful 5,216-launch production audit and an idle GPU. GPU validation and timing remain unexecuted at this checkpoint.
+
+Two further production partitions complete with all 56 original full-vocabulary hashes and tokens preserved, bringing checked coverage to 2,896 of 5,216 launches across seventeen families. `linear_tiled_pipeline` is running; the final coverage audit, numerical acceptance and final performance matrix remain pending.
+
+| Kernel family | Checked launches | Wall time | Peak process-group RSS, bytes | Validation SHA-256 |
+|---|---|---|---|---|
+| `linear_narrow_pipeline` | 468 | 960.51 s | 39,286,951,936 | `c37a4b5f7b200cf78c33481d9dda7571b3f241beb7cce54d88c8b1e718c64610` |
+| `linear_splitk` | 504 | 48.93 s | 121,063,923,712 | `ecfb1bae636e1ed0698391009b463f6bf8c911ebc82d9a5973e087c785ede930` |
