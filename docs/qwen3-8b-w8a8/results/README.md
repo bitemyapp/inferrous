@@ -10,3 +10,4 @@ Each optimization round's raw artifacts (measurement JSONL, logs, profiles, scri
 | [Round 5 (2026-10-03)](round-5.md) | [round 5 record](../optimization/round-5.md) |
 | [Round 6 (2026-10-06)](round-6.md) | [round 6 record](../optimization/round-6.md) |
 | [RTX 5090 Nix validation (2026-10-20)](rtx5090-nix.md) | [Local Nix setup](../../migrations/local-nix.md), release/checked tests and benchmarks |
+| [RTX PRO 6000 cache-mode pilots](pro6000-cache-mode-pilots.md) | [Round 8 record](../optimization/round-8.md), completed prefix/recomputation stock screens and remaining gaps |
