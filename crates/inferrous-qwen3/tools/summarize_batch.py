@@ -7,8 +7,16 @@ Recomputation uses the stock harness's one-token call completion timestamps.
 import argparse
 import hashlib
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
+
+
+def checked_time(value, label, positive=False):
+    if (type(value) not in (int, float) or not math.isfinite(value)
+            or value < 0 or (positive and value == 0)):
+        raise ValueError(f"invalid timing: {label}")
+    return value
 
 
 def distribution(values):
@@ -68,19 +76,23 @@ def measurements(record):
     generations = record["batch"]["generations"] if local else record["generations"]
     if not requests or len(generations) != len(requests) or any(r["max_tokens"] < 1 or len(g["token_ids"]) != r["max_tokens"] for g, r in zip(generations, requests)):
         raise ValueError("incomplete batch or generation")
-    seconds = record["generate_seconds"] if local else record["request_seconds"]
-    if seconds <= 0:
-        raise ValueError("nonpositive API time")
+    seconds = checked_time(record["generate_seconds"] if local else record["request_seconds"],
+                           "API seconds", positive=True)
+    if not local and record["cache_mode"] == "recompute":
+        elapsed = [checked_time(step["elapsed_seconds"], "recomputation elapsed seconds")
+                   for step in record["recompute_steps"]]
+        if any(after < before for before, after in zip(elapsed, elapsed[1:])):
+            raise ValueError("invalid timing: recomputation elapsed seconds move backwards")
     first_tokens, completions, per_stream_decode = [], [], []
     for slot, generation in enumerate(generations):
         count = len(generation["token_ids"])
         if local:
-            steps = generation["step_seconds"]
+            steps = [checked_time(step, "local step seconds") for step in generation["step_seconds"]]
             if len(steps) != count:
                 raise ValueError("incomplete local step timings")
             first = steps[0]
             decode = sum(steps[1:])
-            completion = generation["request_seconds"]
+            completion = checked_time(generation["request_seconds"], "local completion seconds")
         elif record["cache_mode"] == "recompute":
             steps = [step["elapsed_seconds"] for step in record["recompute_steps"] if slot in step["slots"]]
             if len(steps) != count:
@@ -93,19 +105,30 @@ def measurements(record):
             # subtract arrival_time from the monotonic *_ts fields.
             first = metrics.get("first_token_latency")
             begin, end = metrics.get("first_token_ts"), metrics.get("last_token_ts")
+            for label, value in [("first-token latency", first), ("first-token timestamp", begin),
+                                 ("last-token timestamp", end)]:
+                if value is not None:
+                    checked_time(value, label)
+            if begin is not None and end is not None and end < begin:
+                raise ValueError("invalid timing: last-token timestamp precedes first token")
             decode = end - begin if begin is not None and end is not None else None
             completion = first + decode if first is not None and decode is not None else None
+        if decode is not None:
+            checked_time(decode, "decode interval")
         if first is not None:
             first_tokens.append(first)
         if completion is not None:
             completions.append(completion)
         if count > 1 and decode is not None and decode > 0:
             per_stream_decode.append((count - 1) / decode)
-    return dict(api_seconds=[seconds], aggregate_output_tokens_per_second=[sum(len(g["token_ids"]) for g in generations) / seconds],
+    values = dict(api_seconds=[seconds], aggregate_output_tokens_per_second=[sum(len(g["token_ids"]) for g in generations) / seconds],
                 native_first_token_seconds=first_tokens, native_completion_seconds=completions,
                 native_per_stream_post_first_tokens_per_second=per_stream_decode,
                 reused_tokens=reused_tokens(record, local),
                 processed_tokens=[record["batch"]["processed_tokens"]] if local else [])
+    if any(not math.isfinite(value) or value < 0 for samples in values.values() for value in samples):
+        raise ValueError("invalid timing or accounting value")
+    return values
 
 
 def main():

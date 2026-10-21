@@ -40,6 +40,35 @@ class SummaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             summary.measurements(record)
 
+    def test_invalid_local_steps_cannot_hide_inside_a_positive_decode_total(self):
+        for steps in [[1.0, -0.5, 2.0], [1.0, float("nan"), 2.0],
+                      [1.0, float("inf"), 2.0], [1.0, 1e308, 1e308]]:
+            record = dict(backend="inferrous-paged", cache_mode="reuse", generate_seconds=4.0,
+                          requests=[dict(max_tokens=3)], batch=dict(reused_tokens=0, processed_tokens=5,
+                          generations=[dict(token_ids=[1, 2, 3], request_seconds=4.0,
+                                            step_seconds=steps)]))
+            with self.subTest(steps=steps), self.assertRaises(ValueError):
+                summary.measurements(record)
+
+    def test_nonfinite_api_and_reversed_native_timestamps_are_rejected(self):
+        for invalid in [float("nan"), float("inf"), -1.0, 0.0, True]:
+            record = self.record()
+            record["request_seconds"] = invalid
+            with self.subTest(api=invalid), self.assertRaises(ValueError):
+                summary.measurements(record)
+        record = self.record()
+        record["generations"][0]["backend_metrics"]["last_token_ts"] = 9.0
+        with self.assertRaises(ValueError):
+            summary.measurements(record)
+
+    def test_recompute_intermediate_timestamps_must_be_monotonic(self):
+        record = self.record()
+        record.update(cache_mode="recompute", recompute_steps=[dict(slots=slots, elapsed_seconds=elapsed)
+                      for slots, elapsed in [([0, 1], 0.5), ([0, 1], 1.5), ([0], 1.0), ([0], 3.5)]])
+        # First/final timestamps look valid; the third submission moves backwards.
+        with self.assertRaises(ValueError):
+            summary.measurements(record)
+
     def test_stock_prefix_metrics_distinguish_hits_zero_and_unknown(self):
         record = self.record()
         record.update(engine="vllm", prefix_cache=True)
