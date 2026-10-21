@@ -37,7 +37,20 @@ The completed cached A/B/B/A has six measured samples per variant and shape, aft
 | Ragged 12 | 175.818 ms | 137.594 ms | 21.7% |
 | Solo 8K, eight outputs | 5372.336 ms | 2146.259 ms | 60.0% |
 
-These pilots do not establish the final twenty-sample stock ranking, and true-recomputation timings/verification remain in progress.
+The true-recomputation A/B/B/A also completed with six measured samples per variant. Both binaries recompute each growing prefix and retire completed requests; processed-token accounting is checked independently.
+
+| Workload | Original recomputed API median | Candidate recomputed API median | Reduction |
+|---|---:|---:|---:|
+| Batch 1, prompt 129 | 166.482 ms | 143.013 ms | 14.1% |
+| Batch 2, prompt 129 | 225.553 ms | 185.978 ms | 17.5% |
+| Batch 4, prompt 129 | 437.774 ms | 353.008 ms | 19.4% |
+| Batch 8, prompt 129 | 780.651 ms | 643.569 ms | 17.6% |
+| Batch 16, prompt 129 | 1468.144 ms | 1207.749 ms | 17.7% |
+| Batch 32, prompt 129 | 2860.363 ms | 2342.475 ms | 18.1% |
+| Ragged 12 | 364.188 ms | 295.424 ms | 18.9% |
+| Solo 8K, eight outputs | 43662.585 ms | 17273.391 ms | 60.4% |
+
+The four-input verification report confirms that all 151 hashes per suite agree across both binaries and both cache modes, with the complete eight-workload manifest present in every input. Active telemetry samples (GPU utilization above 50%) span 1455–2355 MHz SM clocks, 51–87°C and 127.07–307.56 W. No fixed clocks were imposed. These pilots establish a measured combined improvement on this PRO 6000; they do not establish the final twenty-sample stock ranking. Artifacts: `paired-complete-summary.json`, `cross-mode-hash-verification.json` and `paired-telemetry.csv`.
 
 ## Validation checkpoint
 
@@ -48,12 +61,19 @@ These pilots do not establish the final twenty-sample stock ranking, and true-re
 | Tiled operators against paged and independent contiguous implementations | `tiled-operator-test.log` | Passed; partial groups, shuffled pages, ragged slots, page crossings and complete output/probability tensors |
 | Integrated tiled candidate, release GPU suite | `tiled-release-tests.log` | 18 passed, 4 ignored; 39.94 s |
 | New full-model tiled test | Included in release suite | Exact full-logit hashes across 64/512-row chunks, eager/graph execution, cold/warm prefixes and full recomputation |
-| Final metadata-copy adjustment, release/checked suites | `validation-queue.log` and named logs | Queued after paired timings; not yet a pass |
+| Final metadata-copy adjustment, release GPU suite | `tiled-final-release-tests-v3.log` | 18 passed, 4 ignored; 42.37 s |
+| Checked GPU suite | `tiled-checked-tests.log` | 18 passed, 4 ignored; 41.67 s |
 | Native-context release/checked comparison | `tiled-native-{release,checked}.log` | Queued; original cold/warm output compared with tuned/tiled full recomputation |
-| Tiled operator memcheck/racecheck and full ragged-model racecheck | `tiled-operators-*.log`, `tiled-ragged-racecheck.*` | Queued; complete zero-error summaries required |
+| Tiled operator memcheck | `tiled-operators-memcheck.log` | Test passed; complete summary reports zero errors |
+| Tiled operator racecheck | `tiled-operators-racecheck.log` | Test passed; complete summary reports zero hazards, errors or warnings |
+| Full ragged-model racecheck | `tiled-ragged-racecheck.*` | Queued; complete zero-error summary required |
 
 `run_paired.py` records distinct frozen binary identities, runs original/candidate/candidate/original for both cache modes, and captures GPU clocks, utilization, memory, temperature and power. Each arm has three excluded warmups and three measured samples, yielding six measured samples per variant. Separate verification probes enable full-logit hashing and limit outputs to two; their timings must not be mixed with eight-output performance samples. Recompute probes independently validate the exact submitted-token count. The final twenty-sample, full-shape matrix and stock ranking remain outstanding.
 
-The maintained `tools/check_batch_regression.py` additionally checks the complete expected workload/repetition set and compares outputs across binaries and cache modes together, retaining raw-file SHA-256 identities in its report. Its initial cached report, `cached-hash-verification.json`, confirms all eight workloads and 151 hashes per repetition. The four-input cross-mode report remains pending until recomputation probes finish.
+The maintained `tools/check_batch_regression.py` additionally checks the complete expected workload/repetition set and compares outputs across binaries and cache modes together, retaining raw-file SHA-256 identities in its report. `cached-hash-verification.json` and the completed four-input `cross-mode-hash-verification.json` confirm all eight workloads and 151 hashes per repetition.
+
+The first validation queue assumed Cargo's conventional `release/deps` test path; cuda-oxide instead reports the executable under `release/build`. While replacing the waiting wrapper, the paired process completed and its original child test process briefly overlapped the replacement. Both test process trees were stopped, their output was excluded, and GPU context cleanup was verified before restarting the corrected serial queue. `tiled-final-release-tests.log` and `validation-queue{,-v2}.log` are interrupted artifacts, not passes. The paired timings and hash probes had already completed and are unaffected. The corrected queue obtains the exact library-test executable from the successful test runner log and writes fresh `-v3` release evidence.
 
 The pinned vLLM 0.32.0 container is downloaded and its PyTorch/vLLM imports succeed. The stock Triton INT8/Triton attention graph screen is queued after validation with matching requests, 32K context, 32 sequence slots and 12 GiB KV. Import success alone is not evidence of working model inference or competitive performance. Additional eligible stock configurations, true uncached results, larger capacity, warm prefixes, sustained outputs and the full final acceptance audit remain required.
+
+After the serial validation queue, inspect every terminal summary rather than assuming the shell exit proves all checks. Compare all 56 full-model racecheck hashes with an ordinary original-policy probe using the same ragged request array; the two-output pilot's 23 ragged hashes cover only a prefix. Collect fresh candidate batch-32 and 8K CUPTI traces before selecting the next optimization: the profiles above describe the frozen original-policy baseline. Do not treat these pilots as the complete requested 5/129/512/2K/4K/8K/16K/near-32K, short/sustained-output, cold/warm, cached/uncached and capacity-boundary matrix.
