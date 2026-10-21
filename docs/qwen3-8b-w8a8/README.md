@@ -45,3 +45,5 @@ python3 crates/inferrous-qwen3/tools/check_regression.py \
 ```
 
 Use `tools/summarize.py` on result files for p50/p95/p99 API latency, first-token latency and decode throughput. It excludes the first three repetitions and requires at least twenty measurements. The percentile tails from twenty samples are descriptive, not production tail-latency estimates.
+
+The [kernel profiling guide](profiling.md) describes opt-in CUPTI collection through the Nix shell. Kernel traces identify bottlenecks; their instrumented timings remain separate from paired benchmark results.

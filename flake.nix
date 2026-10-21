@@ -31,6 +31,8 @@
           libnvvm
           libnvjitlink.lib
           libcurand.include
+          cuda_cupti.include
+          cuda_cupti.lib
         ];
         postBuild = ''
           # The CUDA compiler loaders expect the conventional toolkit layout.
