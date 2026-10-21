@@ -2,6 +2,8 @@
 
 Started 2026-10-20 on `feat/kv-cache-batching-rtx5090`, from the validated local setup commit `491f1c2`. The original release executable and measurements are preserved under `clean-work/kv-batch-baseline/`. This document tracks implementation and evidence; unchecked items remain requirements, not claims of completion.
 
+Paused at the user's request on 2026-10-20. Start with the [handoff](kv-cache-batching-rtx5090-handoff.md) for the current implementation, completed validation, interrupted checks and resume commands. The historical checkpoints below retain their original scope; the stock-performance requirement and final matrix remain unfinished.
+
 ## Requested outcome
 
 Implement reusable KV caching, single-stream and batched execution, a real no-KV-cache batch mode, longer context windows, and clean Rust resource management. Optimize on the RTX 5090, compare against the fastest eligible off-the-shelf harness in each scenario, and keep RTX PRO 6000 and RTX 5090 settings and evidence separate. Performance wins require measurements; a missing comparison, unsupported stock configuration or regression cannot be reported as a win.
@@ -28,7 +30,7 @@ Implement reusable KV caching, single-stream and batched execution, a real no-KV
 | Hardware profiles | Explicit legacy PRO 6000 profile, independent 5090 tuning and metadata; no unmeasured cross-GPU claims | Separate capacity configurations, actual-device validation and metadata implemented; performance tuning remains active |
 | Off-the-shelf comparison | Reproducible current vLLM/SGLang screening, eligible winner per scenario, true no-cache reference | Pinned vLLM and SGLang screened; vLLM Triton supports the exported FP32 scales on SM120. SGLang W8A8 and vLLM automatic CUTLASS fail on this architecture; Humming changes scale precision. Tuned stock batch/long-context matrix pending |
 | GPU correctness | Operator fixtures, solo/batched/cache/no-cache comparisons, checked builds, sanitizer coverage, long-context checks | Ragged/shuffled operator tests and 32K uniform reference pass. Batched and native-context model hashes match across cache/recompute/chunk paths in release and checked builds. Paged memcheck/racecheck and full batch CLI memcheck report zero errors |
-| Optimization | Profiles, retained/rejected experiments, paired measurements across all scenarios | Paged PV staging, small-batch projection dispatch, grouped attention and grouped heads retained with exact-output paired measurements. CUPTI identifies projections as the next bottleneck; further tuning and the full matrix remain pending |
+| Optimization | Profiles, retained/rejected experiments, paired measurements across all scenarios | Paged PV staging, small-batch dispatch, grouped attention, projection pipelines and staged grouped heads retained with exact-output paired measurements. Updated pipeline CUPTI traces, further tuning and the full matrix remain pending |
 | Final report and completion audit | Requirement-by-requirement evidence, complete comparison tables, remaining limitations | Pending |
 
 ## Initial findings
