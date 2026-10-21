@@ -146,3 +146,23 @@ crates/inferrous-qwen3/tools/stock_container.sh vllm python3 \
 ```
 
 Use a new output path for every run. Increasing context requires a matching workload, engine limit and memory budget; cold/warm prefix policy and verification overhead must be stated separately. Preserve failed engine logs and verify the expected number of JSONL records before accepting a result: a stock worker failure can terminate its parent without a useful process exit status. The current SGLang W8A8 kernel also rejects SM120. Humming runs but converts these FP32 per-channel weight scales to BF16; its effective precision is recorded separately. The [active round 7 record](optimization/round-7.md) distinguishes tested configurations, unsupported paths and the unfinished comparison matrix.
+
+For graph-only stock screening, add `--graphs-without-compile`. Its default capture sizes now cover powers of two through the configured sequence capacity, plus that capacity itself; it no longer silently captures only batch 1 for a batched run. `--graph-capture-sizes 1 2 4 8 16 32` makes the list explicit, while `--graph-size-one` retains the original solo experiment. Raw records include the chosen sizes and immutable container image identifier.
+
+The official vLLM image omits B12X. This optional stock variant installs exactly the `b12x==1.5.1` extra declared by vLLM 0.32.0, retaining the base image's other packages and unmodified engine code:
+
+```sh
+docker build --tag inferrous-vllm-b12x:0.32.0-1.5.1 \
+  - < crates/inferrous-qwen3/tools/stock-vllm-b12x.Dockerfile
+# Use stock_container.sh vllm-b12x for this image and --attention-backend B12X.
+```
+
+Use `tools/summarize_batch.py` for the new batch schemas:
+
+```sh
+python crates/inferrous-qwen3/tools/summarize_batch.py \
+  clean-work/batch-results.jsonl clean-work/stock-batch-results.jsonl \
+  --output clean-work/batch-summary.json
+```
+
+It excludes three warmups per workload per file and requires twenty measured samples per distinct executable/configuration/workload by default. Tuning pilots must explicitly lower `--min-samples` and label the smaller sample count. Complete request arrays, model roots, hardware, executable/image identities and settings separate series; reordered, missing or duplicate repetitions and incomplete outputs fail validation. The common host-call metrics are API latency and total output tokens divided by that latency, which also applies to ragged batches. Per-stream first-token/completion/post-first-output metrics retain the engine's native boundary: local generation-call timing, vLLM's native latency and monotonic timestamps, or recomputation-harness step completions. Do not treat those boundaries as interchangeable host-call measurements. Three additional host tests cover ragged completion accounting, timestamp domains and incomplete outputs. Percentile tails at these sample counts remain descriptive.

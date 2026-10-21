@@ -6,6 +6,7 @@ engine=${1:?Usage: stock_container.sh ENGINE COMMAND [ARGUMENTS...]}
 shift
 case "$engine" in
   vllm) image=vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34 ;;
+  vllm-b12x) image=$(docker image inspect --format '{{.Id}}' inferrous-vllm-b12x:0.32.0-1.5.1) ;;
   sglang) image=lmsysorg/sglang@sha256:e3a4f06001a29542fc4a8638536d9ffc5eb9c9942b08603c09b19a56eae4a1ae ;;
   *) echo "Unsupported stock image: $engine" >&2; exit 2 ;;
 esac
