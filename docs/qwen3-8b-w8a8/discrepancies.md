@@ -20,6 +20,8 @@ The queued fresh comparison runs the unchanged Torch reference first, then separ
 
 Optimization regression checks compare *all* vocabulary logit hashes and token IDs against the original cuda-oxide baseline, in addition to independent operator fixtures. They do not replace this separate, still-failing oracle gate.
 
+The comparator now requires the complete 51-tensor schema per generated step, exact declared shapes and file lengths, finite reference/candidate values, matching file inventories and a complete generation or valid early stop. The previous comparator could accept an empty or incomplete reference inventory. CPU replays of both historical 153-tensor comparisons produce byte-identical numerical reports and preserve their failures under the strengthened checks. The queued GPU jobs retain their pinned old comparator until completion; their saved traces must also pass the new completeness checks before being used as acceptance evidence. See [round 8](optimization/round-8.md#numerical-trace-completeness-validation) for the tests and replay identities.
+
 ## DISC-002: Fused floating-point operator boundaries
 
 Status: ACCEPTED as an explicit baseline convention; reviewed 2026-10-02. Affects comparisons against eager Hugging Face Qwen3, distinct from DISC-001.
