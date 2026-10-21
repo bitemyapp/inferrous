@@ -121,14 +121,19 @@ fn main() -> Result<()> {
         let load_seconds = start.elapsed().as_secs_f64();
         for (name, requests) in workloads {
             for run in 0..repeats {
+                let prefix_before = engine.prefix_cache_stats()?;
                 let start = Instant::now();
                 let batch = engine.generate(&model, &requests, cache_mode)?;
+                let generate_seconds = start.elapsed().as_secs_f64();
+                let prefix_after = engine.prefix_cache_stats()?;
                 println!(
                     "{}",
                     serde_json::json!({"backend":"inferrous-paged", "profile":PROFILE,
                     "model_root":model.root, "workload":name, "requests":requests, "run":run,
-                    "load_seconds":load_seconds, "generate_seconds":start.elapsed().as_secs_f64(),
+                    "load_seconds":load_seconds, "generate_seconds":generate_seconds,
                     "engine_config":engine.config(), "device_name":engine.device_name(),
+                    "prefix_cache_stats":{"before":prefix_before,"after":prefix_after},
+                    "cache_usage_after":engine.cache_usage(),
                     "cache_mode":cache_mode, "batch":batch})
                 );
             }

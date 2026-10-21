@@ -1,5 +1,6 @@
 """Keep stock timestamp domains and ragged/recomputed accounting explicit."""
 import importlib.util
+import copy
 from pathlib import Path
 import unittest
 
@@ -9,6 +10,18 @@ spec.loader.exec_module(summary)
 
 
 class SummaryTests(unittest.TestCase):
+    def local_record(self):
+        before = dict(lookups=10, hits=3, misses=7, matched_tokens=192, capacity_evictions=0,
+                      entry_limit_evictions=0, replacements=0, cleared_entries=0)
+        after = dict(before, lookups=12, hits=4, misses=8, matched_tokens=256,
+                     capacity_evictions=1, replacements=1)
+        return dict(backend="inferrous-paged", cache_mode="reuse", generate_seconds=4.0,
+                    engine_config=dict(prefix_cache_entries=32), requests=[dict(max_tokens=2)],
+                    batch=dict(reused_tokens=64, processed_tokens=2,
+                               generations=[dict(token_ids=[1, 2], request_seconds=4.0, step_seconds=[3.0, 1.0])]),
+                    prefix_cache_stats=dict(before=dict(counters=before, resident_entries=1, resident_tokens=64),
+                                            after=dict(counters=after, resident_entries=1, resident_tokens=64)))
+
     def record(self):
         return dict(cache_mode="reuse", request_seconds=4.0,
                     requests=[dict(max_tokens=4), dict(max_tokens=2)],
@@ -67,6 +80,41 @@ class SummaryTests(unittest.TestCase):
                       for slots, elapsed in [([0, 1], 0.5), ([0, 1], 1.5), ([0], 1.0), ([0], 3.5)]])
         # First/final timestamps look valid; the third submission moves backwards.
         with self.assertRaises(ValueError):
+            summary.measurements(record)
+
+    def test_local_prefix_deltas_are_separate_from_lifetime_totals(self):
+        values = summary.measurements(self.local_record())
+        self.assertEqual(values["prefix_lookups"], [2])
+        self.assertEqual(values["prefix_hits"], [1])
+        self.assertEqual(values["prefix_misses"], [1])
+        self.assertEqual(values["prefix_matched_tokens"], [64])
+        self.assertEqual(values["prefix_hit_fraction"], [0.5])
+        self.assertEqual(values["prefix_capacity_evictions"], [1])
+        self.assertEqual(values["prefix_resident_entries"], [1])
+
+    def test_absent_prefix_counters_are_unknown_and_no_lookups_have_no_hit_fraction(self):
+        record = self.local_record()
+        record["prefix_cache_stats"]["after"] = copy.deepcopy(record["prefix_cache_stats"]["before"])
+        values = summary.measurements(record)
+        self.assertEqual(values["prefix_hits"], [0])
+        self.assertEqual(values["prefix_hit_fraction"], [])
+        del record["prefix_cache_stats"]
+        self.assertEqual(summary.measurements(record)["prefix_hits"], [])
+        self.assertEqual(summary.measurements(self.record())["prefix_hits"], [])
+
+    def test_inconsistent_prefix_counters_and_disabled_policy_are_rejected(self):
+        for key, value in [("lookups", 11), ("matched_tokens", 192), ("replacements", -1), ("hits", True)]:
+            record = self.local_record()
+            record["prefix_cache_stats"]["after"]["counters"][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                summary.measurements(record)
+        record = self.local_record()
+        record["prefix_cache_stats"]["before"]["counters"]["cleared_entries"] = 1
+        with self.assertRaisesRegex(ValueError, "backwards"):
+            summary.measurements(record)
+        record = self.local_record()
+        record["engine_config"]["prefix_cache_entries"] = 0
+        with self.assertRaisesRegex(ValueError, "disabled policy"):
             summary.measurements(record)
 
     def test_stock_prefix_metrics_distinguish_hits_zero_and_unknown(self):

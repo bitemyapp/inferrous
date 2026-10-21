@@ -18,7 +18,7 @@ impl PageId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CacheUsage {
     pub total_pages: usize,
     pub used_pages: usize,

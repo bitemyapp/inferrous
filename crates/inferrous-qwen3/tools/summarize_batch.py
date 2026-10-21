@@ -70,6 +70,37 @@ def reused_tokens(record, local):
     return [sum(counts)] if counts and all(count is not None for count in counts) else []
 
 
+def prefix_metrics(record, local):
+    counters = ["lookups", "hits", "misses", "matched_tokens", "capacity_evictions",
+                "entry_limit_evictions", "replacements", "cleared_entries"]
+    values = {"prefix_" + name: [] for name in counters + ["resident_entries", "resident_tokens"]}
+    values["prefix_hit_fraction"] = []
+    if not local or "prefix_cache_stats" not in record:
+        return values
+    snapshots = record["prefix_cache_stats"]
+    for snapshot in [snapshots["before"], snapshots["after"]]:
+        counts = snapshot["counters"]
+        numbers = [counts[name] for name in counters] + [snapshot["resident_entries"], snapshot["resident_tokens"]]
+        if any(type(value) is not int or value < 0 for value in numbers):
+            raise ValueError("invalid prefix-cache counter")
+        if counts["lookups"] != counts["hits"] + counts["misses"]:
+            raise ValueError("prefix-cache lookup accounting mismatch")
+    delta = {name: snapshots["after"]["counters"][name] - snapshots["before"]["counters"][name]
+             for name in counters}
+    if any(value < 0 for value in delta.values()):
+        raise ValueError("prefix-cache counters move backwards")
+    if bool(delta["hits"]) != bool(delta["matched_tokens"]):
+        raise ValueError("prefix-cache matched-token accounting mismatch")
+    if delta["lookups"] and (record["cache_mode"] == "recompute" or record["engine_config"]["prefix_cache_entries"] == 0):
+        raise ValueError("prefix-cache lookups contradict disabled policy")
+    values.update({"prefix_" + name: [value] for name, value in delta.items()})
+    for name in ["resident_entries", "resident_tokens"]:
+        values["prefix_" + name] = [snapshots["after"][name]]
+    if delta["lookups"]:
+        values["prefix_hit_fraction"] = [delta["hits"] / delta["lookups"]]
+    return values
+
+
 def measurements(record):
     local = record.get("backend") == "inferrous-paged"
     requests = record["requests"]
@@ -126,6 +157,7 @@ def measurements(record):
                 native_per_stream_post_first_tokens_per_second=per_stream_decode,
                 reused_tokens=reused_tokens(record, local),
                 processed_tokens=[record["batch"]["processed_tokens"]] if local else [])
+    values.update(prefix_metrics(record, local))
     if any(not math.isfinite(value) or value < 0 for samples in values.values() for value in samples):
         raise ValueError("invalid timing or accounting value")
     return values

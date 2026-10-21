@@ -63,6 +63,27 @@ pub struct BatchGeneration {
     pub reused_tokens: usize,
 }
 
+/// Lifetime totals for automatic prefix-cache operations, including admission retries.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct PrefixCacheCounters {
+    pub lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub matched_tokens: u64,
+    pub capacity_evictions: u64,
+    pub entry_limit_evictions: u64,
+    pub replacements: u64,
+    pub cleared_entries: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PrefixCacheStats {
+    pub counters: PrefixCacheCounters,
+    pub resident_entries: usize,
+    /// Logical token references; overlapping prefixes can share physical pages.
+    pub resident_tokens: usize,
+}
+
 struct Prefix {
     tokens: Vec<u32>,
     cache: CacheLease,
@@ -138,6 +159,7 @@ struct Execution {
     decode: Option<Step>,
     prefill: Option<Step>,
     prefixes: VecDeque<Prefix>,
+    prefix_counters: PrefixCacheCounters,
     caches: Vec<Cache>,
     poisoned: bool,
 }
@@ -184,6 +206,7 @@ impl BatchEngine {
                 decode: None,
                 prefill: None,
                 prefixes: VecDeque::new(),
+                prefix_counters: PrefixCacheCounters::default(),
                 poisoned: false,
             }),
             pool,
@@ -203,12 +226,26 @@ impl BatchEngine {
     pub fn cache_usage(&self) -> CacheUsage {
         self.pool.usage()
     }
-    pub fn clear_prefixes(&self) -> Result<()> {
-        self.execution
+    /// Engine-wide snapshot. Callers with concurrent requests must not interpret
+    /// differences between snapshots as counters for one individual request.
+    pub fn prefix_cache_stats(&self) -> Result<PrefixCacheStats> {
+        let execution = self
+            .execution
             .lock()
-            .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?
-            .prefixes
-            .clear();
+            .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?;
+        Ok(PrefixCacheStats {
+            counters: execution.prefix_counters,
+            resident_entries: execution.prefixes.len(),
+            resident_tokens: execution.prefixes.iter().map(|p| p.tokens.len()).sum(),
+        })
+    }
+    pub fn clear_prefixes(&self) -> Result<()> {
+        let mut execution = self
+            .execution
+            .lock()
+            .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?;
+        execution.prefix_counters.cleared_entries += execution.prefixes.len() as u64;
+        execution.prefixes.clear();
         Ok(())
     }
 
@@ -250,6 +287,15 @@ impl BatchEngine {
         } else {
             self.pool.lease(0)?
         };
+        if reuse && self.config.prefix_cache_entries > 0 {
+            execution.prefix_counters.lookups += 1;
+            if best.is_some() {
+                execution.prefix_counters.hits += 1;
+                execution.prefix_counters.matched_tokens += cache.written_tokens() as u64;
+            } else {
+                execution.prefix_counters.misses += 1;
+            }
+        }
         Ok(Session {
             owner: self,
             cache,
@@ -270,6 +316,7 @@ impl BatchEngine {
                     if execution.prefixes.pop_front().is_none() {
                         return Err(error);
                     }
+                    execution.prefix_counters.capacity_evictions += 1;
                 }
             }
         }
@@ -295,6 +342,7 @@ impl BatchEngine {
             .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?;
         if let Some(index) = execution.prefixes.iter().position(|p| p.tokens == tokens) {
             execution.prefixes.remove(index);
+            execution.prefix_counters.replacements += 1;
         }
         execution.prefixes.push_back(Prefix {
             tokens,
@@ -302,6 +350,7 @@ impl BatchEngine {
         });
         while execution.prefixes.len() > self.config.prefix_cache_entries {
             execution.prefixes.pop_front();
+            execution.prefix_counters.entry_limit_evictions += 1;
         }
         Ok(())
     }
@@ -1132,6 +1181,12 @@ mod tests {
         for (actual, expected) in cold.generations.iter().zip(&expected) {
             same(actual, expected);
         }
+        let cold_stats = engine.prefix_cache_stats()?;
+        assert_eq!(cold_stats.counters.lookups, 5);
+        assert_eq!(cold_stats.counters.hits, 0);
+        assert_eq!(cold_stats.counters.misses, 5);
+        assert_eq!(cold_stats.resident_entries, 3);
+        assert_eq!(cold_stats.resident_tokens, 64 + 128 + 256);
         let warm = engine.generate(&model, &requests, CacheMode::Reuse)?;
         assert_eq!(warm.reused_tokens, 64 + 128 + 256);
         assert_eq!(
@@ -1141,12 +1196,22 @@ mod tests {
         for (actual, expected) in warm.generations.iter().zip(&expected) {
             same(actual, expected);
         }
+        let warm_stats = engine.prefix_cache_stats()?;
+        assert_eq!(warm_stats.counters.lookups, 10);
+        assert_eq!(warm_stats.counters.hits, 3);
+        assert_eq!(warm_stats.counters.misses, 7);
+        assert_eq!(warm_stats.counters.matched_tokens, 64 + 128 + 256);
+        assert_eq!(warm_stats.counters.replacements, 3);
         // Force the workspace budget to split these prefixes into smaller
         // chunks even though the configured token limit is much larger.
         engine.config.score_scratch_bytes = 4 << 20;
         engine.config.validate(model.max_context())?;
         let recomputed = engine.generate(&model, &requests, CacheMode::Recompute)?;
         assert_eq!(recomputed.reused_tokens, 0);
+        assert_eq!(
+            engine.prefix_cache_stats()?.counters.lookups,
+            warm_stats.counters.lookups
+        );
         assert_eq!(
             recomputed.processed_tokens,
             requests
@@ -1179,8 +1244,16 @@ mod tests {
         for i in [0, 2, 3, 4] {
             same(&stopped.generations[i], &expected[i]);
         }
+        let before_clear = engine.prefix_cache_stats()?;
         engine.clear_prefixes()?;
         assert_eq!(engine.cache_usage().used_pages, 0);
+        let after_clear = engine.prefix_cache_stats()?;
+        assert_eq!(after_clear.resident_entries, 0);
+        assert_eq!(after_clear.resident_tokens, 0);
+        assert_eq!(
+            after_clear.counters.cleared_entries - before_clear.counters.cleared_entries,
+            before_clear.resident_entries as u64
+        );
 
         // Continuing and forking share only initialized full pages. A partial
         // tail is rebuilt, and dropping either branch cannot invalidate the other.
@@ -1265,6 +1338,35 @@ mod tests {
         // A rejected admission must not poison the resident engine.
         let after = engine.generate(&model, &requests[..1], CacheMode::Reuse)?;
         same(&after.generations[0], &expected[0]);
+
+        // Distinguish LRU entry limits from physical-capacity pressure.
+        engine.config.prefix_cache_entries = 1;
+        let before_limit = engine.prefix_cache_stats()?;
+        let limited = engine.generate(&model, &requests[2..4], CacheMode::Reuse)?;
+        for (actual, expected) in limited.generations.iter().zip(&expected[2..4]) {
+            same(actual, expected);
+        }
+        let after_limit = engine.prefix_cache_stats()?;
+        assert_eq!(after_limit.resident_entries, 1);
+        assert_eq!(
+            after_limit.counters.entry_limit_evictions
+                - before_limit.counters.entry_limit_evictions,
+            1
+        );
+        let mut capacity_session = engine.session(&[42])?;
+        {
+            let mut execution = engine.execution.lock().unwrap();
+            let tokens = engine.cache_usage().total_pages * PAGE_TOKENS;
+            engine.reserve(&mut execution, &mut capacity_session, tokens)?;
+        }
+        let after_capacity = engine.prefix_cache_stats()?;
+        assert_eq!(after_capacity.resident_entries, 0);
+        assert_eq!(
+            after_capacity.counters.capacity_evictions - after_limit.counters.capacity_evictions,
+            1
+        );
+        drop(capacity_session);
+        assert_eq!(engine.cache_usage().used_pages, 0);
         Ok(())
     }
 }
