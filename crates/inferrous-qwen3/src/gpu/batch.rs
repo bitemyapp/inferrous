@@ -167,7 +167,7 @@ impl BatchEngine {
         let device_name = CudaContext::new(0)?.device_name()?;
         config.hardware.validate_device(&device_name)?;
         let pool = CachePool::with_byte_budget(PAGE_TOKENS, config.kv_cache_bytes)?;
-        let gpu = GpuModel::new(model)?;
+        let gpu = GpuModel::weights_only(model)?;
         let elements = pool.usage().total_pages * PAGE_TOKENS * 1024;
         let caches = (0..36)
             .map(|_| {
@@ -1113,9 +1113,12 @@ mod tests {
             .enumerate()
             .map(|(i, n)| request(n, i as u32, 4))
             .collect();
+        // The paged engine intentionally has no legacy execution allocation.
+        // Keep the independent contiguous-cache oracle in a separate model.
+        let oracle = GpuModel::new(&model)?;
         let expected = requests
             .iter()
-            .map(|r| engine.gpu.generate(&model, r, None))
+            .map(|r| oracle.generate(&model, r, None))
             .collect::<Result<Vec<_>>>()?;
         let cold = engine.generate(&model, &requests, CacheMode::Reuse)?;
         assert_eq!(cold.reused_tokens, 0);
@@ -1200,7 +1203,7 @@ mod tests {
         let branches = [&session, &fork]
             .into_iter()
             .map(|s| {
-                engine.gpu.generate(
+                oracle.generate(
                     &model,
                     &Request {
                         prompt_ids: s.tokens().to_vec(),
@@ -1219,7 +1222,7 @@ mod tests {
         }
         // Switching an already shared session to recompute must detach it first.
         let fork = sessions[0].fork()?;
-        let continuation = engine.gpu.generate(
+        let continuation = oracle.generate(
             &model,
             &Request {
                 prompt_ids: sessions[0].tokens().to_vec(),
@@ -1245,7 +1248,7 @@ mod tests {
         // Force capacity waves even though max_batch allows all eight requests.
         // Eight 512-token reservations need more than this 512 MiB pool.
         let waves = vec![request(512, 21, 2); 8];
-        let reference = engine.gpu.generate(&model, &waves[0], None)?;
+        let reference = oracle.generate(&model, &waves[0], None)?;
         let result = engine.generate(&model, &waves, CacheMode::Reuse)?;
         assert_eq!(result.generations.len(), waves.len());
         for actual in &result.generations {

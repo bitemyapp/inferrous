@@ -260,7 +260,7 @@ impl Execution {
 
 pub struct GpuModel {
     // Drop graphs before captured weights/module; Execution drops graphs before scratch.
-    execution: Mutex<Execution>,
+    execution: Mutex<Option<Execution>>,
     stream: Arc<CudaStream>,
     module: device::LoadedModule,
     pipeline: PipelineProjections,
@@ -294,6 +294,16 @@ fn rows(n: usize, threads: u32) -> LaunchConfig {
 }
 impl GpuModel {
     pub fn new(model: &Model) -> Result<Self> {
+        Self::with_legacy_execution(model, true)
+    }
+
+    // BatchEngine owns its paged execution state. Do not allocate a second,
+    // unused 4K cache or capture the legacy decoder's eight graphs for it.
+    fn weights_only(model: &Model) -> Result<Self> {
+        Self::with_legacy_execution(model, false)
+    }
+
+    fn with_legacy_execution(model: &Model, legacy: bool) -> Result<Self> {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.new_stream()?;
         let module = device::load(&ctx)?;
@@ -325,7 +335,11 @@ impl GpuModel {
             layers.push(Layer { gains, weights });
         }
         let mut gpu = Self {
-            execution: Mutex::new(Execution::new(&stream)?),
+            execution: Mutex::new(if legacy {
+                Some(Execution::new(&stream)?)
+            } else {
+                None
+            }),
             embedding: DeviceBuffer::from_host(&stream, &model.embedding)?,
             head: PackedHead::new(&stream, &model.head)?,
             final_gain: DeviceBuffer::from_host(&stream, &model.final_gain)?,
@@ -349,7 +363,7 @@ impl GpuModel {
                 }
             }
         }
-        {
+        if legacy {
             let mut execution = gpu
                 .execution
                 .lock()
@@ -360,7 +374,9 @@ impl GpuModel {
                 decode,
                 control,
                 ..
-            } = &mut *execution;
+            } = execution
+                .as_mut()
+                .expect("legacy execution allocated above");
             gpu.stream.synchronize()?;
             // Every decode kernel waits on its predecessor before touching data,
             // so graph edges may be programmatic. CLEAN_PDL=0 restores ordinary
@@ -968,6 +984,9 @@ impl GpuModel {
             .execution
             .lock()
             .map_err(|_| anyhow::anyhow!("execution mutex poisoned"))?;
+        let execution = execution
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("legacy generation requires legacy execution state"))?;
         // Also complete any previously failed eager request before reusing scratch.
         self.stream.synchronize()?;
         if execution
