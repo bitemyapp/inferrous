@@ -5,7 +5,7 @@
 - [Engine guide](qwen3-8b-w8a8/README.md): design, numerical contract, build, tests and reproduction.
 - [Paged sessions and batching](qwen3-8b-w8a8/sessions.md): configuration, CLI, ownership and validation status.
 - [Benchmarks](qwen3-8b-w8a8/benchmarks.md): workloads, timing boundaries and comparisons with stock engines.
-- [Kernel profiling](qwen3-8b-w8a8/profiling.md): opt-in CUPTI traces, complete-record validation and timing boundaries.
+- [Kernel profiling and racecheck coverage](qwen3-8b-w8a8/profiling.md): opt-in CUPTI traces, complete-record validation, timing boundaries and exhaustive partition coverage audits.
 - [Validation coverage](qwen3-8b-w8a8/coverage.md) and [known numerical discrepancies](qwen3-8b-w8a8/discrepancies.md).
 - [Safety contract](qwen3-8b-w8a8/safety.md): device indexing, launch, graph and lifetime arguments.
 - Optimization records: [round 1](qwen3-8b-w8a8/optimization/round-1.md), [round 2](qwen3-8b-w8a8/optimization/round-2.md), [round 3](qwen3-8b-w8a8/optimization/round-3.md), [round 4](qwen3-8b-w8a8/optimization/round-4.md), [round 5](qwen3-8b-w8a8/optimization/round-5.md), [round 6](qwen3-8b-w8a8/optimization/round-6.md), [round 7 (paused checkpoint)](qwen3-8b-w8a8/optimization/round-7.md).
