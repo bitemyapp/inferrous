@@ -823,7 +823,8 @@ impl BatchEngine {
                 {
                     match outputs {
                         0..=2 => 1,
-                        3..=4 | 9..=12 => 4,
+                        3..=4 => 4,
+                        _ if outputs % 16 == 0 || outputs % 16 >= 9 => 16,
                         _ => 8,
                     }
                 } else {
@@ -840,9 +841,19 @@ impl BatchEngine {
                         &gpu.head.exceptions,
                         &mut w.logits,
                     )?,
-                    8 => gpu.module.head_packed_eight(
+                    8 => gpu.module.head_packed_eight_staged(
                         &gpu.stream,
                         rows((outputs.div_ceil(8) * VOCAB).div_ceil(8), 256),
+                        &w.norm,
+                        &step.outputs,
+                        &gpu.head.words,
+                        &gpu.head.offsets,
+                        &gpu.head.exceptions,
+                        &mut w.logits,
+                    )?,
+                    16 => gpu.module.head_packed_sixteen_staged(
+                        &gpu.stream,
+                        rows((outputs.div_ceil(16) * VOCAB).div_ceil(8), 256),
                         &w.norm,
                         &step.outputs,
                         &gpu.head.words,

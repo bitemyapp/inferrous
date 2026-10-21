@@ -22,13 +22,41 @@ fn grouped_head_shapes() -> Result<()> {
         let selected = DeviceBuffer::from_host(&stream, &selected)?;
         let mut out = DeviceBuffer::<f32>::zeroed(&stream, nr * VOCAB)?;
         let mut expected = None;
-        for group_size in [1_usize, 4, 8] {
+        for (group_size, staged) in [
+            (1_usize, false),
+            (4, false),
+            (8, false),
+            (8, true),
+            (16, true),
+        ] {
             stream.synchronize()?;
             // SAFETY: selected rows are in bounds, every output has a distinct
             // warp owner, and graph/allocation lifetimes are nested and fenced.
             let graph = unsafe {
                 Graph::capture(&stream, false, || {
-                    if group_size == 8 {
+                    if group_size == 16 {
+                        module.head_packed_sixteen_staged(
+                            &stream,
+                            rows(nr.div_ceil(16) * VOCAB / 8, 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                        )?;
+                    } else if group_size == 8 && staged {
+                        module.head_packed_eight_staged(
+                            &stream,
+                            rows(nr.div_ceil(8) * VOCAB / 8, 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                        )?;
+                    } else if group_size == 8 {
                         module.head_packed_eight(
                             &stream,
                             rows((nr.div_ceil(8) * VOCAB).div_ceil(8), 256),
@@ -88,7 +116,7 @@ fn grouped_head_shapes() -> Result<()> {
             println!(
                 "HEAD {}",
                 serde_json::json!({"device":device_name, "model_root":model.root,
-                "rows":nr, "group_size":group_size, "milliseconds":times})
+                "rows":nr, "group_size":group_size, "staged":staged, "milliseconds":times})
             );
         }
     }
@@ -241,13 +269,16 @@ fn projection_shapes() -> Result<()> {
     let context = CudaContext::new(0)?;
     let stream = context.new_stream()?;
     let module = device::load(&context)?;
+    // SAFETY: this experiment uses the declared launch contract and retains all
+    // slice allocations until its stream has completed.
+    let pipeline_module = unsafe { crate::kernels::pipeline_device::load(&context)? };
     let start = context.new_event(Some(0))?;
     let end = context.new_event(Some(0))?;
     let device_name = context.device_name()?;
-    // Rotate through 512 MiB or more of distinct weight allocations, avoiding
+    // Rotate through 128 MiB or more of distinct weight allocations, avoiding
     // the unrealistically hot weights of a single-matrix timing loop.
     const COPIES: usize = 32;
-    for (n, k) in [(4096, 4096), (12288, 4096), (4096, 12288)] {
+    for (n, k) in [(1024, 4096), (4096, 4096), (12288, 4096), (4096, 12288)] {
         let values: Vec<_> = (0..n * k)
             .map(|i| {
                 (((i as u32).wrapping_mul(1664525).wrapping_add(1013904223) >> 16) % 255) as i16
@@ -290,8 +321,22 @@ fn projection_shapes() -> Result<()> {
                 )?;
             }
             let expected = out.to_host_vec(&stream)?;
-            for variant in ["dp4a", "splitk", "tiled", "large"] {
-                if (variant == "dp4a" && nr > 16) || (variant == "large" && nr < 16) {
+            let pipeline =
+                pipeline_module.prepare_linear_large_pipeline(cuda_core::LaunchConfig1D::new(
+                    (nr.div_ceil(64) * n.div_ceil(128)) as u32,
+                    256,
+                    50176,
+                ))?;
+            for variant in [
+                "dp4a",
+                "splitk",
+                "tiled",
+                "tiled-pipeline",
+                "narrow-pipeline",
+                "large",
+                "large-pipeline",
+            ] {
+                if (variant == "dp4a" && nr > 16) || (variant.starts_with("large") && nr < 16) {
                     continue;
                 }
                 stream.synchronize()?;
@@ -331,9 +376,39 @@ fn projection_shapes() -> Result<()> {
                                     k as u32,
                                     &mut out,
                                 )?,
+                                "tiled-pipeline" => module.linear_tiled_pipeline(
+                                    &stream,
+                                    rows(nr.div_ceil(32) * n.div_ceil(64), 256),
+                                    &q,
+                                    &scales,
+                                    weight,
+                                    &weight_scales,
+                                    k as u32,
+                                    &mut out,
+                                )?,
+                                "narrow-pipeline" => module.linear_narrow_pipeline(
+                                    &stream,
+                                    rows(nr.div_ceil(16) * n.div_ceil(32), 128),
+                                    &q,
+                                    &scales,
+                                    weight,
+                                    &weight_scales,
+                                    k as u32,
+                                    &mut out,
+                                )?,
                                 "large" => module.linear_large(
                                     &stream,
                                     rows(nr.div_ceil(64) * n.div_ceil(128), 256),
+                                    map.as_ref().expect("large map"),
+                                    &scales,
+                                    weight_map,
+                                    &weight_scales,
+                                    k as u32,
+                                    &mut out,
+                                )?,
+                                "large-pipeline" => pipeline_module.linear_large_pipeline(
+                                    &stream,
+                                    &pipeline,
                                     map.as_ref().expect("large map"),
                                     &scales,
                                     weight_map,

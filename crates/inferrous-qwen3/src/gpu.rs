@@ -4,7 +4,7 @@ mod batch;
 mod profile;
 use crate::{
     CONTEXT, HIDDEN, VOCAB,
-    kernels::device,
+    kernels::{device, pipeline_device},
     model::{Generation, Model, Request, sha},
 };
 use anyhow::Result;
@@ -44,6 +44,35 @@ fn grow(mut config: LaunchConfig, prefetch: bool) -> LaunchConfig {
 fn row_prefetch(prefetch: bool, bytes: u32) -> u32 {
     if prefetch { bytes } else { 0 }
 }
+// Prepare every admitted TMA grid outside graph capture. The kernel has one
+// block shape/resource contract; only its number of independent tiles varies.
+struct PipelineProjections {
+    module: pipeline_device::LoadedModule,
+    launches: BTreeMap<
+        usize,
+        cuda_core::PreparedLaunch<pipeline_device::__linear_large_pipeline_CudaKernel>,
+    >,
+}
+impl PipelineProjections {
+    fn new(context: &Arc<CudaContext>) -> Result<Self> {
+        // SAFETY: all uses go through the prepared 256-thread/50,176-byte
+        // contract. Validated model shapes and owned buffers supply the slices.
+        let module = unsafe { pipeline_device::load(context)? };
+        let mut launches = BTreeMap::new();
+        for row_tiles in 1..=16 {
+            for column_tiles in [8, 32, 96] {
+                let blocks = row_tiles * column_tiles;
+                if let std::collections::btree_map::Entry::Vacant(entry) = launches.entry(blocks) {
+                    entry.insert(module.prepare_linear_large_pipeline(
+                        cuda_core::LaunchConfig1D::new(blocks as u32, 256, 50176),
+                    )?);
+                }
+            }
+        }
+        Ok(Self { module, launches })
+    }
+}
+
 struct Matrix {
     w: DeviceBuffer<i8>,
     map: Option<DeviceBuffer<u64>>,
@@ -141,7 +170,7 @@ impl Workspace {
             logits: DeviceBuffer::zeroed(stream, output_rows * VOCAB)?,
             next: DeviceBuffer::zeroed(stream, output_rows)?,
         };
-        if rows >= 256 {
+        if rows >= 128 {
             workspace.map4 = Some(crate::tensor::map(
                 stream,
                 &workspace.quant4,
@@ -234,6 +263,7 @@ pub struct GpuModel {
     execution: Mutex<Execution>,
     stream: Arc<CudaStream>,
     module: device::LoadedModule,
+    pipeline: PipelineProjections,
     layers: Vec<Layer>,
     embedding: DeviceBuffer<u16>,
     head: PackedHead,
@@ -267,6 +297,7 @@ impl GpuModel {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.new_stream()?;
         let module = device::load(&ctx)?;
+        let pipeline = PipelineProjections::new(&ctx)?;
         let mut layers = Vec::new();
         for l in &model.layers {
             let gains = l
@@ -302,11 +333,12 @@ impl GpuModel {
             prefetch: std::env::var("CLEAN_PREFETCH").map_or(true, |v| v != "0"),
             stream,
             module,
+            pipeline,
             layers,
         };
         for layer in &mut gpu.layers {
             for weight in layer.weights.values_mut() {
-                if weight.n >= 4096 {
+                if weight.n >= 1024 {
                     weight.map = Some(crate::tensor::map(
                         &gpu.stream,
                         &weight.w,
@@ -482,17 +514,76 @@ impl GpuModel {
         // Keep the original PRO 6000/legacy dispatch independently selectable.
         let tuned_tiled = policy == ProjectionPolicy::Rtx5090
             && ((nr >= 4 && w.n == 12288) || (nr >= 5 && w.k == 12288));
-        let tuned_dp4a = policy == ProjectionPolicy::Rtx5090 && w.k == 12288 && nr <= 4;
+        let tuned = policy == ProjectionPolicy::Rtx5090;
+        let tuned_dp4a = tuned && ((w.k == 12288 && nr <= 4) || (w.n == 1024 && nr <= 4));
+        let pipelined_large = tuned
+            && ((w.n == 4096 && nr >= 256)
+                || (w.n == 12288 && (nr == 128 || nr == 1024))
+                || (w.n == 1024 && nr == 1024));
+        let tuned_splitk = tuned && w.n == 1024 && (5..=32).contains(&nr);
+        let narrow = tuned
+            && ((w.n == 1024 && (33..=128).contains(&nr))
+                || (w.n == 4096 && w.k == 4096 && (17..=32).contains(&nr))
+                || (w.n == 4096 && w.k == 12288 && (5..=32).contains(&nr))
+                || (w.n == 12288 && (4..=32).contains(&nr)));
         // SAFETY: fixed graph supplies exact dimensions and distinct buffers. Scratch
         // stays alive across all queued uses. Stream order protects quantizer reuse.
         unsafe {
-            if nr >= 256 && w.n >= 4096 {
+            if pipelined_large {
+                let blocks = nr.div_ceil(64) * w.n.div_ceil(128);
+                self.pipeline.module.linear_large_pipeline(
+                    &self.stream,
+                    self.pipeline
+                        .launches
+                        .get(&blocks)
+                        .expect("admitted projection grid"),
+                    map.expect("pipelined activation map"),
+                    scale,
+                    w.map.as_ref().expect("pipelined weight map"),
+                    &w.scale,
+                    w.k as u32,
+                    out,
+                )?;
+            } else if narrow {
+                self.module.linear_narrow_pipeline(
+                    &self.stream,
+                    rows(nr.div_ceil(16) * w.n.div_ceil(32), 128),
+                    q,
+                    scale,
+                    &w.w,
+                    &w.scale,
+                    w.k as u32,
+                    out,
+                )?;
+            } else if tuned_splitk {
+                self.module.linear_splitk(
+                    &self.stream,
+                    rows(nr.div_ceil(16) * w.n.div_ceil(8), 256),
+                    q,
+                    scale,
+                    &w.w,
+                    &w.scale,
+                    w.k as u32,
+                    out,
+                )?;
+            } else if nr >= 256 && w.n >= 4096 {
                 self.module.linear_large(
                     &self.stream,
                     rows(nr.div_ceil(64) * w.n.div_ceil(128), 256),
                     map.expect("large prefill activation map"),
                     scale,
                     w.map.as_ref().expect("large prefill weight map"),
+                    &w.scale,
+                    w.k as u32,
+                    out,
+                )?;
+            } else if tuned && (nr >= 32 || tuned_tiled) && !(w.n == 1024 && nr > 512) {
+                self.module.linear_tiled_pipeline(
+                    &self.stream,
+                    rows(nr.div_ceil(32) * w.n.div_ceil(64), 256),
+                    q,
+                    scale,
+                    &w.w,
                     &w.scale,
                     w.k as u32,
                     out,

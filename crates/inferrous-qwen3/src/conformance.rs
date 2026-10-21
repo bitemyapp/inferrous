@@ -36,6 +36,9 @@ fn independent_operators() -> anyhow::Result<()> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
     let module = device::load(&context)?;
+    // SAFETY: launches below use the declared resource contract and the same
+    // immutable fixture allocations validated for the original TMA kernel.
+    let pipeline = unsafe { crate::kernels::pipeline_device::load(&context)? };
     let hint = DeviceBuffer::<i8>::zeroed(&stream, HINT as usize)?;
     let hint_cache = DeviceBuffer::<u16>::zeroed(&stream, 4096 * 1024)?;
     for case in manifest["cases"].as_array().unwrap() {
@@ -345,11 +348,65 @@ fn independent_operators() -> anyhow::Result<()> {
                         "tiled MMA {}",
                         case["name"]
                     );
+                    module.linear_tiled_pipeline(
+                        &stream,
+                        rows(a.len().div_ceil(32) * s.len().div_ceil(64), 256),
+                        &q,
+                        &a,
+                        &w,
+                        &s,
+                        width as u32,
+                        &mut out,
+                    )?;
+                    assert_eq!(
+                        out.to_host_vec(&stream)?,
+                        expected,
+                        "pipelined tiled {}",
+                        case["name"]
+                    );
+                    module.linear_narrow_pipeline(
+                        &stream,
+                        rows(a.len().div_ceil(16) * s.len().div_ceil(32), 128),
+                        &q,
+                        &a,
+                        &w,
+                        &s,
+                        width as u32,
+                        &mut out,
+                    )?;
+                    assert_eq!(
+                        out.to_host_vec(&stream)?,
+                        expected,
+                        "pipelined narrow {}",
+                        case["name"]
+                    );
                     let amap = crate::tensor::map(&stream, &q, a.len(), width, 64)?;
                     let bmap = crate::tensor::map(&stream, &w, s.len(), width, 128)?;
                     module.linear_large(
                         &stream,
                         rows(a.len().div_ceil(64) * s.len().div_ceil(128), 256),
+                        &amap,
+                        &a,
+                        &bmap,
+                        &s,
+                        width as u32,
+                        &mut out,
+                    )?;
+                    assert_eq!(
+                        out.to_host_vec(&stream)?,
+                        expected,
+                        "original TMA {}",
+                        case["name"]
+                    );
+                    let launch =
+                        pipeline.prepare_linear_large_pipeline(cuda_core::LaunchConfig1D::new(
+                            (a.len().div_ceil(64) * s.len().div_ceil(128)) as u32,
+                            256,
+                            50176,
+                        ))?;
+                    pipeline.linear_large_pipeline(
+                        &stream,
+                        &launch,
                         &amap,
                         &a,
                         &bmap,
