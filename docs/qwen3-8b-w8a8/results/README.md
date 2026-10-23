@@ -14,3 +14,5 @@ Each optimization round's raw artifacts (measurement JSONL, logs, profiles, scri
 | [RTX PRO 6000 segmented attention](pro6000-segmented-attention.md) | [Round 8 record](../optimization/round-8.md), fixed-64/128/512-key operator validation and all 27 shape timings |
 | [RTX PRO 6000 128-row projections](pro6000-m128-projections.md) | [Round 8 record](../optimization/round-8.md), independent-reference/sanitizer validation and all 44 shape timings |
 | [RTX PRO 6000 asynchronous projections and 32-row head](pro6000-async-projections-head32.md) | [Round 8 record](../optimization/round-8.md), rejected projections and retained head with paired model, sanitizer and native-session evidence |
+| [RTX PRO 6000 certified head](pro6000-certified-head.md) | [Round 8 record](../optimization/round-8.md), retained exact head, paired model results, capacity/sanitizers and isolated shape/grouped-bound screens |
+| [Torch reference cache-mode sensitivity](pro6000-reference-cache-modes.md) | [Numerical discrepancy](../discrepancies.md), controlled cached/recomputed comparisons, fresh cached controls and the unchanged acceptance gate |
