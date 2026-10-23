@@ -1269,3 +1269,53 @@ Artifacts are `paired-pv-model-native-sanitizers-v1/`: native completion `9b50c5
 Integration copies the four qualified source files exactly from the isolated model worktree. Every other tracked crate/build-input file and the clean pinned cuda-rust revision also match; the same frozen qualified binaries are retained without a redundant rebuild. Remote formatting and diff checks pass. `paired-pv-retained-v1/summary.json` has SHA-256 `19474b2efe4006f2ee5d5698d77935a75b5f3d29aec5611c746c133b4394f534`. Its release CLI is `7307072880c59bf86bc9d62dadc863fe08f06fff0f7086705663b4725f4f2aa6`, checked CLI `cfc32d114c120722730c44e8aa31fea5c7fd4392fff9327483ff220bae3fba3a`, and release/checked test binaries `3df700fc4f40df14f565105a867b185dac3f8774238dfe943a6dac4ca94af8a7` / `1287cd5f883f5172f6e0029e738b1d9ece1f33b813365ccacb9a934d82ed91e7`. The preceding split-K CLI remains preserved as the paired control.
 
 The fresh v5 matrix plan pins the new retained binary and retention summary, preserving all ninety-nine scenarios, three cache modes, eight eligible stock configurations, fifty-four suites, 69,498 expected records and twenty measured samples per candidate/scenario. Plan SHA-256 is `387849b88c5732ad4a07acebedc05e781a95626b69d4fc45adc741c1fbf8c97c`; reporting-command SHA-256 is `251886740493d6aba3b6b835cb716e2a4b8de6809c4aa441727a765f37c8a54c`. Preflight passes without starting GPU measurements. The v4 plan is unchanged, and both plans have zero suite outputs. Original numerical acceptance, every-case fastest-stock wins and complete final reporting remain open; this retained optimization does not complete the requested work.
+
+## Retained paired-row PV sustained profiles
+
+Fresh profiles now measure retained CLI `7307072880c59bf86bc9d62dadc863fe08f06fff0f7086705663b4725f4f2aa6` at source `7c777a4db10935431ad2fbac6eb60185a7a5e4e3`. They reuse the unchanged validated CUDA 13.1 CUPTI collector and final cold configuration: 64 GiB KV, thirty-two request slots, chunk 512, 4 GiB score scratch, graphs and all retained tuning, with full-logit verification disabled. Each batch-32/prompt-129 and solo/prompt-8192 workload produces thirty-two outputs over three invocations, with a separate uninstrumented control.
+
+The batch and solo traces contain 88,824 and 78,405 records respectively, with complete zero-dropped/invalid footers. All 3,168 generated tokens match their uninstrumented controls and the earlier certified-head sequences; processed-token counts, zero prefix reuse, empty post-call page/reference state and telemetry extrema are independently audited. These checks establish profile integrity and regression consistency, not the original numerical gate or paired model performance.
+
+| Workload/launch phase | Kernel | Share of phase kernel time |
+|---|---|---:|
+| Batch 32, eager | `linear_large` | 38.36% |
+| Batch 32, eager | `linear_large_pipeline` | 31.46% |
+| Batch 32, graph | `linear_narrow_pipeline` | 23.27% |
+| Batch 32, graph | `linear_square_partials` | 20.84% |
+| Batch 32, graph | `head_certificate_fallback` | 18.84% |
+| Batch 32, graph | `head_integer_nine_products64` | 11.01% |
+| Solo 8K, eager | `attention_scores_tiled` | 32.30% |
+| Solo 8K, eager | `attention_values_tiled_pair` | 32.24% |
+| Solo 8K, eager | `attention_softmax_paged` | 11.80% |
+| Solo 8K, graph | `attention_values_paged` | 37.67% |
+| Solo 8K, graph | `linear_swiglu` | 22.12% |
+| Solo 8K, graph | `linear_residual` | 16.49% |
+
+QK, PV and softmax still account for 76.34% of solo eager kernel time. This supports investigating their data movement and launch organization while preserving exact arithmetic. Instrumented kernel durations are not benchmark latencies, and the phase split describes launch mechanism rather than a strict prefill/decode boundary.
+
+Artifacts are `paired-pv-retained-profiles-v1/`: identity `77d3de47f8e74930325a522c09de65989ed57173f586a614246eccd70df73d18`, completion `fc1f57be97dd356206037a12c6ec063b401792630be4f7c0d7a4dd48c1b6d8a2` and audit `55e1625ef145b95f3cbf28dbac6e4a99c3667d37e1e5739b27b94bd1ac0e5f17`. The runner is terminal. The v5 final matrix still has zero outputs; these profiles do not establish stock wins.
+
+## Single-QK fusion with retained score storage
+
+A new isolated experiment uses one 512-thread CTA per four-query group and KV head through QK, softmax and PV. Unlike the earlier rejected three-QK-pass fusion, it computes QK once and retains the global score buffer. Each score location has one CTA owner; CTA barriers publish scores before softmax and probabilities before PV. The kernel keeps ascending separate FP32 QK/PV products and additions, the original 128-lane softmax tree/exponential/division, each row's causal end and the final BF16 conversion. One shared 16 KiB allocation is reused for coordinate-major K and token-major V; the total reported shared allocation is 31,744 bytes. Release/checked use 62/68 registers, with zero stack or local bytes. This first version does not overlap successive V-page copies.
+
+The `inferrous-fused-score-buffer` worktree starts at `7c777a4`. Both release and checked builds pass twenty-four eager/graph cases over row counts 1–9/17/32/33, all partial group sizes 1–4, two sequence slots, shuffled pages, causal boundaries, NaN score tails and output guards. Every probability/output bit matches the existing three-stage pipeline. Independent host checks validate serial FP32 QK and PV plus explicit BF16 rounding; a separate f64-exponential softmax sanity check uses a stated tolerance and does not replace the exact GPU approximate-exponential comparison. Unfiltered focused memcheck and racecheck each pass all twenty-four cases with zero errors/hazards/warnings. This is operator coverage, not model sanitizer or original numerical acceptance.
+
+The whole-attention event screen compares the current QK/softmax/PV policy against fusion in A/B/B/A order, with three excluded warmups and seven measured samples per arm (fourteen per variant). A 256 MiB eviction lies outside event timing. Every arm checks all output and probability bits, including tails and guards. The larger shapes use the retained paired-row PV baseline; partial shapes use its existing four-row fallback.
+
+| Rows | Score stride | Existing pipeline median ms | Fused median ms | Existing/fused |
+|---:|---:|---:|---:|---:|
+| 1 | 64 | 0.014160 | 0.014336 | 0.988× |
+| 7 | 512 | 0.024576 | 0.065200 | 0.377× |
+| 128 | 512 | 0.071344 | 0.110592 | 0.645× |
+| 512 | 512 | 0.151568 | 0.196608 | 0.771× |
+| 128 | 4096 | 0.514080 | 0.800480 | 0.642× |
+| 512 | 4096 | 2.055056 | 2.361152 | 0.870× |
+| 128 | 32768 | 5.788160 | 6.736096 | 0.859× |
+| 512 | 32768 | 25.545088 | 23.189217 | 1.102× |
+
+Fusion is slower in seven of eight screened shapes. Only 512 rows at 32K stride improves, with baseline arm medians 25.518/25.572 ms and candidate medians 23.212/23.167 ms. This is a narrow operator result, not a broad improvement or a model gain. Native-stride event cases supply exact pipeline comparisons; the independent CPU and sanitizer cases use stride 512.
+
+Artifacts are `fused-score-buffer-v1/`: source identity `79c55085068972292bd3b5ae429f7aa168a5b7bba724706020da7d639cf7fd4d`, patch `9bb9b0637e39aec694678e47bd08268ce508c00a6631929eb856cd0cd53604c3`, build completion `12a777caaadc394fd1d2e43e428d2f8dd84318e030adccaa72d51eed4c82dce5`, validation identity `f89d57ce87ee14b337371dc4aa0c319bc28d5f355c39b89ebf93615083cb8cc4`, completion `766d7652cd09061ff673c183271dc8c9e8440d27c5f88a101782d8c287b710bf` and audit `ac68f01b270f569f99eb590743ce8b273ff1cbcbbe2440d3e9083164d9ac968d`. Frozen release/checked test executables are `158e8ee780c751dc71bf8518469e68ff50f8832960357cab0e0a4834b239462c` / `77b7d20c3409c8190f23a4450752ad5438dfe6d1ce6738fdc22cd77700ea7825`. All operator runners are terminal, and production dispatch is unchanged.
+
+A separate `inferrous-fused-score-model` worktree tests only the measured opportunity: tiled PRO prefill with exactly 512 rows and score stride 32,768. It reuses existing query metadata and score allocations. The `fused-score-model-v1/` build/ordinary-test queue is followed by six full-logit suites under `fused-score-model-qualification-v1/`: retained/release/checked binaries, chunks 512 and 256, cold reuse, one repetition of solo 16,897/24,576-token and paired 17,025-token prompts, two outputs per stream. A complete 24K dispatch trace must show all 576 expected fused launches. Only after this regression/dispatch audit passes may `fused-score-model-paired-v1/` run its three-warmup/seven-measured-per-arm 24K cold-reuse A/B/B/A pilot. These queued checks are not yet acceptance evidence. Recompute, model sanitizer, broader native qualification and retention remain separate; the original numerical gate and final stock matrix are unchanged.
