@@ -1,6 +1,6 @@
 # RTX PRO 6000 asynchronous projections and 32-row head
 
-All builds, checks and timings ran on `ssh wx-workstation`. These isolated kernels preserve integer projection arithmetic or the existing ordered FP32 head arithmetic. Production dispatch is unchanged. The measurements are unpaired operator screens with three warmups and seven measured CUDA events, not stock comparisons or model-level acceptance.
+All builds, checks and timings ran on `ssh wx-workstation`. These isolated kernels preserve integer projection arithmetic or the existing ordered FP32 head arithmetic. Production dispatch is unchanged. Operator screens use three warmups and seven measured CUDA events; the subsequent paired head model pilot uses twenty measured samples per binary/case. Neither is the final stock comparison matrix.
 
 ## Validation
 
@@ -43,9 +43,9 @@ Every new projection variant loses to the best existing kernel at every eligible
 | 1024 | 4096 | 12288 | `large` | 0.278583 | `large-async` | 0.316554 | 1.136 |
 | 1024 | 12288 | 4096 | `large` | 0.270325 | `large-async` | 0.291650 | 1.079 |
 
-## Head results: model trial pending
+## Head operator results
 
-The new head is 6.1–7.4% faster at the screened 17–32 and 64 row counts. It is slower for the smaller groups and for 33/48 rows. This compares two operators even where production would choose another head; it is not a claim that production slows down at those shapes. A batch-32 paired model trial is justified, with unchanged full-logit hashes required. No model gain, retention or stock win has been established.
+The new head is 6.1–7.4% faster at the screened 17–32 and 64 row counts. It is slower for the smaller groups and for 33/48 rows. This compares two operators even where production would choose another head; it is not a claim that production slows down at those shapes. The paired model trial below selects the new kernel only for exactly thirty-two outputs on the PRO profile. Other row counts retain their preceding dispatch.
 
 | Rows | Sixteen-row median, ms | Thirty-two-row median, ms | New / existing |
 |---:|---:|---:|---:|
@@ -60,6 +60,30 @@ The new head is 6.1–7.4% faster at the screened 17–32 and 64 row counts. It 
 | 33 | 6.676512 | 8.228896 | 1.233 |
 | 48 | 7.027744 | 8.473632 | 1.206 |
 | 64 | 9.098272 | 8.538912 | 0.939 |
+
+## Paired model trial: integrated validation pending
+
+The isolated model candidate passes release and checked full-logit comparisons across chunks 64/512, eager/graph execution, original/reversed request order, cold/warm prefixes and recomputation. Thirty-two requests shrink to sixteen active requests during generation. Each build checks twelve combinations and 960 complete output hashes against the unchanged head arithmetic. Separate CLI verification compares 1,592 hashes in each of two repetitions across nine workloads, both binaries, all three cache modes and a 64 GiB candidate KV configuration; every hash and token matches.
+
+The timing pilot uses the frozen production/candidate binaries in A/B/B/A order, three excluded warmups and ten measurements per resident suite, giving twenty measured samples per binary/case. It measures two batch-32 workloads and a batch-16 control in cold, prefix-cache-enabled and recompute modes. The five-token prompt cannot reuse a complete 64-token prefix page even when prefix caching is enabled. Builds finished before all timing runs. This is a focused model pilot, not the final stock comparison matrix.
+
+| Mode | Batch / prompt / outputs | Baseline median, ms | Candidate median, ms | Candidate / baseline |
+|---|---|---:|---:|---:|
+| Cold | 16 / 129 / 8 | 213.342 | 213.344 | 1.0000 |
+| Cold | 32 / 129 / 8 | 378.189 | 375.930 | 0.9940 |
+| Cold | 32 / 5 / 32 | 451.429 | 442.502 | 0.9802 |
+| Prefix | 16 / 129 / 8 | 82.564 | 82.569 | 1.0001 |
+| Prefix | 32 / 129 / 8 | 114.202 | 111.819 | 0.9791 |
+| Prefix | 32 / 5 / 32 | 451.093 | 441.894 | 0.9796 |
+| Recompute | 16 / 129 / 8 | 1,182.876 | 1,189.090 | 1.0053 |
+| Recompute | 32 / 129 / 8 | 2,342.612 | 2,346.636 | 1.0017 |
+| Recompute | 32 / 5 / 32 | 1,690.406 | 1,680.535 | 0.9942 |
+
+Both candidate arms improve batch-32 cold/prefix latency against both surrounding baseline arms. The batch-16 cold/prefix control is effectively unchanged. Recompute measurements have baseline drift: batch-32 prompt-129 baseline arm medians rise from 2,326.03 to 2,354.91 ms, while the unaffected batch-16 baseline rises from 1,171.26 to 1,192.40 ms. The pooled recompute numbers above do not establish a clear gain or explain that drift. Integrated racecheck and native-context validation remain required before retention, and the original numerical gate and stock-performance target remain open.
+
+The model source patch is `b43e46b5116c9641ce72b7406a85ac1d69e7ee4fb73a857480646e851f0f7dda`; frozen candidate SHA-256 is `d99fc2c187d5ccaff9b69f86b496398260ce6c7c2a26ebeb2257549992c28f42` against baseline `29d4ebb0e73a749748d91d68a9eef4871a0c8a8654c533a825e40c270a69e34d`. Artifacts are under `head32-model-v1/` and `head32-model-paired-v1/`. The release/checked model-check summary is `56c9a9da688c4683b166949d8f0a2a10c2608606e7e3cc1f38064e5889aebb43`, paired identity manifest `dcbb305b8b005d43a24d8c899824ff2c19831d55371e624223c00f7d259b46c0`, full-hash verification `5a28340914cd5356ebf73fa6d29b672697a6106d7c643fc1cdc1ec7536352f40`, paired summary `f55a2d20398456b49adff0b9197352fbc0e24f3d29709b8a4f34df3910d2fa79`, and telemetry `e758b5f4bd1ce44e782e7e62306089de2186c78d0b588677bae279592072e013`. All nineteen raw suite identities and successful command receipts were rechecked after completion.
+
+The same frozen candidate passes unfiltered full-model memcheck on thirty-two five-token prompts with two outputs each. All 64 tokens and full-logit hashes agree directly with the original untuned `864a88df` executable. The complete 1,304-launch inventory contains two new-head launches, one eager and one graph, each covering all 18,992 vocabulary CTAs at 256 threads. Its exhaustive new-head racecheck partition is running; other kernel families are filtered and this is not a new aggregate full-model racecheck pass. Memcheck validation SHA-256 is `46b920e3821eb22075c585cd332034501f376a72dd22a11c2a57dc7747ac7c87` under `head32-model-sanitizers-v1/`.
 
 ## Evidence
 

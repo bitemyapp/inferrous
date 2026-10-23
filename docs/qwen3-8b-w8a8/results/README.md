@@ -13,4 +13,4 @@ Each optimization round's raw artifacts (measurement JSONL, logs, profiles, scri
 | [RTX PRO 6000 cache-mode pilots](pro6000-cache-mode-pilots.md) | [Round 8 record](../optimization/round-8.md), completed prefix/recomputation stock screens and remaining gaps |
 | [RTX PRO 6000 segmented attention](pro6000-segmented-attention.md) | [Round 8 record](../optimization/round-8.md), fixed-64/128/512-key operator validation and all 27 shape timings |
 | [RTX PRO 6000 128-row projections](pro6000-m128-projections.md) | [Round 8 record](../optimization/round-8.md), independent-reference/sanitizer validation and all 44 shape timings |
-| [RTX PRO 6000 asynchronous projections and 32-row head](pro6000-async-projections-head32.md) | [Round 8 record](../optimization/round-8.md), complete operator checks, rejected projections and head model-trial candidate |
+| [RTX PRO 6000 asynchronous projections and 32-row head](pro6000-async-projections-head32.md) | [Round 8 record](../optimization/round-8.md), complete operator checks, rejected projections and paired head model pilot |
