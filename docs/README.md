@@ -11,7 +11,7 @@
 - Optimization records: [round 1](qwen3-8b-w8a8/optimization/round-1.md), [round 2](qwen3-8b-w8a8/optimization/round-2.md), [round 3](qwen3-8b-w8a8/optimization/round-3.md), [round 4](qwen3-8b-w8a8/optimization/round-4.md), [round 5](qwen3-8b-w8a8/optimization/round-5.md), [round 6](qwen3-8b-w8a8/optimization/round-6.md), [round 7 (paused checkpoint)](qwen3-8b-w8a8/optimization/round-7.md).
 - [Results summaries](qwen3-8b-w8a8/results/README.md) for every round.
 - [Round 8: RTX PRO 6000 batching](qwen3-8b-w8a8/optimization/round-8.md): remote-only builds/tests/benchmarks, complete aggregate sanitizer coverage, operator screens, explicit attention-reference investigation and full-matrix preparation.
-- [RTX PRO 6000 asynchronous projections and 32-row head](qwen3-8b-w8a8/results/pro6000-async-projections-head32.md): completed operator checks, rejected projections and paired head model gains with integrated validation pending.
+- [RTX PRO 6000 asynchronous projections and 32-row head](qwen3-8b-w8a8/results/pro6000-async-projections-head32.md): rejected projections and a retained head with paired model gains, sanitizer checks and native-session validation.
 - [RTX PRO 6000 cache-mode pilots](qwen3-8b-w8a8/results/pro6000-cache-mode-pilots.md): completed stock prefix/recomputation screens, matching local medians and pilot limitations.
 - [RTX PRO 6000 segmented-attention operators](qwen3-8b-w8a8/results/pro6000-segmented-attention.md): independent-reference and sanitizer checks, complete shape timings and the short-context gap.
 - [RTX PRO 6000 128-row projections](qwen3-8b-w8a8/results/pro6000-m128-projections.md): complete correctness/sanitizer checks and the rejected operator screen.

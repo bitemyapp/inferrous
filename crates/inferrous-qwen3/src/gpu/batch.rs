@@ -934,6 +934,11 @@ impl BatchEngine {
             unsafe {
                 let head_group = if self.config.tuned_head {
                     match outputs {
+                        32 if self.config.hardware
+                            == crate::config::HardwareProfile::RtxPro6000 =>
+                        {
+                            32
+                        }
                         0..=2 => 1,
                         3..=4 => 4,
                         _ if outputs % 16 == 0 || outputs % 16 >= 9 => 16,
@@ -943,6 +948,16 @@ impl BatchEngine {
                     1
                 };
                 match head_group {
+                    32 => gpu.module.head_packed_thirtytwo_staged(
+                        &gpu.stream,
+                        rows((outputs.div_ceil(32) * VOCAB).div_ceil(8), 256),
+                        &w.norm,
+                        &step.outputs,
+                        &gpu.head.words,
+                        &gpu.head.offsets,
+                        &gpu.head.exceptions,
+                        &mut w.logits,
+                    )?,
                     4 => gpu.module.head_packed_four(
                         &gpu.stream,
                         rows((outputs.div_ceil(4) * VOCAB).div_ceil(8), 256),
@@ -1108,6 +1123,181 @@ mod tests {
             "native context cold {:.3}s; warm {:.3}s; recompute {:.3}s",
             cold.elapsed_seconds, warm.elapsed_seconds, fresh.elapsed_seconds
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CLEAN_LONG_MODEL_BUNDLE and 64 GiB KV capacity"]
+    fn head32_native_session_continuation() -> Result<()> {
+        let bundle =
+            std::env::var_os("CLEAN_LONG_MODEL_BUNDLE").context("set CLEAN_LONG_MODEL_BUNDLE")?;
+        let model = Model::load(Path::new(&bundle))?;
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 32768);
+        config.max_batch = 32;
+        config.kv_cache_bytes = 64 << 30;
+        config.prefix_cache_entries = 0;
+        config.tuned_projections = true;
+        config.tuned_attention = true;
+        config.tiled_attention = true;
+        config.tuned_head = false;
+        config.verify_logits = true;
+        let requests: Vec<_> = (0..32)
+            .map(|i| {
+                request(
+                    match i {
+                        0 => 8192,
+                        1 => 16384,
+                        2 => 32764,
+                        _ => 5 + i,
+                    },
+                    i as u32,
+                    1,
+                )
+            })
+            .collect();
+        let warm_option = SessionOptions {
+            max_tokens: 1,
+            stop_ids: vec![],
+            cache: CacheMode::Reuse,
+        };
+        let options = vec![
+            SessionOptions {
+                max_tokens: 2,
+                ..warm_option.clone()
+            };
+            32
+        ];
+        let baseline = BatchEngine::new(&model, config.clone())?;
+        let mut sessions = requests
+            .iter()
+            .map(|r| baseline.session(&r.prompt_ids))
+            .collect::<Result<Vec<_>>>()?;
+        let mut expected_warm = Vec::new();
+        for session in &mut sessions {
+            let mut result = baseline.generate_sessions(
+                &model,
+                std::slice::from_mut(session),
+                std::slice::from_ref(&warm_option),
+            )?;
+            expected_warm.push(result.generations.remove(0));
+        }
+        // Every stream now has exactly one unprocessed token, so both continued
+        // steps compute exactly 32 heads, including native-context hidden rows.
+        assert!(
+            sessions
+                .iter()
+                .all(|s| s.cached_tokens() + 1 == s.tokens().len())
+        );
+        let expected = baseline.generate_sessions(&model, &mut sessions, &options)?;
+        assert_eq!(expected.processed_tokens, 64);
+        assert_eq!(
+            expected
+                .generations
+                .iter()
+                .map(|g| g.logit_sha256.len())
+                .sum::<usize>(),
+            64
+        );
+        drop(sessions);
+        assert_eq!(baseline.cache_usage().used_pages, 0);
+        drop(baseline);
+        config.tuned_head = true;
+        for (chunk, graphs, reverse) in [(512, true, false), (128, false, true)] {
+            config.prefill_chunk = chunk;
+            config.cuda_graphs = graphs;
+            let engine = BatchEngine::new(&model, config.clone())?;
+            let mut sessions = requests
+                .iter()
+                .map(|r| engine.session(&r.prompt_ids))
+                .collect::<Result<Vec<_>>>()?;
+            for (i, session) in sessions.iter_mut().enumerate() {
+                let actual = engine.generate_sessions(
+                    &model,
+                    std::slice::from_mut(session),
+                    std::slice::from_ref(&warm_option),
+                )?;
+                same(&actual.generations[0], &expected_warm[i]);
+            }
+            assert!(
+                sessions
+                    .iter()
+                    .all(|s| s.cached_tokens() + 1 == s.tokens().len())
+            );
+            if reverse {
+                sessions.reverse();
+            }
+            let actual = engine.generate_sessions(&model, &mut sessions, &options)?;
+            assert_eq!(actual.processed_tokens, 64);
+            assert_eq!(actual.reused_tokens, expected.reused_tokens);
+            for (i, generation) in actual.generations.iter().enumerate() {
+                same(
+                    generation,
+                    &expected.generations[if reverse { 31 - i } else { i }],
+                );
+            }
+            assert_eq!(sessions[if reverse { 29 } else { 2 }].tokens().len(), 32767);
+            drop(sessions);
+            assert_eq!(engine.cache_usage().used_pages, 0);
+            println!(
+                "HEAD32_NATIVE {}",
+                serde_json::json!({"chunk":chunk,"graphs":graphs,"reverse":reverse,"continuation_hashes":64,"warm_hashes":32,"kv_bytes":64_u64 << 30,"longest_final_tokens":32767})
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn head32_model_preserves_full_logits() -> Result<()> {
+        let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE").context("set CLEAN_MODEL_BUNDLE")?;
+        let model = Model::load(Path::new(&bundle))?;
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 4096);
+        config.max_batch = 32;
+        config.kv_cache_bytes = 512 << 20;
+        config.tuned_projections = true;
+        config.tuned_attention = true;
+        config.tiled_attention = true;
+        config.tuned_head = false;
+        let requests: Vec<_> = (0..32)
+            .map(|i| request([5, 65, 129][i % 3], i as u32, if i < 16 { 3 } else { 2 }))
+            .collect();
+        let baseline = BatchEngine::new(&model, config.clone())?;
+        let expected = baseline.generate(&model, &requests, CacheMode::Reuse)?;
+        assert!(
+            expected
+                .generations
+                .iter()
+                .all(|g| g.logit_sha256.len() >= 2)
+        );
+        drop(baseline);
+        config.tuned_head = true;
+        for (chunk, graphs) in [(64, false), (512, true)] {
+            config.prefill_chunk = chunk;
+            config.cuda_graphs = graphs;
+            let engine = BatchEngine::new(&model, config.clone())?;
+            for reverse in [false, true] {
+                let batch: Vec<_> = if reverse {
+                    requests.iter().rev().cloned().collect()
+                } else {
+                    requests.clone()
+                };
+                for (run, mode) in [CacheMode::Reuse, CacheMode::Reuse, CacheMode::Recompute]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let actual = engine.generate(&model, &batch, mode)?;
+                    for (index, actual) in actual.generations.iter().enumerate() {
+                        same(
+                            actual,
+                            &expected.generations[if reverse { 31 - index } else { index }],
+                        );
+                    }
+                    println!(
+                        "HEAD32_MODEL {}",
+                        serde_json::json!({"chunk":chunk,"graphs":graphs,"reverse":reverse,"run":run,"hashes":actual.generations.iter().map(|g| g.logit_sha256.len()).sum::<usize>()})
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

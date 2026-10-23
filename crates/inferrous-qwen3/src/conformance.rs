@@ -1245,3 +1245,99 @@ fn paged_attention_reaches_native_context() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn head32_independent_reference() -> anyhow::Result<()> {
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    // Sixteen vocabulary columns exercise two CTAs per output group, while
+    // the real vocabulary stride and all untouched columns remain guarded.
+    let weights: Vec<u16> = (0..16 * 4096)
+        .map(|i| {
+            (((i * 17 % 2) << 15) | (((i * 37 % 23) + 105) << 7) | ((i * 61 + 7) % 128)) as u16
+        })
+        .collect();
+    let packed = crate::packing::PackedBf16::new(&weights);
+    assert!(packed.exceptions.len() > 1);
+    let words = DeviceBuffer::from_host(&stream, &packed.words)?;
+    let offsets = DeviceBuffer::from_host(&stream, &packed.offsets)?;
+    let exceptions = DeviceBuffer::from_host(&stream, &packed.exceptions)?;
+    for nr in [1_usize, 3, 8, 16, 17, 31, 32, 33, 63, 64, 65] {
+        let values: Vec<f32> = (0..(nr + 3) * 4096)
+            .map(|i| {
+                let x = ((i * 37 + i / 4096 * 19 + 11) % 511) as f32 / 128.0 - 2.0;
+                let bits = x.to_bits();
+                f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
+            })
+            .collect();
+        let selected: Vec<u32> = (0..nr).map(|i| ((nr + 2 - i) % (nr + 3)) as u32).collect();
+        let sentinel = -12345.25_f32;
+        let mut expected = vec![sentinel.to_bits(); nr * 151936 + 64];
+        for (r, &selected_row) in selected.iter().enumerate() {
+            for column in 0..16 {
+                let mut lanes = [0.0_f32; 32];
+                for lane in 0..32 {
+                    for k in (lane..4096).step_by(32) {
+                        let weight = f32::from_bits(u32::from(weights[column * 4096 + k]) << 16);
+                        let product = values[selected_row as usize * 4096 + k] * weight;
+                        lanes[lane] += product;
+                    }
+                }
+                for distance in [16, 8, 4, 2, 1] {
+                    let prior = lanes;
+                    for lane in 0..32 - distance {
+                        lanes[lane] = prior[lane] + prior[lane + distance];
+                    }
+                }
+                assert!(lanes[0].is_finite());
+                let bits = lanes[0].to_bits();
+                expected[r * 151936 + column] =
+                    bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000;
+            }
+        }
+        let x = DeviceBuffer::from_host(&stream, &values)?;
+        let selected = DeviceBuffer::from_host(&stream, &selected)?;
+        let mut output = DeviceBuffer::from_host(&stream, &vec![sentinel; expected.len()])?;
+        for graph in [false, true] {
+            output.copy_from_host(&stream, &vec![sentinel; expected.len()])?;
+            // SAFETY: two vocabulary CTAs, positive output count, complete 4096-wide
+            // inputs and losslessly packed weights. Padded selected rows never publish.
+            let mut launch = || -> anyhow::Result<()> {
+                unsafe {
+                    module.head_packed_thirtytwo_staged(
+                        &stream,
+                        rows(2 * nr.div_ceil(32), 256),
+                        &x,
+                        &selected,
+                        &words,
+                        &offsets,
+                        &exceptions,
+                        &mut output,
+                    )?;
+                }
+                Ok(())
+            };
+            if graph {
+                let capture = unsafe { crate::graph::Graph::capture(&stream, false, launch)? };
+                unsafe {
+                    capture.launch()?;
+                }
+                stream.synchronize()?;
+            } else {
+                launch()?;
+            }
+            let actual: Vec<u32> = output
+                .to_host_vec(&stream)?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            assert_eq!(actual, expected, "head32 rows={nr}, graph={graph}");
+            println!(
+                "HEAD32_REFERENCE {}",
+                serde_json::json!({"rows":nr,"graph":graph,"vocabulary_columns":16})
+            );
+        }
+    }
+    Ok(())
+}

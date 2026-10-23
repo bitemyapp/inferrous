@@ -472,6 +472,182 @@ fn head_packed_staged<const SIXTEEN: bool>(
     }
 }
 
+/// Operator-only 32-output head with one staging slot. Each CTA owns eight
+/// vocabulary columns. Ascending terms and descending warp reduction are unchanged.
+#[inline(always)]
+fn head_packed32_single(
+    staged: *mut u32,
+    x: &[f32],
+    output_rows: &[u32],
+    words: &[u32],
+    offsets: &[u32],
+    exceptions: &[u16],
+    mut out: DisjointSlice<f32>,
+) {
+    dependency_wait();
+    let t = thread::threadIdx_x() as usize;
+    let lane = t % 32;
+    let groups = output_rows.len().div_ceil(32);
+    let block = thread::blockIdx_x() as usize;
+    let batch = block % groups * 32;
+    let row = block / groups * 8 + t / 32;
+    let mut sums0 = [0.0; 4];
+    let mut sums1 = [0.0; 4];
+    let mut sums2 = [0.0; 4];
+    let mut sums3 = [0.0; 4];
+    let mut sums4 = [0.0; 4];
+    let mut sums5 = [0.0; 4];
+    let mut sums6 = [0.0; 4];
+    let mut sums7 = [0.0; 4];
+    let mut group = 0;
+    while group < 16 {
+        // One complete 32x256 stripe, with eight disjoint aligned copies per thread.
+        // Padded rows read a valid selected row and never publish an output.
+        unsafe {
+            let mut piece = 0;
+            while piece < 8 {
+                let i = t * 4 + piece * 1024;
+                let selected = (batch + i / 256).min(output_rows.len() - 1);
+                let from = output_rows[selected] as usize * 4096 + group * 256 + i % 256;
+                cuda_device::async_copy::cp_async_ca_16(
+                    staged.add(i),
+                    x.as_ptr().add(from).cast::<u32>(),
+                );
+                piece += 1;
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+            cuda_device::async_copy::cp_async_wait_all();
+        }
+        thread::sync_threads();
+        let input = unsafe { core::slice::from_raw_parts(staged.cast::<f32>(), 8192) };
+        let chunk = row * 16 + group;
+        let word = chunk * 96 + lane;
+        let w0 = words[word];
+        let w1 = words[word + 32];
+        let w2 = words[word + 64];
+        macro_rules! term32 {
+            ($code:expr, $offset:expr) => {{
+                let weight = widen(unpack_code($code, offsets, exceptions, chunk));
+                sums0 = head_add_four(input, [0, 256, 512, 768], sums0, lane + $offset, weight);
+                sums1 = head_add_four(
+                    input,
+                    [1024, 1280, 1536, 1792],
+                    sums1,
+                    lane + $offset,
+                    weight,
+                );
+                sums2 = head_add_four(
+                    input,
+                    [2048, 2304, 2560, 2816],
+                    sums2,
+                    lane + $offset,
+                    weight,
+                );
+                sums3 = head_add_four(
+                    input,
+                    [3072, 3328, 3584, 3840],
+                    sums3,
+                    lane + $offset,
+                    weight,
+                );
+                sums4 = head_add_four(
+                    input,
+                    [4096, 4352, 4608, 4864],
+                    sums4,
+                    lane + $offset,
+                    weight,
+                );
+                sums5 = head_add_four(
+                    input,
+                    [5120, 5376, 5632, 5888],
+                    sums5,
+                    lane + $offset,
+                    weight,
+                );
+                sums6 = head_add_four(
+                    input,
+                    [6144, 6400, 6656, 6912],
+                    sums6,
+                    lane + $offset,
+                    weight,
+                );
+                sums7 = head_add_four(
+                    input,
+                    [7168, 7424, 7680, 7936],
+                    sums7,
+                    lane + $offset,
+                    weight,
+                );
+            }};
+        }
+        term32!(w0, 0);
+        term32!(w0 >> 12, 32);
+        term32!((w0 >> 24) | (w1 << 8), 64);
+        term32!(w1 >> 4, 96);
+        term32!(w1 >> 16, 128);
+        term32!((w1 >> 28) | (w2 << 4), 160);
+        term32!(w2 >> 8, 192);
+        term32!(w2 >> 20, 224);
+        // Every warp finishes consuming the sole slot before any thread overwrites it.
+        thread::sync_threads();
+        group += 1;
+    }
+    sums0 = head_reduce_four(sums0);
+    sums1 = head_reduce_four(sums1);
+    sums2 = head_reduce_four(sums2);
+    sums3 = head_reduce_four(sums3);
+    sums4 = head_reduce_four(sums4);
+    sums5 = head_reduce_four(sums5);
+    sums6 = head_reduce_four(sums6);
+    sums7 = head_reduce_four(sums7);
+    if lane == 0 {
+        let mut b = 0;
+        while b < 4 {
+            if batch + b + 0 < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b + 0) * 151936 + row) = bf(sums0[b]);
+                }
+            }
+            if batch + b + 4 < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b + 4) * 151936 + row) = bf(sums1[b]);
+                }
+            }
+            if batch + b + 8 < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b + 8) * 151936 + row) = bf(sums2[b]);
+                }
+            }
+            if batch + b + 12 < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b + 12) * 151936 + row) = bf(sums3[b]);
+                }
+            }
+            if batch + b + 16 < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b + 16) * 151936 + row) = bf(sums4[b]);
+                }
+            }
+            if batch + b + 20 < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b + 20) * 151936 + row) = bf(sums5[b]);
+                }
+            }
+            if batch + b + 24 < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b + 24) * 151936 + row) = bf(sums6[b]);
+                }
+            }
+            if batch + b + 28 < output_rows.len() {
+                unsafe {
+                    *out.get_unchecked_mut((batch + b + 28) * 151936 + row) = bf(sums7[b]);
+                }
+            }
+            b += 1;
+        }
+    }
+}
+
 #[inline(always)]
 fn best_warp(mut value: f32, mut index: u32, mut bad: u32) -> (f32, u32, u32) {
     let mut d = 16;
@@ -3895,6 +4071,20 @@ pub mod device {
         static mut INPUT: SharedArray<u32, 8192, 16> = SharedArray::UNINIT;
         let staged = unsafe { SharedArray::as_raw_mut_ptr(&raw mut INPUT) };
         head_packed_staged::<true>(staged, x, output_rows, words, offsets, exceptions, out);
+    }
+
+    #[kernel]
+    pub fn head_packed_thirtytwo_staged(
+        x: &[f32],
+        output_rows: &[u32],
+        words: &[u32],
+        offsets: &[u32],
+        exceptions: &[u16],
+        out: DisjointSlice<f32>,
+    ) {
+        static mut INPUT: SharedArray<u32, 8192, 16> = SharedArray::UNINIT;
+        let staged = unsafe { SharedArray::as_raw_mut_ptr(&raw mut INPUT) };
+        head_packed32_single(staged, x, output_rows, words, offsets, exceptions, out);
     }
 
     #[kernel]

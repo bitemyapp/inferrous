@@ -487,3 +487,130 @@ fn projection_shapes() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "GPU head timing experiment; run alone with --nocapture and a model bundle"]
+fn head32_shapes() -> Result<()> {
+    let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE").expect("CLEAN_MODEL_BUNDLE");
+    let model = Model::load(Path::new(&bundle))?;
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    let head = PackedHead::new(&stream, &model.head)?;
+    let start = context.new_event(Some(0))?;
+    let end = context.new_event(Some(0))?;
+    let device_name = context.device_name()?;
+    for nr in [1_usize, 2, 8, 16, 17, 24, 31, 32, 33, 48, 64] {
+        let input: Vec<f32> = (0..(nr + 2) * HIDDEN)
+            .map(|i| ((i * 37 + 11) % 255) as f32 / 128.0 - 1.0)
+            .collect();
+        let input = DeviceBuffer::from_host(&stream, &input)?;
+        let selected: Vec<u32> = (0..nr).map(|i| (nr - i) as u32).collect();
+        let selected = DeviceBuffer::from_host(&stream, &selected)?;
+        let mut out = DeviceBuffer::<f32>::zeroed(&stream, nr * VOCAB)?;
+        let mut expected = None;
+        for (group_size, staged) in [(16_usize, true), (32, true)] {
+            stream.synchronize()?;
+            // SAFETY: selected rows are in bounds, every output has a distinct
+            // warp owner, and graph/allocation lifetimes are nested and fenced.
+            let graph = unsafe {
+                Graph::capture(&stream, false, || {
+                    if group_size == 32 {
+                        module.head_packed_thirtytwo_staged(
+                            &stream,
+                            rows(nr.div_ceil(32) * VOCAB / 8, 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                        )?;
+                    } else if group_size == 16 {
+                        module.head_packed_sixteen_staged(
+                            &stream,
+                            rows(nr.div_ceil(16) * VOCAB / 8, 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                        )?;
+                    } else if group_size == 8 && staged {
+                        module.head_packed_eight_staged(
+                            &stream,
+                            rows(nr.div_ceil(8) * VOCAB / 8, 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                        )?;
+                    } else if group_size == 8 {
+                        module.head_packed_eight(
+                            &stream,
+                            rows((nr.div_ceil(8) * VOCAB).div_ceil(8), 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                        )?;
+                    } else if group_size == 4 {
+                        module.head_packed_four(
+                            &stream,
+                            rows((nr.div_ceil(4) * VOCAB).div_ceil(8), 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                        )?;
+                    } else {
+                        module.head_packed_rows(
+                            &stream,
+                            rows((nr * VOCAB).div_ceil(8), 256),
+                            &input,
+                            &selected,
+                            &head.words,
+                            &head.offsets,
+                            &head.exceptions,
+                            &mut out,
+                            0,
+                        )?;
+                    }
+                    Ok(())
+                })?
+            };
+            let mut times = Vec::new();
+            for repetition in 0..10 {
+                let _eviction = DeviceBuffer::<u8>::zeroed(&stream, 256 << 20)?;
+                start.record(&stream)?;
+                unsafe {
+                    graph.launch()?;
+                }
+                end.record(&stream)?;
+                let milliseconds = start.elapsed_ms(&end)?;
+                if repetition >= 3 {
+                    times.push(milliseconds);
+                }
+            }
+            let actual = out.to_host_vec(&stream)?;
+            if let Some(expected) = &expected {
+                assert_eq!(&actual, expected, "head {nr} rows");
+            } else {
+                expected = Some(actual);
+            }
+            println!(
+                "HEAD32_PROFILE {}",
+                serde_json::json!({"device":device_name, "model_root":model.root,
+                "rows":nr, "group_size":group_size, "staged":staged, "milliseconds":times})
+            );
+        }
+    }
+    Ok(())
+}
