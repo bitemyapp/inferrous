@@ -18,6 +18,7 @@
 - [RTX PRO 6000 cache-mode pilots](qwen3-8b-w8a8/results/pro6000-cache-mode-pilots.md): completed stock prefix/recomputation screens, matching local medians and pilot limitations.
 - [RTX PRO 6000 stock native-capacity checks](qwen3-8b-w8a8/results/pro6000-stock-native-capacity.md): all eight planned stock configurations complete the 64 GiB KV/native-context probes; separate from final timing and numerical acceptance.
 - [Fixed paged policy qualification](qwen3-8b-w8a8/results/pro6000-fixed-policy-qualification.md): isolated current-head candidate passes release/checked native tests, full-model memcheck and exhaustive changed-family racecheck partitions; production and the original numerical gate remain unchanged.
+- [Exact ordered PV experiment](qwen3-8b-w8a8/results/pro6000-exact-pv.md): exact CPU/CUDA comparisons and scoped sanitizers pass, but the guarded integer-grid prototype loses every production-kernel timing case and is rejected.
 - [RTX PRO 6000 segmented-attention operators](qwen3-8b-w8a8/results/pro6000-segmented-attention.md): independent-reference and sanitizer checks, complete shape timings and the short-context gap.
 - [RTX PRO 6000 128-row projections](qwen3-8b-w8a8/results/pro6000-m128-projections.md): complete correctness/sanitizer checks and the rejected operator screen.
 - [RTX 5090 Nix validation](qwen3-8b-w8a8/results/rtx5090-nix.md): local release/checked test results, benchmark timings and exact-output comparisons.
@@ -36,5 +37,6 @@
 
 ## Research
 
+- [Exact ordered attention-value sums](research/exact-ordered-pv.md): constant-spacing integer blocks, exact tie handling, fallback and the rejected GPU implementation's validation boundary.
 - [Modern open models for one RTX PRO 6000](research/single-gpu-model-candidates.md): candidates ranked by decode speed and coding quality.
 - [DeepSeek-V4.1-Flash on one RTX PRO 6000](research/deepseek-v4.1-flash-rtx-pro-6000.md): quantizations, engine support and feasibility.
