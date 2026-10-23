@@ -237,6 +237,56 @@ fn head_reduce_four(mut sums: [f32; 4]) -> [f32; 4] {
     sums
 }
 
+/// Packed per-byte addition modulo 256 without carries between byte lanes.
+/// Inputs are signed seven-bit digits; each sum fits signed INT8 exactly.
+#[inline(always)]
+fn packed_digit_sum(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    let mut result = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        result[i] = ((a[i] & 0x7f7f7f7f) + (b[i] & 0x7f7f7f7f)) ^ ((a[i] ^ b[i]) & 0x80808080);
+        i += 1;
+    }
+    result
+}
+
+/// Six exact INT8 dots reconstruct the original base-128 three-digit dot.
+/// K <= 4096 and digits in -64..=63 bound every MMA sum below 2^27 and
+/// every reconstructed absolute partial sum below 2^53 (well inside i64).
+#[inline(always)]
+fn combine_head_digits(d0: i32, d1: i32, d2: i32, s01: i32, s02: i32, s12: i32) -> i64 {
+    let (a, b, c) = (d0 as i64, d1 as i64, d2 as i64);
+    a + ((s01 as i64 - a - b) << 7)
+        + ((s02 as i64 - a - c + b) << 14)
+        + ((s12 as i64 - b - c) << 21)
+        + (c << 28)
+}
+
+#[inline(always)]
+fn next_up_f32(x: f32) -> f32 {
+    let bits = x.to_bits();
+    if bits & 0x7fffffff == 0 {
+        f32::from_bits(1)
+    } else if bits == 0x7f800000 {
+        x
+    } else {
+        f32::from_bits(if bits >> 31 == 0 { bits + 1 } else { bits - 1 })
+    }
+}
+#[inline(always)]
+fn next_down_f32(x: f32) -> f32 {
+    -next_up_f32(-x)
+}
+
+#[inline(always)]
+fn combine_head_bytes(p: [i32; 9]) -> i64 {
+    p[0] as i64
+        + (((p[1] as i64) + (p[3] as i64)) << 8)
+        + (((p[2] as i64) + (p[4] as i64) + (p[6] as i64)) << 16)
+        + (((p[5] as i64) + (p[7] as i64)) << 24)
+        + ((p[8] as i64) << 32)
+}
+
 /// Const specialization keeps the hot accumulators in registers for both widths.
 #[inline(always)]
 fn head_packed_group<const EIGHT: bool>(
@@ -1609,6 +1659,587 @@ pub mod device {
     }
     /// A 32x64 output tile cooperatively stages 128 K elements at a time.
     /// Eight warps each own a 16x16 tile (two adjacent m16n8k32 MMAs).
+    /// Three signed-eight-bit input planes and upward-rounded norm metadata.
+    /// Metadata per row: scale, original norm, approximation norm, error norm,
+    /// and position-weighted original norm. Infinity disables certification.
+    #[kernel]
+    pub fn head_certificate_inputs(
+        x: &[f32],
+        selected: &[u32],
+        mut q: DisjointSlice<i8>,
+        mut stats: DisjointSlice<f64>,
+    ) {
+        dependency_wait();
+        use cuda_device::float::{add_rp_f64 as au, mul_rp_f64 as mu, sqrt_rp_f64 as su};
+        static mut META: SharedArray<u32, 512> = SharedArray::UNINIT;
+        static mut NORMS: SharedArray<f64, 1024> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let row = thread::blockIdx_x() as usize;
+        let nr = selected.len();
+        let start = selected[row] as usize * 4096;
+        let meta = unsafe { SharedArray::as_raw_mut_ptr(&raw mut META) };
+        let norms = unsafe { SharedArray::as_raw_mut_ptr(&raw mut NORMS) };
+        let mut maximum = 0_u32;
+        let mut invalid = 0_u32;
+        let mut j = t;
+        while j < 4096 {
+            let bits = x[start + j].to_bits();
+            let abs = bits & 0x7fffffff;
+            maximum = maximum.max(abs);
+            if bits & 65535 != 0 || (abs != 0 && (abs < (77_u32 << 23) || abs > (157_u32 << 23))) {
+                invalid = 1;
+            }
+            j += 256;
+        }
+        unsafe {
+            *meta.add(t) = maximum;
+            *meta.add(256 + t) = invalid;
+        }
+        thread::sync_threads();
+        let mut distance = 128;
+        while distance > 0 {
+            if t < distance {
+                unsafe {
+                    *meta.add(t) = (*meta.add(t)).max(*meta.add(t + distance));
+                    *meta.add(256 + t) |= *meta.add(256 + t + distance);
+                }
+            }
+            thread::sync_threads();
+            distance /= 2;
+        }
+        let valid = unsafe { *meta.add(256) == 0 };
+        maximum = unsafe { *meta };
+        let mut scale = 1.0_f32;
+        if valid && maximum != 0 {
+            scale = f32::from_bits(((maximum >> 23) - 22) << 23);
+            if f32::from_bits(maximum) > mul(8355711.0, scale) {
+                scale = mul(scale, 2.0);
+            }
+        }
+        let mut a = 0.0_f64;
+        let mut b = 0.0_f64;
+        let mut e = 0.0_f64;
+        let mut weighted = 0.0_f64;
+        j = t;
+        while j < 4096 {
+            let value = if valid { x[start + j] } else { 0.0 };
+            let scaled = div(value, scale);
+            let integer: i32;
+            unsafe {
+                cuda_device::ptx_asm!("cvt.rni.s32.f32 %0, %1;",out("=r") integer,in("f") scaled);
+            }
+            let middle_high = (integer + 128) >> 8;
+            let high = (middle_high + 128) >> 8;
+            unsafe {
+                *q.get_unchecked_mut(row * 4096 + j) = (integer - middle_high * 256) as i8;
+                *q.get_unchecked_mut(nr * 4096 + row * 4096 + j) = (middle_high - high * 256) as i8;
+                *q.get_unchecked_mut(2 * nr * 4096 + row * 4096 + j) = high as i8;
+            }
+            let v = value as f64;
+            let approximation = (integer as f64) * (scale as f64);
+            // Power-of-two approximation is either zero or within a factor two
+            // of v; subtraction is exact (Sterbenz), in the guarded domain.
+            let error = v - approximation;
+            a = au(a, mu(v, v));
+            b = au(b, mu(approximation, approximation));
+            e = au(e, mu(error, error));
+            weighted = au(weighted, mu(mu(v, v), (133 - j / 32) as f64));
+            j += 256;
+        }
+        unsafe {
+            *norms.add(t) = a;
+            *norms.add(256 + t) = b;
+            *norms.add(512 + t) = e;
+            *norms.add(768 + t) = weighted;
+        }
+        thread::sync_threads();
+        distance = 128;
+        while distance > 0 {
+            if t < distance {
+                unsafe {
+                    *norms.add(t) = au(*norms.add(t), *norms.add(t + distance));
+                    *norms.add(256 + t) = au(*norms.add(256 + t), *norms.add(256 + t + distance));
+                    *norms.add(512 + t) = au(*norms.add(512 + t), *norms.add(512 + t + distance));
+                    *norms.add(768 + t) = au(*norms.add(768 + t), *norms.add(768 + t + distance));
+                }
+            }
+            thread::sync_threads();
+            distance /= 2;
+        }
+        if t == 0 {
+            unsafe {
+                *stats.get_unchecked_mut(row * 5) = scale as f64;
+                *stats.get_unchecked_mut(row * 5 + 1) = su(*norms);
+                *stats.get_unchecked_mut(row * 5 + 2) = su(*norms.add(256));
+                *stats.get_unchecked_mut(row * 5 + 3) = su(*norms.add(512));
+                *stats.get_unchecked_mut(row * 5 + 4) = if valid {
+                    su(*norms.add(768))
+                } else {
+                    f64::INFINITY
+                };
+            }
+        }
+    }
+
+    /// One complete warp owns a vocabulary column and up to 32 output rows.
+    #[kernel]
+    pub fn head_certify(
+        center: &[i64],
+        xs: &[f64],
+        ws: &[f64],
+        nr: u32,
+        nc: u32,
+        mut masks: DisjointSlice<u32>,
+        mut out: DisjointSlice<f32>,
+    ) {
+        dependency_wait();
+        use cuda_device::float::{add_rm_f64 as ad, add_rp_f64 as au, mul_rp_f64 as mu};
+        let tid = thread::index_1d().get();
+        let lane = tid % 32;
+        let index = tid / 32;
+        let groups = (nr as usize).div_ceil(32);
+        if index >= masks.len() {
+            return;
+        }
+        let col = index / groups;
+        let row = index % groups * 32 + lane;
+        let mut fallback = false;
+        if row < (nr as usize) {
+            let xi = row * 5;
+            let wi = col * 5;
+            fallback = true;
+            if xs[xi + 4].is_finite() && ws[wi + 4].is_finite() {
+                // Integer conversion may round; the explicit center allowance
+                // below covers it. Power-of-two scaling is exact in this domain.
+                let value = (center[row * (nc as usize) + col] as f64) * (xs[xi] * ws[wi]);
+                const U: f64 = 1.0 / 16777216.0;
+                const C: f64 = f64::from_bits((U / (1.0 - 133.0 * U)).to_bits() + 1);
+                let representation = au(mu(xs[xi + 3], ws[wi + 1]), mu(xs[xi + 2], ws[wi + 3]));
+                let legacy = mu(C, mu(xs[xi + 4], ws[wi + 4]));
+                // Integer-to-f64 rounding is bounded by twice its unit roundoff
+                // times the rounded magnitude; power-of-two dequantization is exact.
+                let radius = au(
+                    au(representation, legacy),
+                    mu(value.abs(), 1.0 / 4503599627370496.0),
+                );
+                let low = next_down_f32(ad(value, -radius) as f32);
+                let high = next_up_f32(au(value, radius) as f32);
+                let lower = bf(low);
+                let upper = bf(high);
+                if lower.to_bits() == upper.to_bits() && lower.is_finite() {
+                    unsafe {
+                        *out.get_unchecked_mut(row * (nc as usize) + col) = lower;
+                    }
+                    fallback = false;
+                }
+            }
+        }
+        let mask = warp::ballot_sync(0xffffffff, fallback);
+        if lane == 0 {
+            unsafe {
+                *masks.get_unchecked_mut(index) = mask;
+            }
+        }
+    }
+
+    /// Compact four ambiguous outputs per warp, preserving all original sums.
+    #[kernel]
+    pub fn head_certificate_fallback(
+        x: &[f32],
+        selected: &[u32],
+        words: &[u32],
+        offsets: &[u32],
+        exceptions: &[u16],
+        masks: &[u32],
+        nc: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        dependency_wait();
+        let tid = thread::index_1d().get();
+        let lane = tid % 32;
+        let index = tid / 32;
+        if index >= masks.len() {
+            return;
+        }
+        let groups = selected.len().div_ceil(32);
+        let col = index / groups;
+        let base = index % groups * 32;
+        let mut mask = masks[index];
+        while mask != 0 {
+            let mut selected_output = [0_usize; 4];
+            let mut starts = [0_usize; 4];
+            let mut count = 0;
+            while count < 4 && mask != 0 {
+                let row = base + mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                selected_output[count] = row;
+                starts[count] = selected[row] as usize * 4096;
+                count += 1;
+            }
+            let mut sums = [0.0_f32; 4];
+            let mut group = 0;
+            while group < 16 {
+                let chunk = col * 16 + group;
+                let word = chunk * 96 + lane;
+                let w0 = words[word];
+                let w1 = words[word + 32];
+                let w2 = words[word + 64];
+                let j = group * 256 + lane;
+                macro_rules! term {
+                    ($code:expr,$offset:expr) => {{
+                        let weight = widen(unpack_code($code, offsets, exceptions, chunk));
+                        sums = head_add_four(x, starts, sums, j + $offset, weight);
+                    }};
+                }
+                term!(w0, 0);
+                term!(w0 >> 12, 32);
+                term!((w0 >> 24) | (w1 << 8), 64);
+                term!(w1 >> 4, 96);
+                term!(w1 >> 16, 128);
+                term!((w1 >> 28) | (w2 << 4), 160);
+                term!(w2 >> 8, 192);
+                term!(w2 >> 20, 224);
+                group += 1;
+            }
+            sums = head_reduce_four(sums);
+            if lane == 0 {
+                let mut i = 0;
+                while i < count {
+                    unsafe {
+                        *out.get_unchecked_mut(selected_output[i] * (nc as usize) + col) =
+                            bf(sums[i]);
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    #[kernel]
+    pub fn head_integer_nine_products64(
+        q: &[i8],
+        w: &[i8],
+        nr: u32,
+        nc: u32,
+        width: u32,
+        mut out: DisjointSlice<i64>,
+    ) {
+        dependency_wait();
+        static mut A: SharedArray<u32, 3456, 16> = SharedArray::UNINIT;
+        static mut B: SharedArray<u32, 6912, 16> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let lane = t % 32;
+        let warp_id = t / 32;
+        let tiles_n = (nc as usize).div_ceil(64);
+        let tile = thread::blockIdx_x() as usize;
+        let row = tile / tiles_n * 32;
+        let col = tile % tiles_n * 64;
+        let wr = warp_id / 4 * 16;
+        let wc = warp_id % 4 * 16;
+        let group = lane / 4;
+        let part = lane % 4;
+        let k = width as usize;
+        let a_shared = unsafe { SharedArray::as_raw_mut_ptr(&raw mut A) };
+        let b_shared = unsafe { SharedArray::as_raw_mut_ptr(&raw mut B) };
+        let mut c00_0 = [0_i32; 4];
+        let mut c00_1 = [0_i32; 4];
+        let mut c01_0 = [0_i32; 4];
+        let mut c01_1 = [0_i32; 4];
+        let mut c02_0 = [0_i32; 4];
+        let mut c02_1 = [0_i32; 4];
+        let mut c10_0 = [0_i32; 4];
+        let mut c10_1 = [0_i32; 4];
+        let mut c11_0 = [0_i32; 4];
+        let mut c11_1 = [0_i32; 4];
+        let mut c12_0 = [0_i32; 4];
+        let mut c12_1 = [0_i32; 4];
+        let mut c20_0 = [0_i32; 4];
+        let mut c20_1 = [0_i32; 4];
+        let mut c21_0 = [0_i32; 4];
+        let mut c21_1 = [0_i32; 4];
+        let mut c22_0 = [0_i32; 4];
+        let mut c22_1 = [0_i32; 4];
+        let mut base = 0;
+        while base < k {
+            // SAFETY: each thread owns one aligned 16-byte A fragment and two
+            // B fragments. Tail rows copy zero bytes from a valid dummy address.
+            // The issuing thread waits for its copies, then the CTA publishes them.
+            unsafe {
+                let mut plane = 0;
+                while plane < 3 {
+                    let r = row + t / 8;
+                    let offset = if r < (nr as usize) {
+                        r * k + base + t % 8 * 16
+                    } else {
+                        0
+                    };
+                    cuda_device::async_copy::cp_async_ca_zfill_16(
+                        a_shared.add(plane * 1152 + t / 8 * 36 + t % 8 * 4),
+                        q.as_ptr()
+                            .add(plane * (nr as usize) * k + offset)
+                            .cast::<u8>(),
+                        if r < (nr as usize) { 16 } else { 0 },
+                    );
+                    let mut piece = 0;
+                    while piece < 2 {
+                        let i = t + piece * 256;
+                        let c = col + i / 8;
+                        let offset = if c < (nc as usize) {
+                            c * k + base + i % 8 * 16
+                        } else {
+                            0
+                        };
+                        cuda_device::async_copy::cp_async_ca_zfill_16(
+                            b_shared.add(plane * 2304 + i / 8 * 36 + i % 8 * 4),
+                            w.as_ptr()
+                                .add(plane * (nc as usize) * k + offset)
+                                .cast::<u8>(),
+                            if c < (nc as usize) { 16 } else { 0 },
+                        );
+                        piece += 1;
+                    }
+                    plane += 1;
+                }
+                cuda_device::async_copy::cp_async_commit_group();
+                cuda_device::async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            let mut j = 0;
+            while j < 32 {
+                unsafe {
+                    // Each lane supplies an aligned row of one of four 8x8
+                    // b16 matrices. Their bytes are the same INT8 MMA fragments.
+                    let a0 = cuda_device::wmma::ldmatrix_x4(
+                        a_shared.add(0 * 1152 + (wr + lane % 16) * 36 + j + lane / 16 * 4),
+                    );
+                    let b0 = cuda_device::wmma::ldmatrix_x4(b_shared.add(
+                        0 * 2304 + (wc + lane / 16 * 8 + lane % 8) * 36 + j + lane / 8 % 2 * 4,
+                    ));
+                    let a1 = cuda_device::wmma::ldmatrix_x4(
+                        a_shared.add(1 * 1152 + (wr + lane % 16) * 36 + j + lane / 16 * 4),
+                    );
+                    let b1 = cuda_device::wmma::ldmatrix_x4(b_shared.add(
+                        1 * 2304 + (wc + lane / 16 * 8 + lane % 8) * 36 + j + lane / 8 % 2 * 4,
+                    ));
+                    let a2 = cuda_device::wmma::ldmatrix_x4(
+                        a_shared.add(2 * 1152 + (wr + lane % 16) * 36 + j + lane / 16 * 4),
+                    );
+                    let b2 = cuda_device::wmma::ldmatrix_x4(b_shared.add(
+                        2 * 2304 + (wc + lane / 16 * 8 + lane % 8) * 36 + j + lane / 8 % 2 * 4,
+                    ));
+                    c00_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c00_0, a0, [b0[0], b0[1]]);
+                    c00_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c00_1, a0, [b0[2], b0[3]]);
+                    c01_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c01_0, a0, [b1[0], b1[1]]);
+                    c01_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c01_1, a0, [b1[2], b1[3]]);
+                    c02_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c02_0, a0, [b2[0], b2[1]]);
+                    c02_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c02_1, a0, [b2[2], b2[3]]);
+                    c10_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c10_0, a1, [b0[0], b0[1]]);
+                    c10_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c10_1, a1, [b0[2], b0[3]]);
+                    c11_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c11_0, a1, [b1[0], b1[1]]);
+                    c11_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c11_1, a1, [b1[2], b1[3]]);
+                    c12_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c12_0, a1, [b2[0], b2[1]]);
+                    c12_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c12_1, a1, [b2[2], b2[3]]);
+                    c20_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c20_0, a2, [b0[0], b0[1]]);
+                    c20_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c20_1, a2, [b0[2], b0[3]]);
+                    c21_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c21_0, a2, [b1[0], b1[1]]);
+                    c21_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c21_1, a2, [b1[2], b1[3]]);
+                    c22_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c22_0, a2, [b2[0], b2[1]]);
+                    c22_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c22_1, a2, [b2[2], b2[3]]);
+                }
+                j += 8;
+            }
+            // No thread may overwrite staging before the last warp consumes it.
+            thread::sync_threads();
+            base += 128;
+        }
+        let mut i = 0;
+        while i < 4 {
+            let r = row + wr + group + i / 2 * 8;
+            let c = col + wc + part * 2 + i % 2;
+            if r < (nr as usize) {
+                unsafe {
+                    if c < (nc as usize) {
+                        *out.get_unchecked_mut(r * (nc as usize) + c) = combine_head_bytes([
+                            c00_0[i], c01_0[i], c02_0[i], c10_0[i], c11_0[i], c12_0[i], c20_0[i],
+                            c21_0[i], c22_0[i],
+                        ]);
+                    }
+                    if c + 8 < (nc as usize) {
+                        *out.get_unchecked_mut(r * (nc as usize) + c + 8) = combine_head_bytes([
+                            c00_1[i], c01_1[i], c02_1[i], c10_1[i], c11_1[i], c12_1[i], c20_1[i],
+                            c21_1[i], c22_1[i],
+                        ]);
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    #[kernel]
+    pub fn head_integer_nine_products32(
+        q: &[i8],
+        w: &[i8],
+        nr: u32,
+        nc: u32,
+        width: u32,
+        mut out: DisjointSlice<i64>,
+    ) {
+        dependency_wait();
+        static mut A: SharedArray<u32, 3456, 16> = SharedArray::UNINIT;
+        static mut B: SharedArray<u32, 3456, 16> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let lane = t % 32;
+        let warp_id = t / 32;
+        let tiles_n = (nc as usize).div_ceil(32);
+        let tile = thread::blockIdx_x() as usize;
+        let row = tile / tiles_n * 32;
+        let col = tile % tiles_n * 32;
+        let wr = warp_id / 2 * 16;
+        let wc = warp_id % 2 * 16;
+        let group = lane / 4;
+        let part = lane % 4;
+        let k = width as usize;
+        let a_shared = unsafe { SharedArray::as_raw_mut_ptr(&raw mut A) };
+        let b_shared = unsafe { SharedArray::as_raw_mut_ptr(&raw mut B) };
+        let mut c00_0 = [0_i32; 4];
+        let mut c00_1 = [0_i32; 4];
+        let mut c01_0 = [0_i32; 4];
+        let mut c01_1 = [0_i32; 4];
+        let mut c02_0 = [0_i32; 4];
+        let mut c02_1 = [0_i32; 4];
+        let mut c10_0 = [0_i32; 4];
+        let mut c10_1 = [0_i32; 4];
+        let mut c11_0 = [0_i32; 4];
+        let mut c11_1 = [0_i32; 4];
+        let mut c12_0 = [0_i32; 4];
+        let mut c12_1 = [0_i32; 4];
+        let mut c20_0 = [0_i32; 4];
+        let mut c20_1 = [0_i32; 4];
+        let mut c21_0 = [0_i32; 4];
+        let mut c21_1 = [0_i32; 4];
+        let mut c22_0 = [0_i32; 4];
+        let mut c22_1 = [0_i32; 4];
+        let mut base = 0;
+        while base < k {
+            // SAFETY: each thread owns one aligned 16-byte A fragment and two
+            // B fragments. Tail rows copy zero bytes from a valid dummy address.
+            // The issuing thread waits for its copies, then the CTA publishes them.
+            unsafe {
+                let mut plane = 0;
+                while plane < 3 {
+                    let mut apiece = 0;
+                    while apiece < 2 {
+                        let aindex = t + apiece * 128;
+                        let r = row + aindex / 8;
+                        let offset = if r < (nr as usize) {
+                            r * k + base + aindex % 8 * 16
+                        } else {
+                            0
+                        };
+                        cuda_device::async_copy::cp_async_ca_zfill_16(
+                            a_shared.add(plane * 1152 + aindex / 8 * 36 + aindex % 8 * 4),
+                            q.as_ptr()
+                                .add(plane * (nr as usize) * k + offset)
+                                .cast::<u8>(),
+                            if r < (nr as usize) { 16 } else { 0 },
+                        );
+                        apiece += 1;
+                    }
+                    let mut piece = 0;
+                    while piece < 2 {
+                        let i = t + piece * 128;
+                        let c = col + i / 8;
+                        let offset = if c < (nc as usize) {
+                            c * k + base + i % 8 * 16
+                        } else {
+                            0
+                        };
+                        cuda_device::async_copy::cp_async_ca_zfill_16(
+                            b_shared.add(plane * 1152 + i / 8 * 36 + i % 8 * 4),
+                            w.as_ptr()
+                                .add(plane * (nc as usize) * k + offset)
+                                .cast::<u8>(),
+                            if c < (nc as usize) { 16 } else { 0 },
+                        );
+                        piece += 1;
+                    }
+                    plane += 1;
+                }
+                cuda_device::async_copy::cp_async_commit_group();
+                cuda_device::async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            let mut j = 0;
+            while j < 32 {
+                unsafe {
+                    // Each lane supplies an aligned row of one of four 8x8
+                    // b16 matrices. Their bytes are the same INT8 MMA fragments.
+                    let a0 = cuda_device::wmma::ldmatrix_x4(
+                        a_shared.add(0 * 1152 + (wr + lane % 16) * 36 + j + lane / 16 * 4),
+                    );
+                    let b0 = cuda_device::wmma::ldmatrix_x4(b_shared.add(
+                        0 * 1152 + (wc + lane / 16 * 8 + lane % 8) * 36 + j + lane / 8 % 2 * 4,
+                    ));
+                    let a1 = cuda_device::wmma::ldmatrix_x4(
+                        a_shared.add(1 * 1152 + (wr + lane % 16) * 36 + j + lane / 16 * 4),
+                    );
+                    let b1 = cuda_device::wmma::ldmatrix_x4(b_shared.add(
+                        1 * 1152 + (wc + lane / 16 * 8 + lane % 8) * 36 + j + lane / 8 % 2 * 4,
+                    ));
+                    let a2 = cuda_device::wmma::ldmatrix_x4(
+                        a_shared.add(2 * 1152 + (wr + lane % 16) * 36 + j + lane / 16 * 4),
+                    );
+                    let b2 = cuda_device::wmma::ldmatrix_x4(b_shared.add(
+                        2 * 1152 + (wc + lane / 16 * 8 + lane % 8) * 36 + j + lane / 8 % 2 * 4,
+                    ));
+                    c00_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c00_0, a0, [b0[0], b0[1]]);
+                    c00_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c00_1, a0, [b0[2], b0[3]]);
+                    c01_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c01_0, a0, [b1[0], b1[1]]);
+                    c01_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c01_1, a0, [b1[2], b1[3]]);
+                    c02_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c02_0, a0, [b2[0], b2[1]]);
+                    c02_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c02_1, a0, [b2[2], b2[3]]);
+                    c10_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c10_0, a1, [b0[0], b0[1]]);
+                    c10_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c10_1, a1, [b0[2], b0[3]]);
+                    c11_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c11_0, a1, [b1[0], b1[1]]);
+                    c11_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c11_1, a1, [b1[2], b1[3]]);
+                    c12_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c12_0, a1, [b2[0], b2[1]]);
+                    c12_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c12_1, a1, [b2[2], b2[3]]);
+                    c20_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c20_0, a2, [b0[0], b0[1]]);
+                    c20_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c20_1, a2, [b0[2], b0[3]]);
+                    c21_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c21_0, a2, [b1[0], b1[1]]);
+                    c21_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c21_1, a2, [b1[2], b1[3]]);
+                    c22_0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c22_0, a2, [b2[0], b2[1]]);
+                    c22_1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c22_1, a2, [b2[2], b2[3]]);
+                }
+                j += 8;
+            }
+            // No thread may overwrite staging before the last warp consumes it.
+            thread::sync_threads();
+            base += 128;
+        }
+        let mut i = 0;
+        while i < 4 {
+            let r = row + wr + group + i / 2 * 8;
+            let c = col + wc + part * 2 + i % 2;
+            if r < (nr as usize) {
+                unsafe {
+                    if c < (nc as usize) {
+                        *out.get_unchecked_mut(r * (nc as usize) + c) = combine_head_bytes([
+                            c00_0[i], c01_0[i], c02_0[i], c10_0[i], c11_0[i], c12_0[i], c20_0[i],
+                            c21_0[i], c22_0[i],
+                        ]);
+                    }
+                    if c + 8 < (nc as usize) {
+                        *out.get_unchecked_mut(r * (nc as usize) + c + 8) = combine_head_bytes([
+                            c00_1[i], c01_1[i], c02_1[i], c10_1[i], c11_1[i], c12_1[i], c20_1[i],
+                            c21_1[i], c22_1[i],
+                        ]);
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
     #[kernel]
     pub fn linear_tiled(
         q: &[i8],

@@ -1,4 +1,5 @@
 //! Paged, ragged execution with reusable session ownership and bounded scratch.
+use super::certified_head::{CertificateWorkspace, CertifiedHead};
 use super::*;
 use crate::{
     cache::{CacheLease, CachePool, CacheUsage},
@@ -118,6 +119,7 @@ struct Step {
     graph: Option<Graph>,
     shape: (usize, usize, usize),
     w: Workspace,
+    certificate: Option<CertificateWorkspace>,
     input: DeviceBuffer<u32>,
     info: DeviceBuffer<u32>,
     query_tiles: DeviceBuffer<u32>,
@@ -131,11 +133,17 @@ impl Step {
         stream: &Arc<CudaStream>,
         shape: (usize, usize, usize),
         table_len: usize,
+        certified: bool,
     ) -> Result<Self> {
         let (n, output_rows, stride) = shape;
         Ok(Self {
             graph: None,
             shape,
+            certificate: if certified && output_rows == 32 {
+                Some(CertificateWorkspace::new(stream)?)
+            } else {
+                None
+            },
             w: Workspace::with_shape(stream, n, output_rows.max(1), stride)?,
             input: DeviceBuffer::zeroed(stream, n)?,
             info: DeviceBuffer::zeroed(stream, n * 2)?,
@@ -178,6 +186,7 @@ pub struct BatchEngine {
     execution: Mutex<Execution>,
     pool: CachePool,
     gpu: GpuModel,
+    certified_head: Option<CertifiedHead>,
     config: EngineConfig,
     model_root: String,
     device_name: String,
@@ -190,6 +199,14 @@ impl BatchEngine {
         config.hardware.validate_device(&device_name)?;
         let pool = CachePool::with_byte_budget(PAGE_TOKENS, config.kv_cache_bytes)?;
         let gpu = GpuModel::weights_only(model)?;
+        let certified_head = if config.tuned_head
+            && config.max_batch >= 32
+            && config.hardware == crate::config::HardwareProfile::RtxPro6000
+        {
+            Some(CertifiedHead::new(&gpu.stream, &model.head)?)
+        } else {
+            None
+        };
         let elements = pool.usage().total_pages * PAGE_TOKENS * 1024;
         let caches = (0..36)
             .map(|_| {
@@ -211,6 +228,7 @@ impl BatchEngine {
             }),
             pool,
             gpu,
+            certified_head,
             config,
             model_root: model.root.clone(),
             device_name,
@@ -569,7 +587,12 @@ impl BatchEngine {
                     // Release the previous shape before allocating its replacement,
                     // avoiding a temporary doubling of the score workspace.
                     drop(storage.take());
-                    *storage = Some(Step::new(&self.gpu.stream, shape, table.len())?);
+                    *storage = Some(Step::new(
+                        &self.gpu.stream,
+                        shape,
+                        table.len(),
+                        self.certified_head.is_some(),
+                    )?);
                 }
                 let step = storage.as_mut().expect("allocated above");
                 step.input.copy_from_host(&self.gpu.stream, &input)?;
@@ -948,16 +971,57 @@ impl BatchEngine {
                     1
                 };
                 match head_group {
-                    32 => gpu.module.head_packed_thirtytwo_staged(
-                        &gpu.stream,
-                        rows((outputs.div_ceil(32) * VOCAB).div_ceil(8), 256),
-                        &w.norm,
-                        &step.outputs,
-                        &gpu.head.words,
-                        &gpu.head.offsets,
-                        &gpu.head.exceptions,
-                        &mut w.logits,
-                    )?,
+                    32 => {
+                        let weights = self
+                            .certified_head
+                            .as_ref()
+                            .expect("PRO tuned head weights");
+                        let scratch = step
+                            .certificate
+                            .as_mut()
+                            .expect("32-output certificate workspace");
+                        gpu.module.head_certificate_inputs(
+                            &gpu.stream,
+                            rows(32, 256),
+                            &w.norm,
+                            &step.outputs,
+                            &mut scratch.digits,
+                            &mut scratch.stats,
+                        )?;
+                        gpu.module.head_integer_nine_products64(
+                            &gpu.stream,
+                            rows(VOCAB.div_ceil(64), 256),
+                            &scratch.digits,
+                            &weights.digits,
+                            32,
+                            VOCAB as u32,
+                            HIDDEN as u32,
+                            &mut scratch.center,
+                        )?;
+                        gpu.module.head_certify(
+                            &gpu.stream,
+                            rows(VOCAB.div_ceil(8), 256),
+                            &scratch.center,
+                            &scratch.stats,
+                            &weights.stats,
+                            32,
+                            VOCAB as u32,
+                            &mut scratch.masks,
+                            &mut w.logits,
+                        )?;
+                        gpu.module.head_certificate_fallback(
+                            &gpu.stream,
+                            rows(VOCAB.div_ceil(8), 256),
+                            &w.norm,
+                            &step.outputs,
+                            &gpu.head.words,
+                            &gpu.head.offsets,
+                            &gpu.head.exceptions,
+                            &scratch.masks,
+                            VOCAB as u32,
+                            &mut w.logits,
+                        )?;
+                    }
                     4 => gpu.module.head_packed_four(
                         &gpu.stream,
                         rows((outputs.div_ceil(4) * VOCAB).div_ceil(8), 256),

@@ -1,6 +1,6 @@
 # RTX PRO 6000 asynchronous projections and 32-row head
 
-All builds, checks and timings ran on `ssh wx-workstation`. These kernels preserve integer projection arithmetic or the existing ordered FP32 head arithmetic. The 32-output head is retained for exactly thirty-two outputs on the PRO profile; the projection experiments are rejected. Operator screens use three warmups and seven measured CUDA events; the subsequent paired head model pilot uses twenty measured samples per binary/case. Neither is the final stock comparison matrix.
+All builds, checks and timings ran on `ssh wx-workstation`. These kernels preserve integer projection arithmetic or the existing ordered FP32 head arithmetic. The 32-output head was retained for exactly thirty-two outputs on the PRO profile and now serves as the preceding baseline for the [certified head](pro6000-certified-head.md); the projection experiments are rejected. Operator screens use three warmups and seven measured CUDA events; the subsequent paired head model pilot uses twenty measured samples per binary/case. Neither is the final stock comparison matrix.
 
 ## Validation
 

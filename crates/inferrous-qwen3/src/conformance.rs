@@ -1341,3 +1341,544 @@ fn head32_independent_reference() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+fn certificate_host_rows(values: &[f32], nr: usize) -> (Vec<i8>, Vec<f64>) {
+    let mut digits = vec![0_i8; 3 * nr * 4096];
+    let mut stats = vec![0.0_f64; nr * 5];
+    for row in 0..nr {
+        let values = &values[row * 4096..(row + 1) * 4096];
+        let valid = values.iter().all(|v| {
+            v.to_bits() & 65535 == 0
+                && v.is_finite()
+                && (*v == 0.0 || (v.abs() >= 2.0_f32.powi(-50) && v.abs() <= 2.0_f32.powi(30)))
+        });
+        let maximum = values.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let mut scale = 1.0_f32;
+        if valid && maximum > 0.0 {
+            scale = f32::from_bits(((maximum.to_bits() >> 23) - 22) << 23);
+            if maximum > 8355711.0 * scale {
+                scale *= 2.0;
+            }
+        }
+        let mut sums = [0.0_f64; 4];
+        for (j, &value) in values.iter().enumerate() {
+            let value = if valid { value } else { 0.0 };
+            let q = (value / scale).round_ties_even() as i32;
+            assert!(q.abs() <= 8355711);
+            // Euclidean division independently defines balanced base-256 digits.
+            let middle_high = (q + 128).div_euclid(256);
+            let high = (middle_high + 128).div_euclid(256);
+            let parts = [q - middle_high * 256, middle_high - high * 256, high];
+            assert!(parts.iter().all(|v| (-128..=127).contains(v)));
+            assert_eq!(parts[0] + 256 * parts[1] + 65536 * parts[2], q);
+            for plane in 0..3 {
+                digits[plane * nr * 4096 + row * 4096 + j] = parts[plane] as i8;
+            }
+            let v = value as f64;
+            let a = (q as f64) * (scale as f64);
+            let e = v - a;
+            sums[0] += v * v;
+            sums[1] += a * a;
+            sums[2] += e * e;
+            sums[3] += v * v * (133 - j / 32) as f64;
+        }
+        stats[row * 5] = scale as f64;
+        // Each square/product is exact in f64 in this guarded BF16 domain.
+        // 2^-39 exceeds the 4096-term positive-sum relative error bound.
+        for i in 0..4 {
+            stats[row * 5 + 1 + i] = (sums[i] * (1.0 + 2.0_f64.powi(-39)))
+                .next_up()
+                .sqrt()
+                .next_up();
+        }
+        if !valid {
+            stats[row * 5 + 4] = f64::INFINITY;
+        }
+    }
+    (digits, stats)
+}
+
+#[test]
+fn certified_weight_preparation_boundaries() {
+    // Independent FP32/Euclidean reference, including domain endpoints, signed
+    // zeros, invalid finite values, infinities/NaNs, and nontrivial quantization.
+    let special = [
+        0_u16,
+        0x8000,
+        1,
+        0x8001,
+        (77 << 7) - 1,
+        77 << 7,
+        (77 << 7) + 1,
+        157 << 7,
+        (157 << 7) + 1,
+        0x7f80,
+        0xff80,
+        0x7fc1,
+    ];
+    let nr = special.len() + 16;
+    let mut weights = vec![0_u16; nr * 4096];
+    for (row, values) in weights.chunks_exact_mut(4096).enumerate() {
+        for (k, value) in values.iter_mut().enumerate() {
+            *value = if row < special.len() {
+                if k == 2047 { special[row] } else { 0x3f80 }
+            } else {
+                // Vary mantissas, signs and 80 exponents within the guarded domain.
+                (((77 + (k * 17 + row * 11) % 80) as u16) << 7)
+                    | (((k * 37 + row) % 128) as u16)
+                    | (((k + row) % 2) as u16) << 15
+            };
+        }
+    }
+    let values: Vec<f32> = weights
+        .iter()
+        .map(|&v| f32::from_bits((v as u32) << 16))
+        .collect();
+    let expected = certificate_host_rows(&values, nr);
+    let actual = crate::gpu::certified_head::prepare_weights(&weights);
+    assert_eq!(actual.0, expected.0);
+    assert_eq!(
+        actual.1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        expected.1.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    println!(
+        "CERTIFIED_WEIGHT_PREPARATION {{\"rows\":{},\"values\":{}}}",
+        nr,
+        weights.len()
+    );
+}
+
+fn certificate_reference(x: &[f32], selected: &[u32], weights: &[u16], nc: usize) -> Vec<f32> {
+    selected
+        .iter()
+        .flat_map(|&r| {
+            (0..nc).map(move |c| {
+                let mut lanes = [0.0_f32; 32];
+                for lane in 0..32 {
+                    for k in (lane..4096).step_by(32) {
+                        let product = x[r as usize * 4096 + k]
+                            * f32::from_bits((weights[c * 4096 + k] as u32) << 16);
+                        lanes[lane] += product;
+                    }
+                }
+                for distance in [16, 8, 4, 2, 1] {
+                    let old = lanes;
+                    for lane in 0..32 - distance {
+                        lanes[lane] = old[lane] + old[lane + distance];
+                    }
+                }
+                let bits = lanes[0].to_bits();
+                f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn certified_head_independent_reference() -> anyhow::Result<()> {
+    use crate::graph::Graph;
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    for (nr, nc) in [(1_usize, 1_usize), (3, 16), (16, 65), (32, 65), (33, 16)] {
+        let values: Vec<f32> = (0..nr * 4096)
+            .map(|i| match i / 4096 {
+                0 => 1.0,
+                1 => {
+                    if i % 4096 == 0 {
+                        0.1234567
+                    } else {
+                        0.5
+                    }
+                }
+                2 => 0.0,
+                3 => 2.0_f32.powi(-60),
+                4 => 2.0_f32.powi(40),
+                _ => f32::from_bits(
+                    (((110 + (i * 17 + i / 4096 * 7) % 25) as u32) << 23)
+                        | ((((i * 37 + i / 4096 * 3) % 128) as u32) << 16)
+                        | (((i % 2) as u32) << 31),
+                ),
+            })
+            .collect();
+        let selected: Vec<u32> = (0..nr).rev().map(|v| v as u32).collect();
+        let weights: Vec<u16> = (0..nc * 4096)
+            .map(|i| {
+                let v = match i / 4096 {
+                    0 => 0.25,
+                    1 => 2.0_f32.powi(-60),
+                    2 => 2.0_f32.powi(40),
+                    _ => f32::from_bits(
+                        (((100 + (i * 19 + i / 4096 * 11) % 50) as u32) << 23)
+                            | ((((i * 13 + i / 4096 * 5) % 128) as u32) << 16)
+                            | (((i % 3 == 0) as u32) << 31),
+                    ),
+                };
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let wf: Vec<f32> = weights
+            .iter()
+            .map(|&w| f32::from_bits((w as u32) << 16))
+            .collect();
+        let (wq, ws) = certificate_host_rows(&wf, nc);
+        let ordered: Vec<f32> = selected
+            .iter()
+            .flat_map(|&r| {
+                values[r as usize * 4096..(r as usize + 1) * 4096]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let (expected_q, expected_stats) = certificate_host_rows(&ordered, nr);
+        let reconstruct = |data: &[i8], rows: usize, row: usize, k: usize| -> i64 {
+            data[row * 4096 + k] as i64
+                + ((data[rows * 4096 + row * 4096 + k] as i64) << 8)
+                + ((data[2 * rows * 4096 + row * 4096 + k] as i64) << 16)
+        };
+        let expected_center: Vec<i64> = (0..nr * nc)
+            .map(|i| {
+                (0..4096)
+                    .map(|k| {
+                        reconstruct(&expected_q, nr, i / nc, k) * reconstruct(&wq, nc, i % nc, k)
+                    })
+                    .sum()
+            })
+            .collect();
+        let expected = certificate_reference(&values, &selected, &weights, nc);
+        let packed = crate::packing::PackedBf16::new(&weights);
+        let x = DeviceBuffer::from_host(&stream, &values)?;
+        let selections = DeviceBuffer::from_host(&stream, &selected)?;
+        let wq = DeviceBuffer::from_host(&stream, &wq)?;
+        let words = DeviceBuffer::from_host(&stream, &packed.words)?;
+        let offsets = DeviceBuffer::from_host(&stream, &packed.offsets)?;
+        let exceptions = DeviceBuffer::from_host(&stream, &packed.exceptions)?;
+        let mut xq = DeviceBuffer::<i8>::zeroed(&stream, 3 * nr * 4096)?;
+        let mut xs = DeviceBuffer::<f64>::zeroed(&stream, nr * 5)?;
+        let mut center = DeviceBuffer::<i64>::zeroed(&stream, nr * nc)?;
+        let mut masks = DeviceBuffer::<u32>::zeroed(&stream, nc * nr.div_ceil(32))?;
+        for forced in [false, true] {
+            let mut current_stats = ws.clone();
+            if forced {
+                for c in 0..nc {
+                    current_stats[c * 5 + 4] = f64::INFINITY;
+                }
+            }
+            let ws = DeviceBuffer::from_host(&stream, &current_stats)?;
+            for tile in [32, 64] {
+                for graph in [false, true] {
+                    // Fresh sentinels prove both launch forms actually publish all outputs.
+                    let sentinel = -12345.25_f32;
+                    let mut out = DeviceBuffer::from_host(&stream, &vec![sentinel; nr * nc + 64])?;
+                    let mut launch = || -> anyhow::Result<()> {
+                        unsafe {
+                            module.head_certificate_inputs(
+                                &stream,
+                                rows(nr, 256),
+                                &x,
+                                &selections,
+                                &mut xq,
+                                &mut xs,
+                            )?;
+                            if tile == 32 {
+                                module.head_integer_nine_products32(
+                                    &stream,
+                                    rows(nr.div_ceil(32) * nc.div_ceil(32), 128),
+                                    &xq,
+                                    &wq,
+                                    nr as u32,
+                                    nc as u32,
+                                    4096,
+                                    &mut center,
+                                )?;
+                            } else if tile == 64 {
+                                module.head_integer_nine_products64(
+                                    &stream,
+                                    rows(nr.div_ceil(32) * nc.div_ceil(64), 256),
+                                    &xq,
+                                    &wq,
+                                    nr as u32,
+                                    nc as u32,
+                                    4096,
+                                    &mut center,
+                                )?;
+                            }
+                            module.head_certify(
+                                &stream,
+                                rows((nc * nr.div_ceil(32)).div_ceil(8), 256),
+                                &center,
+                                &xs,
+                                &ws,
+                                nr as u32,
+                                nc as u32,
+                                &mut masks,
+                                &mut out,
+                            )?;
+                            module.head_certificate_fallback(
+                                &stream,
+                                rows(masks.len().div_ceil(8), 256),
+                                &x,
+                                &selections,
+                                &words,
+                                &offsets,
+                                &exceptions,
+                                &masks,
+                                nc as u32,
+                                &mut out,
+                            )?;
+                        }
+                        Ok(())
+                    };
+                    if graph {
+                        let capture = unsafe { Graph::capture(&stream, false, launch)? };
+                        unsafe {
+                            capture.launch()?;
+                        }
+                        stream.synchronize()?;
+                    } else {
+                        launch()?;
+                    }
+                    let actual = out.to_host_vec(&stream)?;
+                    assert_eq!(
+                        actual[..nr * nc]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        actual[nr * nc..]
+                            .iter()
+                            .all(|&v| v.to_bits() == sentinel.to_bits())
+                    );
+                    assert_eq!(xq.to_host_vec(&stream)?, expected_q);
+                    assert_eq!(center.to_host_vec(&stream)?, expected_center);
+                    let actual_stats = xs.to_host_vec(&stream)?;
+                    for row in 0..nr {
+                        assert_eq!(actual_stats[row * 5], expected_stats[row * 5]);
+                        assert_eq!(
+                            actual_stats[row * 5 + 4].is_finite(),
+                            expected_stats[row * 5 + 4].is_finite()
+                        );
+                    }
+                    let masks_host = masks.to_host_vec(&stream)?;
+                    let fallback: usize = masks_host.iter().map(|v| v.count_ones() as usize).sum();
+                    for row in 0..nr {
+                        for col in 0..nc {
+                            let bit =
+                                (masks_host[col * nr.div_ceil(32) + row / 32] >> (row % 32)) & 1;
+                            if forced
+                                || !expected_stats[row * 5 + 4].is_finite()
+                                || !current_stats[col * 5 + 4].is_finite()
+                            {
+                                assert_eq!(bit, 1);
+                            }
+                        }
+                    }
+                    if forced {
+                        assert_eq!(fallback, nr * nc);
+                    } else {
+                        assert!(fallback < nr * nc, "require some certified outputs");
+                    }
+                    println!(
+                        "CERTIFIED_HEAD_CHECK {}",
+                        serde_json::json!({"rows":nr,"columns":nc,"graph":graph,"forced":forced,"tile":tile,"fallback":fallback,"outputs":nr*nc})
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "complete certified-head operator comparison on captured inputs; no model dispatch"]
+fn certified_head_captured_profile() -> anyhow::Result<()> {
+    use crate::{graph::Graph, model::Model};
+    let root = PathBuf::from(std::env::var("CLEAN_MODEL_BUNDLE")?);
+    let model = Model::load(&root)?;
+    let captures = PathBuf::from(std::env::var("CLEAN_HEAD_CAPTURE_ROOT")?);
+    let mut samples = Vec::new();
+    let mut identities = Vec::new();
+    for prompt in [5, 513] {
+        for step in 0..3 {
+            let path = captures.join(format!("k0-p{prompt}/step.{step}.norm.bin"));
+            let bytes = fs::read(&path)?;
+            assert!(bytes.len() >= 4096 * 4 && bytes.len() % (4096 * 4) == 0);
+            identities.push(serde_json::json!({"path":path,"sha256":sha(&bytes)}));
+            samples.push(
+                bytes[bytes.len() - 4096 * 4..]
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    let nr = 32_usize;
+    let nc = 151936_usize;
+    let values: Vec<f32> = (0..nr)
+        .flat_map(|i| samples[i % 6].iter().copied())
+        .collect();
+    let selected: Vec<u32> = (0..nr).map(|i| i as u32).collect();
+    let wf: Vec<f32> = model
+        .head
+        .iter()
+        .map(|&w| f32::from_bits((w as u32) << 16))
+        .collect();
+    let (wq, ws) = certificate_host_rows(&wf, nc);
+    drop(wf);
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    let packed = crate::packing::PackedBf16::new(&model.head);
+    let packed_words = DeviceBuffer::from_host(&stream, &packed.words)?;
+    let packed_offsets = DeviceBuffer::from_host(&stream, &packed.offsets)?;
+    let packed_exceptions = DeviceBuffer::from_host(&stream, &packed.exceptions)?;
+    drop(packed);
+    let x = DeviceBuffer::from_host(&stream, &values)?;
+    let selections = DeviceBuffer::from_host(&stream, &selected)?;
+    let wq = DeviceBuffer::from_host(&stream, &wq)?;
+    let ws = DeviceBuffer::from_host(&stream, &ws)?;
+    let mut xq = DeviceBuffer::<i8>::zeroed(&stream, 3 * nr * 4096)?;
+    let mut xs = DeviceBuffer::<f64>::zeroed(&stream, nr * 5)?;
+    let mut center = DeviceBuffer::<i64>::zeroed(&stream, nr * nc)?;
+    let mut masks = DeviceBuffer::<u32>::zeroed(&stream, nc)?;
+    let mut out = DeviceBuffer::<f32>::zeroed(&stream, nr * nc)?;
+    unsafe {
+        module.head_packed_thirtytwo_staged(
+            &stream,
+            rows(nc / 8, 256),
+            &x,
+            &selections,
+            &packed_words,
+            &packed_offsets,
+            &packed_exceptions,
+            &mut out,
+        )?;
+    }
+    let expected = out.to_host_vec(&stream)?;
+    let start = context.new_event(Some(0))?;
+    let end = context.new_event(Some(0))?;
+    for stage in [
+        "complete-32",
+        "complete-64",
+        "baseline",
+        "inputs",
+        "center-32",
+        "center-64",
+        "certify",
+        "fallback",
+    ] {
+        if stage.starts_with("complete-") {
+            out.copy_from_host(&stream, &vec![f32::NAN; nr * nc])?;
+        }
+        let graph = unsafe {
+            Graph::capture(&stream, false, || {
+                if stage.starts_with("complete-") || stage == "inputs" {
+                    module.head_certificate_inputs(
+                        &stream,
+                        rows(nr, 256),
+                        &x,
+                        &selections,
+                        &mut xq,
+                        &mut xs,
+                    )?;
+                }
+                if stage.starts_with("complete-") || stage.starts_with("center-") {
+                    if stage.ends_with("-32") {
+                        module.head_integer_nine_products32(
+                            &stream,
+                            rows(nc.div_ceil(32), 128),
+                            &xq,
+                            &wq,
+                            nr as u32,
+                            nc as u32,
+                            4096,
+                            &mut center,
+                        )?;
+                    } else {
+                        module.head_integer_nine_products64(
+                            &stream,
+                            rows(nc.div_ceil(64), 256),
+                            &xq,
+                            &wq,
+                            nr as u32,
+                            nc as u32,
+                            4096,
+                            &mut center,
+                        )?;
+                    }
+                }
+                if stage.starts_with("complete-") || stage == "certify" {
+                    module.head_certify(
+                        &stream,
+                        rows(nc / 8, 256),
+                        &center,
+                        &xs,
+                        &ws,
+                        nr as u32,
+                        nc as u32,
+                        &mut masks,
+                        &mut out,
+                    )?;
+                }
+                if stage.starts_with("complete-") || stage == "fallback" {
+                    module.head_certificate_fallback(
+                        &stream,
+                        rows(nc / 8, 256),
+                        &x,
+                        &selections,
+                        &packed_words,
+                        &packed_offsets,
+                        &packed_exceptions,
+                        &masks,
+                        nc as u32,
+                        &mut out,
+                    )?;
+                }
+                if stage == "baseline" {
+                    module.head_packed_thirtytwo_staged(
+                        &stream,
+                        rows(nc / 8, 256),
+                        &x,
+                        &selections,
+                        &packed_words,
+                        &packed_offsets,
+                        &packed_exceptions,
+                        &mut out,
+                    )?;
+                }
+                Ok(())
+            })?
+        };
+        let mut times = Vec::new();
+        for iteration in 0..10 {
+            let _eviction = DeviceBuffer::<u8>::zeroed(&stream, 256 << 20)?;
+            start.record(&stream)?;
+            unsafe {
+                graph.launch()?;
+            }
+            end.record(&stream)?;
+            let ms = start.elapsed_ms(&end)?;
+            if iteration >= 3 {
+                times.push(ms);
+            }
+        }
+        let actual = out.to_host_vec(&stream)?;
+        assert_eq!(
+            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        let fallback: u64 = masks
+            .to_host_vec(&stream)?
+            .iter()
+            .map(|v| v.count_ones() as u64)
+            .sum();
+        assert!(fallback > 0 && fallback < (nr * nc) as u64);
+        println!(
+            "CERTIFIED_HEAD_PROFILE {}",
+            serde_json::json!({"rows":nr,"columns":nc,"stage":stage,"milliseconds":times,"fallback":fallback,"outputs":nr*nc,"model_root":model.root,"input_identities":identities,"device":context.device_name()?,"scope":"Unpaired operator screen on six captured input rows repeated to batch 32; complete includes dynamic input preparation, center, certification and exact fallback; phase timings are separate diagnostics."})
+        );
+    }
+    Ok(())
+}

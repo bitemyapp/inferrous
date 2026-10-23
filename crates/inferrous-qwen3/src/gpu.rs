@@ -1,5 +1,6 @@
 use crate::graph::Graph;
 mod batch;
+pub(crate) mod certified_head;
 #[cfg(test)]
 mod profile;
 use crate::{
