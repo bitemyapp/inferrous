@@ -627,6 +627,8 @@ impl BatchEngine {
                 } else {
                     self.forward(step, caches, pages_per_sequence)?;
                 }
+                #[cfg(test)]
+                tests::after_enqueue(&self.gpu.stream)?;
                 self.gpu.stream.synchronize()?;
                 for (slot, end) in ends {
                     sessions[slot].cache.commit_append(end)?;
@@ -1082,6 +1084,22 @@ mod tests {
     use crate::config::HardwareProfile;
     use anyhow::Context;
 
+    type AfterEnqueueHook = Box<dyn FnOnce(&Arc<CudaStream>) -> Result<()>>;
+    thread_local! {
+        // A one-shot, thread-local hook cannot affect another test's engine.
+        static AFTER_ENQUEUE: std::cell::RefCell<Option<AfterEnqueueHook>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn after_enqueue(stream: &Arc<CudaStream>) -> Result<()> {
+        let hook = AFTER_ENQUEUE.with(|slot| slot.borrow_mut().take());
+        match hook {
+            Some(hook) => hook(stream),
+            None => Ok(()),
+        }
+    }
+
     #[test]
     fn query_tiles_preserve_sequence_and_position_boundaries() -> Result<()> {
         assert_eq!(query_tiles(&[])?, Vec::<u32>::new());
@@ -1138,6 +1156,129 @@ mod tests {
         assert_eq!(actual.logit_sha256, expected.logit_sha256);
         assert_eq!(actual.finish_reason, expected.finish_reason);
         assert_eq!(actual.text, expected.text);
+    }
+
+    #[test]
+    fn queued_execution_failure_fences_and_preserves_session_ownership() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE")
+            .context("set CLEAN_MODEL_BUNDLE for failure-path validation")?;
+        let model = Model::load(Path::new(&bundle))?;
+        for graphs in [false, true] {
+            for panic in [false, true] {
+                let mut config = EngineConfig::for_hardware(test_hardware()?, 4096);
+                config.max_batch = 1;
+                config.kv_cache_bytes = 512 << 20;
+                config.prefix_cache_entries = 0;
+                config.cuda_graphs = graphs;
+                let engine = BatchEngine::new(&model, config)?;
+                let request = request(65, 29, 1);
+                let mut session = engine.session(&request.prompt_ids)?;
+                let option = SessionOptions {
+                    max_tokens: 1,
+                    stop_ids: vec![],
+                    cache: CacheMode::Reuse,
+                };
+                engine.generate_sessions(
+                    &model,
+                    std::slice::from_mut(&mut session),
+                    std::slice::from_ref(&option),
+                )?;
+                assert_eq!(session.cached_tokens(), 65);
+                let fork = session.fork()?;
+                assert_eq!(fork.cached_tokens(), 64);
+                let tokens = session.tokens().to_vec();
+                let completed = Arc::new(AtomicBool::new(false));
+                let event = Arc::new(Mutex::new(None));
+                let hook_completed = completed.clone();
+                let hook_event = event.clone();
+                AFTER_ENQUEUE.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some(Box::new(move |stream| {
+                        // Hold the stream busy after real model work. The
+                        // callback touches only host state, never CUDA APIs.
+                        stream.launch_host_function(move || {
+                            std::thread::sleep(Duration::from_millis(250));
+                            hook_completed.store(true, Ordering::SeqCst);
+                        })?;
+                        let marker = stream.record_event(None)?;
+                        assert!(!marker.query()?, "fault must follow queued work");
+                        *hook_event.lock().unwrap() = Some(marker);
+                        if panic {
+                            std::panic::panic_any("injected post-enqueue panic");
+                        }
+                        anyhow::bail!("injected post-enqueue error")
+                    }));
+                });
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    engine.generate_sessions(
+                        &model,
+                        std::slice::from_mut(&mut session),
+                        std::slice::from_ref(&option),
+                    )
+                }));
+                AFTER_ENQUEUE.with(|slot| assert!(slot.borrow().is_none()));
+                // These checks do not synchronize: the engine must have
+                // completed the queued callback/marker before returning.
+                assert!(completed.load(Ordering::SeqCst));
+                assert!(event.lock().unwrap().as_ref().unwrap().query()?);
+                assert!(engine.gpu.stream.query()?);
+                if panic {
+                    let payload = match outcome {
+                        Err(payload) => payload,
+                        Ok(_) => panic!("injected panic was not propagated"),
+                    };
+                    assert_eq!(
+                        payload.downcast_ref::<&str>(),
+                        Some(&"injected post-enqueue panic")
+                    );
+                    assert!(engine.execution.is_poisoned());
+                } else {
+                    let error = outcome
+                        .expect("error injection must not panic")
+                        .err()
+                        .expect("injected error was not propagated");
+                    assert_eq!(error.to_string(), "injected post-enqueue error");
+                    assert!(engine.execution.lock().unwrap().poisoned);
+                }
+                assert_eq!(session.cached_tokens(), 65);
+                assert_eq!(session.tokens(), tokens);
+                assert_eq!(fork.cached_tokens(), 64);
+                let execution = match engine.execution.lock() {
+                    Ok(execution) => execution,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                assert_eq!(execution.decode.as_ref().unwrap().graph.is_some(), graphs);
+                drop(execution);
+                let retry = engine
+                    .generate_sessions(
+                        &model,
+                        std::slice::from_mut(&mut session),
+                        std::slice::from_ref(&option),
+                    )
+                    .err()
+                    .expect("a failed engine must reject reuse");
+                assert_eq!(
+                    retry.to_string(),
+                    if panic {
+                        "batch execution mutex poisoned"
+                    } else {
+                        "batch engine failed previously; recreate it"
+                    }
+                );
+                drop(fork);
+                drop(session);
+                assert_eq!(engine.cache_usage().used_pages, 0);
+                assert_eq!(engine.cache_usage().references, 0);
+                eprintln!(
+                    "failure path graphs={graphs} panic={panic}: fenced, uncommitted, poisoned, released"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
