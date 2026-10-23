@@ -91,15 +91,16 @@ struct Prefix {
 }
 
 /// Partition packed rows without ever sharing a tile across sequence slots or
-/// nonconsecutive positions. Each pair is (first row, count), with count <= 4.
-fn query_tiles(info: &[u32]) -> Result<Vec<u32>> {
+/// nonconsecutive positions. Each pair is (first row, count), with count <= LIMIT.
+fn query_tiles<const LIMIT: usize>(info: &[u32]) -> Result<Vec<u32>> {
+    ensure!((1..=8).contains(&LIMIT), "invalid query tile limit");
     ensure!(info.len() % 2 == 0, "incomplete query row metadata");
     ensure!(info.len() / 2 <= 1024, "too many query rows");
     let mut tiles = Vec::new();
     let mut first = 0;
     while first < info.len() / 2 {
         let mut count = 1;
-        while count < 4 && first + count < info.len() / 2 {
+        while count < LIMIT && first + count < info.len() / 2 {
             let row = first + count;
             if info[row * 2] != info[first * 2]
                 || info[(row - 1) * 2 + 1].checked_add(1) != Some(info[row * 2 + 1])
@@ -125,6 +126,8 @@ struct Step {
     info: DeviceBuffer<u32>,
     query_tiles: DeviceBuffer<u32>,
     query_tile_count: usize,
+    value_tiles: DeviceBuffer<u32>,
+    value_tile_count: usize,
     table: DeviceBuffer<u32>,
     outputs: DeviceBuffer<u32>,
     stream: Arc<CudaStream>,
@@ -156,6 +159,8 @@ impl Step {
             info: DeviceBuffer::zeroed(stream, n * 2)?,
             query_tiles: DeviceBuffer::zeroed(stream, n * 2)?,
             query_tile_count: 0,
+            value_tiles: DeviceBuffer::zeroed(stream, n * 2)?,
+            value_tile_count: 0,
             table: DeviceBuffer::zeroed(stream, table_len)?,
             outputs: DeviceBuffer::zeroed(stream, output_rows.max(1))?,
             stream: stream.clone(),
@@ -607,11 +612,25 @@ impl BatchEngine {
                 step.input.copy_from_host(&self.gpu.stream, &input)?;
                 step.info.copy_from_host(&self.gpu.stream, &info)?;
                 step.query_tile_count = input.len();
+                step.value_tile_count = 0;
                 if self.config.tiled_attention && input.len() != output_slots.len() {
-                    let mut tiles = query_tiles(&info)?;
+                    let mut tiles = query_tiles::<4>(&info)?;
                     step.query_tile_count = tiles.len() / 2;
                     tiles.resize(input.len() * 2, 0);
                     step.query_tiles.copy_from_host(&self.gpu.stream, &tiles)?;
+                    // The isolated operator screen qualifies only these larger
+                    // row counts with completely occupied eight-row groups.
+                    // Decode remains excluded, so no graph launch count changes.
+                    if self.config.hardware == crate::config::HardwareProfile::RtxPro6000
+                        && matches!(input.len(), 128 | 256 | 512)
+                    {
+                        let mut values = query_tiles::<8>(&info)?;
+                        if values.chunks_exact(2).all(|tile| tile[1] == 8) {
+                            step.value_tile_count = values.len() / 2;
+                            values.resize(input.len() * 2, 0);
+                            step.value_tiles.copy_from_host(&self.gpu.stream, &values)?;
+                        }
+                    }
                 }
                 step.table.copy_from_host(&self.gpu.stream, &table)?;
                 if !output_rows.is_empty() {
@@ -843,7 +862,20 @@ impl BatchEngine {
                     &step.info,
                     stride as u32,
                 )?;
-                if tiled_attention {
+                if tiled_attention && step.value_tile_count > 0 {
+                    gpu.module.attention_values_tiled_pair(
+                        &gpu.stream,
+                        rows(step.value_tile_count * 32, 128),
+                        &w.scores,
+                        &cache.v,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        &step.value_tiles,
+                        &mut w.attention,
+                    )?;
+                } else if tiled_attention {
                     gpu.module.attention_values_tiled(
                         &gpu.stream,
                         rows(step.query_tile_count * 8 * 4, 128),
@@ -1118,9 +1150,9 @@ mod tests {
 
     #[test]
     fn query_tiles_preserve_sequence_and_position_boundaries() -> Result<()> {
-        assert_eq!(query_tiles(&[])?, Vec::<u32>::new());
-        assert!(query_tiles(&[0]).is_err());
-        assert!(query_tiles(&vec![0; 2050]).is_err());
+        assert_eq!(query_tiles::<4>(&[])?, Vec::<u32>::new());
+        assert!(query_tiles::<4>(&[0]).is_err());
+        assert!(query_tiles::<4>(&vec![0; 2050]).is_err());
         let info = [
             1,
             61,
@@ -1143,7 +1175,18 @@ mod tests {
             1,
             0,
         ];
-        assert_eq!(query_tiles(&info)?, [0, 4, 4, 1, 5, 2, 7, 1, 8, 1, 9, 1]);
+        assert_eq!(
+            query_tiles::<4>(&info)?,
+            [0, 4, 4, 1, 5, 2, 7, 1, 8, 1, 9, 1]
+        );
+        assert_eq!(query_tiles::<8>(&info)?, [0, 5, 5, 2, 7, 1, 8, 1, 9, 1]);
+        assert!(query_tiles::<0>(&[]).is_err());
+        assert!(query_tiles::<9>(&[]).is_err());
+        let full: Vec<u32> = (0..128).flat_map(|r| [r / 64, r % 64]).collect();
+        assert_eq!(
+            query_tiles::<8>(&full)?,
+            (0..128).step_by(8).flat_map(|r| [r, 8]).collect::<Vec<_>>()
+        );
         Ok(())
     }
 

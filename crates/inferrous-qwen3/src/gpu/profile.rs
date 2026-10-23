@@ -1023,3 +1023,120 @@ fn split_square_projection_shapes() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "isolated PV tile A/B/B/A operator comparison; run alone"]
+fn paired_pv_shapes() -> Result<()> {
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    let start = context.new_event(Some(0))?;
+    let end = context.new_event(Some(0))?;
+    let device = context.device_name()?;
+    let mut shapes = vec![(1_usize, 64_usize), (7, 512), (17, 4096), (33, 32768)];
+    for stride in [512_usize, 4096, 32768] {
+        for nr in [32_usize, 128, 256, 512] {
+            shapes.push((nr, stride));
+        }
+    }
+    for (nr, stride) in shapes {
+        let pages = stride / 64;
+        let table: Vec<u32> = (0..pages as u32).rev().collect();
+        let table = DeviceBuffer::from_host(&stream, &table)?;
+        let values: Vec<u16> = (0..stride * 1024)
+            .map(|i| (((((i * 37 + 11) % 127) as f32 - 63.0) / 64.0).to_bits() >> 16) as u16)
+            .collect();
+        let v = DeviceBuffer::from_host(&stream, &values)?;
+        let info: Vec<u32> = (0..nr)
+            .flat_map(|row| [0, (stride - nr + row) as u32])
+            .collect();
+        let info = DeviceBuffer::from_host(&stream, &info)?;
+        let mut probabilities = vec![f32::NAN; nr * 32 * stride];
+        for row in 0..nr {
+            let visible = stride - nr + row + 1;
+            for head in 0..32 {
+                for key in 0..visible {
+                    probabilities[(row * 32 + head) * stride + key] =
+                        ((key * 17 + head * 13 + row * 7) % 127 + 1) as f32
+                            / (visible * 127) as f32;
+                }
+            }
+        }
+        let scores = DeviceBuffer::from_host(&stream, &probabilities)?;
+        drop(probabilities);
+        let mut expected = None;
+        for (arm, group) in [4_usize, 8, 8, 4].into_iter().enumerate() {
+            let groups: Vec<u32> = (0..nr)
+                .step_by(group)
+                .flat_map(|first| [first as u32, (nr - first).min(group) as u32])
+                .collect();
+            let count = groups.len() / 2;
+            let groups = DeviceBuffer::from_host(&stream, &groups)?;
+            let sentinel = -12345.25_f32;
+            let mut out = DeviceBuffer::from_host(&stream, &vec![sentinel; nr * 4096 + 64])?;
+            let graph = unsafe {
+                Graph::capture(&stream, false, || {
+                    match group {
+                        4 => module.attention_values_tiled(
+                            &stream,
+                            rows(count * 32, 128),
+                            &scores,
+                            &v,
+                            &info,
+                            &table,
+                            pages as u32,
+                            stride as u32,
+                            &groups,
+                            &mut out,
+                        )?,
+                        8 => module.attention_values_tiled_pair(
+                            &stream,
+                            rows(count * 32, 128),
+                            &scores,
+                            &v,
+                            &info,
+                            &table,
+                            pages as u32,
+                            stride as u32,
+                            &groups,
+                            &mut out,
+                        )?,
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                })?
+            };
+            let mut times = Vec::new();
+            for repetition in 0..10 {
+                let _eviction = DeviceBuffer::<u8>::zeroed(&stream, 256 << 20)?;
+                start.record(&stream)?;
+                unsafe {
+                    graph.launch()?;
+                }
+                end.record(&stream)?;
+                let ms = start.elapsed_ms(&end)?;
+                if repetition >= 3 {
+                    times.push(ms);
+                }
+            }
+            let actual = out.to_host_vec(&stream)?;
+            assert!(
+                actual[nr * 4096..]
+                    .iter()
+                    .all(|v| v.to_bits() == sentinel.to_bits())
+            );
+            let bits: Vec<u32> = actual[..nr * 4096].iter().map(|v| v.to_bits()).collect();
+            if let Some(expected) = &expected {
+                assert_eq!(&bits, expected);
+            } else {
+                expected = Some(bits);
+            }
+            println!(
+                "PAIRED_PV_PROFILE {}",
+                serde_json::json!({"rows":nr,"stride":stride,"group":group,"arm":arm,
+                "milliseconds":times,"device":device,"scope":"PV-only A/B/B/A event screen; every output and tail guard checked, no model gain."})
+            );
+        }
+    }
+    Ok(())
+}

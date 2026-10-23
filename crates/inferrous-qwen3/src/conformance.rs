@@ -2146,3 +2146,181 @@ fn split_square_projection_reference() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn paired_pv_independent_reference() -> anyhow::Result<()> {
+    use crate::graph::Graph;
+    fn tiles(info: &[u32], limit: usize) -> Vec<u32> {
+        let mut result = Vec::new();
+        let mut first = 0;
+        while first < info.len() / 2 {
+            let mut count = 1;
+            while count < limit
+                && first + count < info.len() / 2
+                && info[(first + count) * 2] == info[first * 2]
+                && info[(first + count) * 2 + 1] == info[(first + count - 1) * 2 + 1] + 1
+            {
+                count += 1;
+            }
+            result.extend([first as u32, count as u32]);
+            first += count;
+        }
+        result
+    }
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    let stride = 512_usize;
+    let pages = stride / 64;
+    let table: Vec<u32> = (0..pages * 2)
+        .map(|i| ((i * 5 + 3) % (pages * 2)) as u32)
+        .collect();
+    let values: Vec<u16> = (0..pages * 2 * 65536)
+        .map(|i| {
+            let bits = (((120 + (i * 7 + i / 1024) % 13) as u32) << 23)
+                | (((i * 19 % 128) as u32) << 16)
+                | (((i % 3 == 0) as u32) << 31);
+            (bits >> 16) as u16
+        })
+        .collect();
+    let v = DeviceBuffer::from_host(&stream, &values)?;
+    let page_table = DeviceBuffer::from_host(&stream, &table)?;
+    for nr in (1_usize..=17).chain([31, 32, 33]) {
+        let info: Vec<u32> = (0..nr)
+            .flat_map(|row| {
+                let slot = row / 17;
+                let position = if nr == 1 {
+                    0
+                } else if row + 1 == nr {
+                    511
+                } else {
+                    57 + slot * 64 + row % 17
+                };
+                [slot as u32, position as u32]
+            })
+            .collect();
+        for pattern in ["uniform", "mixed"] {
+            let mut probabilities = vec![f32::NAN; nr * 32 * stride];
+            for row in 0..nr {
+                let end = info[row * 2 + 1] as usize + 1;
+                for head in 0..32 {
+                    for key in 0..end {
+                        probabilities[(row * 32 + head) * stride + key] = if pattern == "uniform" {
+                            1.0 / end as f32
+                        } else {
+                            ((key * 17 + head * 13 + row * 7) % 127 + 1) as f32 / (end * 127) as f32
+                        };
+                    }
+                }
+            }
+            let mut expected = vec![0.0_f32; nr * 4096];
+            for row in 0..nr {
+                let slot = info[row * 2] as usize;
+                let end = info[row * 2 + 1] as usize + 1;
+                for head in 0..32 {
+                    for col in 0..128 {
+                        let mut sum = 0.0_f32;
+                        for key in 0..end {
+                            let page = table[slot * pages + key / 64] as usize;
+                            let value = f32::from_bits(
+                                (values[page * 65536 + key % 64 * 1024 + head / 4 * 128 + col]
+                                    as u32)
+                                    << 16,
+                            );
+                            let term = probabilities[(row * 32 + head) * stride + key] * value;
+                            sum += term;
+                        }
+                        let bits = sum.to_bits();
+                        expected[row * 4096 + head * 128 + col] = f32::from_bits(
+                            bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000,
+                        );
+                    }
+                }
+            }
+            let scores = DeviceBuffer::from_host(&stream, &probabilities)?;
+            let metadata = DeviceBuffer::from_host(&stream, &info)?;
+            let mut baseline = DeviceBuffer::<f32>::zeroed(&stream, nr * 4096)?;
+            unsafe {
+                module.attention_values_paged(
+                    &stream,
+                    rows(nr * 32 * 4, 32),
+                    &scores,
+                    &v,
+                    &metadata,
+                    &page_table,
+                    pages as u32,
+                    stride as u32,
+                    &mut baseline,
+                )?;
+            }
+            assert_eq!(
+                baseline
+                    .to_host_vec(&stream)?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            for group in [8_usize] {
+                let groups = tiles(&info, group);
+                assert_eq!(
+                    groups.chunks_exact(2).map(|p| p[1] as usize).sum::<usize>(),
+                    nr
+                );
+                let count = groups.len() / 2;
+                let groups = DeviceBuffer::from_host(&stream, &groups)?;
+                for graph in [false, true] {
+                    let sentinel = -12345.25_f32;
+                    let mut out =
+                        DeviceBuffer::from_host(&stream, &vec![sentinel; nr * 4096 + 64])?;
+                    let mut launch = || -> anyhow::Result<()> {
+                        unsafe {
+                            module.attention_values_tiled_pair(
+                                &stream,
+                                rows(count * 32, 128),
+                                &scores,
+                                &v,
+                                &metadata,
+                                &page_table,
+                                pages as u32,
+                                stride as u32,
+                                &groups,
+                                &mut out,
+                            )?;
+                        }
+                        Ok(())
+                    };
+                    if graph {
+                        let capture = unsafe { Graph::capture(&stream, false, launch)? };
+                        unsafe {
+                            capture.launch()?;
+                        }
+                        stream.synchronize()?;
+                    } else {
+                        launch()?;
+                    }
+                    let actual = out.to_host_vec(&stream)?;
+                    assert_eq!(
+                        actual[..nr * 4096]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        actual[nr * 4096..]
+                            .iter()
+                            .all(|v| v.to_bits() == sentinel.to_bits())
+                    );
+                    println!(
+                        "PAIRED_PV_REFERENCE {}",
+                        serde_json::json!({
+                        "rows":nr,"stride":stride,"pattern":pattern,"group":group,"graph":graph,"tiles":count,
+                        "outputs":nr*4096,"reference":"Independent CPU ordered FP32 products/additions and explicit BF16 rounding; paged GPU control also exact."})
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}

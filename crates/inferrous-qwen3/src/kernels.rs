@@ -4734,6 +4734,192 @@ pub mod device {
         }
     }
 
+    #[inline(always)]
+    unsafe fn stage_values_tiled_pair(
+        tile: *mut u32,
+        probability: *mut f32,
+        scores: &[f32],
+        v: &[u16],
+        row_info: &[u32],
+        first_row: usize,
+        row_count: usize,
+        stride: usize,
+        page: usize,
+        kv: usize,
+        column: usize,
+        t: usize,
+        base: usize,
+    ) {
+        let slot = base / 64 % 2;
+        unsafe {
+            // Each of 128 threads stages two 16-byte V vectors.
+            let mut value_piece = 0;
+            while value_piece < 2 {
+                let i = t * 8 + value_piece * 1024;
+                cuda_device::async_copy::cp_async_ca_16(
+                    tile.add(slot * 1024 + i / 2),
+                    v.as_ptr()
+                        .add(page * 65536 + i / 32 * 1024 + kv * 128 + column + i % 32)
+                        .cast::<u32>(),
+                );
+                value_piece += 1;
+            }
+            // Every thread stages four aligned probability vectors. Padded
+            // members use the final valid row, but never publish an output.
+            let mut piece = 0;
+            while piece < 4 {
+                let i = t * 4 + piece * 512;
+                let head = i / 64;
+                let row = first_row + (head / 4).min(row_count - 1);
+                let end = row_info[row * 2 + 1] as usize + 1;
+                let token = base + i % 64;
+                let bytes = end.saturating_sub(token).min(4) * 4;
+                let source = if bytes == 0 {
+                    0
+                } else {
+                    (row * 32 + kv * 4 + head % 4) * stride + token
+                };
+                cuda_device::async_copy::cp_async_ca_zfill_16(
+                    probability.add(slot * 2048 + i).cast::<u32>(),
+                    scores.as_ptr().add(source).cast::<u8>(),
+                    bytes as u32,
+                );
+                piece += 1;
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+        }
+    }
+
+    /// Operator-only eight-row PV tile: each warp accumulates two adjacent rows.
+    /// Both rows keep separate products/additions in ascending key order.
+    #[kernel]
+    pub fn attention_values_tiled_pair(
+        scores: &[f32],
+        v: &[u16],
+        row_info: &[u32],
+        page_table: &[u32],
+        pages_per_sequence: u32,
+        stride: u32,
+        query_tiles: &[u32],
+        mut out: DisjointSlice<f32>,
+    ) {
+        dependency_wait();
+        static mut TILE: SharedArray<u32, 2048, 16> = SharedArray::UNINIT;
+        static mut PROB: SharedArray<f32, 4096, 16> = SharedArray::UNINIT;
+        let block = thread::blockIdx_x() as usize;
+        let tile_index = block / 32;
+        let first_row = query_tiles[tile_index * 2] as usize;
+        let count = query_tiles[tile_index * 2 + 1] as usize;
+        let kv = block / 4 % 8;
+        let column = block % 4 * 32;
+        let t = thread::threadIdx_x() as usize;
+        let member = t / 32 * 2;
+        let lane = t % 32;
+        let row = first_row + member.min(count - 1);
+        let second_row = first_row + (member + 1).min(count - 1);
+        let slot = row_info[first_row * 2] as usize;
+        let end = row_info[row * 2 + 1] as usize + 1;
+        let second_end = row_info[second_row * 2 + 1] as usize + 1;
+        let max_end = row_info[(first_row + count - 1) * 2 + 1] as usize + 1;
+        let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+        let halves = tile.cast::<u16>();
+        let probability = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PROB) };
+        unsafe {
+            stage_values_tiled_pair(
+                tile,
+                probability,
+                scores,
+                v,
+                row_info,
+                first_row,
+                count,
+                stride as usize,
+                page_table[slot * pages_per_sequence as usize] as usize,
+                kv,
+                column,
+                t,
+                0,
+            );
+        }
+        let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
+        let (mut r0, mut r1, mut r2, mut r3) = (0.0, 0.0, 0.0, 0.0);
+        let mut base = 0;
+        while base < max_end {
+            unsafe {
+                cuda_device::async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            if base + 64 < max_end {
+                let page = page_table[slot * pages_per_sequence as usize + base / 64 + 1] as usize;
+                unsafe {
+                    stage_values_tiled_pair(
+                        tile,
+                        probability,
+                        scores,
+                        v,
+                        row_info,
+                        first_row,
+                        count,
+                        stride as usize,
+                        page,
+                        kv,
+                        column,
+                        t,
+                        base + 64,
+                    );
+                }
+            }
+            let shared_slot = base / 64 % 2;
+            let probs = unsafe { probability.add(shared_slot * 2048 + member * 256) };
+            let mut j = 0;
+            let key_count = end.saturating_sub(base).min(64);
+            let second_key_count = second_end.saturating_sub(base).min(64);
+            #[unroll(8)]
+            while j < key_count {
+                let value = widen(unsafe { *halves.add(shared_slot * 2048 + j * 32 + lane) });
+                s0 = add(s0, mul(unsafe { *probs.add(j) }, value));
+                s1 = add(s1, mul(unsafe { *probs.add(64 + j) }, value));
+                s2 = add(s2, mul(unsafe { *probs.add(128 + j) }, value));
+                s3 = add(s3, mul(unsafe { *probs.add(192 + j) }, value));
+                r0 = add(r0, mul(unsafe { *probs.add(256 + j) }, value));
+                r1 = add(r1, mul(unsafe { *probs.add(320 + j) }, value));
+                r2 = add(r2, mul(unsafe { *probs.add(384 + j) }, value));
+                r3 = add(r3, mul(unsafe { *probs.add(448 + j) }, value));
+                j += 1;
+            }
+            // Consecutive rows differ by at most one key. Padded rows are equal.
+            // Do not add zero-valued tail terms to either accumulation.
+            while j < second_key_count {
+                let value = widen(unsafe { *halves.add(shared_slot * 2048 + j * 32 + lane) });
+                r0 = add(r0, mul(unsafe { *probs.add(256 + j) }, value));
+                r1 = add(r1, mul(unsafe { *probs.add(320 + j) }, value));
+                r2 = add(r2, mul(unsafe { *probs.add(384 + j) }, value));
+                r3 = add(r3, mul(unsafe { *probs.add(448 + j) }, value));
+                j += 1;
+            }
+            thread::sync_threads();
+            base += 64;
+        }
+        if member < count {
+            let offset = (row * 32 + kv * 4) * 128 + column + lane;
+            unsafe {
+                *out.get_unchecked_mut(offset) = bf(s0);
+                *out.get_unchecked_mut(offset + 128) = bf(s1);
+                *out.get_unchecked_mut(offset + 256) = bf(s2);
+                *out.get_unchecked_mut(offset + 384) = bf(s3);
+            }
+        }
+        if member + 1 < count {
+            let offset = (second_row * 32 + kv * 4) * 128 + column + lane;
+            unsafe {
+                *out.get_unchecked_mut(offset) = bf(r0);
+                *out.get_unchecked_mut(offset + 128) = bf(r1);
+                *out.get_unchecked_mut(offset + 256) = bf(r2);
+                *out.get_unchecked_mut(offset + 384) = bf(r3);
+            }
+        }
+    }
+
     /// Four independent ordered PV sums reuse a single staged value tile.
     #[kernel]
     pub fn attention_values_grouped(
