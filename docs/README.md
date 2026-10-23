@@ -17,6 +17,7 @@
 - [Certified-head model pilot](qwen3-8b-w8a8/results/pro6000-certified-head.md): retained PRO thirty-two-output dispatch, paired latency results, original-logit checks, 64 GiB capacity, startup/storage costs, integrated sanitizers and broader shape/grouped-bound screens.
 - [RTX PRO 6000 cache-mode pilots](qwen3-8b-w8a8/results/pro6000-cache-mode-pilots.md): completed stock prefix/recomputation screens, matching local medians and pilot limitations.
 - [RTX PRO 6000 stock native-capacity checks](qwen3-8b-w8a8/results/pro6000-stock-native-capacity.md): all eight planned stock configurations complete the 64 GiB KV/native-context probes; separate from final timing and numerical acceptance.
+- [Fixed paged policy qualification](qwen3-8b-w8a8/results/pro6000-fixed-policy-qualification.md): isolated current-head candidate passes release/checked native tests, full-model memcheck and exhaustive changed-family racecheck partitions; production and the original numerical gate remain unchanged.
 - [RTX PRO 6000 segmented-attention operators](qwen3-8b-w8a8/results/pro6000-segmented-attention.md): independent-reference and sanitizer checks, complete shape timings and the short-context gap.
 - [RTX PRO 6000 128-row projections](qwen3-8b-w8a8/results/pro6000-m128-projections.md): complete correctness/sanitizer checks and the rejected operator screen.
 - [RTX 5090 Nix validation](qwen3-8b-w8a8/results/rtx5090-nix.md): local release/checked test results, benchmark timings and exact-output comparisons.
