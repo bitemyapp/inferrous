@@ -944,6 +944,46 @@ unsafe fn stage_projection_tile<const NARROW: bool>(
     }
 }
 
+#[inline(always)]
+unsafe fn stage_square_projection_tile(
+    a_shared: *mut u32,
+    b_shared: *mut u32,
+    q: &[i8],
+    w: &[i8],
+    nr: usize,
+    n: usize,
+    k: usize,
+    row: usize,
+    col: usize,
+    t: usize,
+    base: usize,
+) {
+    // Each of 128 threads owns two 16-byte fragments of each 32x128 tile.
+    // The 36-word shared row pitch preserves ldmatrix alignment and bank layout.
+    unsafe {
+        let mut piece = 0;
+        while piece < 2 {
+            let i = t + piece * 128;
+            let r = row + i / 8;
+            let a_offset = if r < nr { r * k + base + i % 8 * 16 } else { 0 };
+            cuda_device::async_copy::cp_async_ca_zfill_16(
+                a_shared.add(i / 8 * 36 + i % 8 * 4),
+                q.as_ptr().add(a_offset).cast::<u8>(),
+                if r < nr { 16 } else { 0 },
+            );
+            let c = col + i / 8;
+            let b_offset = if c < n { c * k + base + i % 8 * 16 } else { 0 };
+            cuda_device::async_copy::cp_async_ca_zfill_16(
+                b_shared.add(i / 8 * 36 + i % 8 * 4),
+                w.as_ptr().add(b_offset).cast::<u8>(),
+                if c < n { 16 } else { 0 },
+            );
+            piece += 1;
+        }
+        cuda_device::async_copy::cp_async_commit_group();
+    }
+}
+
 #[cuda_module]
 pub mod device {
     use super::*;
@@ -2454,6 +2494,260 @@ pub mod device {
                 }
             }
             i += 1;
+        }
+    }
+    /// Experimental 32x32 integer tile: four warps own 16x16 fragments.
+    #[kernel]
+    pub fn linear_square_pipeline(
+        q: &[i8],
+        asc: &[f32],
+        w: &[i8],
+        ws: &[f32],
+        width: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        static mut A: SharedArray<u32, 2304, 16> = SharedArray::UNINIT;
+        static mut B: SharedArray<u32, 2304, 16> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let lane = t % 32;
+        let warp_id = t / 32;
+        let tiles_n = ws.len().div_ceil(32);
+        let tile = thread::blockIdx_x() as usize;
+        let row = tile / tiles_n * 32;
+        let col = tile % tiles_n * 32;
+        let wr = warp_id / 2 * 16;
+        let wc = warp_id % 2 * 16;
+        let group = lane / 4;
+        let part = lane % 4;
+        let k = width as usize;
+        let a_shared = unsafe { SharedArray::as_raw_mut_ptr(&raw mut A) };
+        let b_shared = unsafe { SharedArray::as_raw_mut_ptr(&raw mut B) };
+        let mut c0 = [0_i32; 4];
+        let mut c1 = [0_i32; 4];
+        unsafe {
+            stage_square_projection_tile(
+                a_shared,
+                b_shared,
+                q,
+                w,
+                asc.len(),
+                ws.len(),
+                k,
+                row,
+                col,
+                t,
+                0,
+            );
+        }
+        let mut base = 0;
+        while base < k {
+            unsafe {
+                cuda_device::async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            let slot = base / 128 % 2;
+            if base + 128 < k {
+                unsafe {
+                    stage_square_projection_tile(
+                        a_shared.add((1 - slot) * 1152),
+                        b_shared.add((1 - slot) * 1152),
+                        q,
+                        w,
+                        asc.len(),
+                        ws.len(),
+                        k,
+                        row,
+                        col,
+                        t,
+                        base + 128,
+                    );
+                }
+            }
+            let a_tile = unsafe { a_shared.add(slot * 1152) };
+            let b_tile = unsafe { b_shared.add(slot * 1152) };
+            let mut j = 0;
+            while j < 32 {
+                unsafe {
+                    // Each lane supplies an aligned row of one of four 8x8
+                    // b16 matrices. Their bytes are the same INT8 MMA fragments.
+                    let a = cuda_device::wmma::ldmatrix_x4(
+                        a_tile.add((wr + lane % 16) * 36 + j + lane / 16 * 4),
+                    );
+                    let b = cuda_device::wmma::ldmatrix_x4(
+                        b_tile.add((wc + lane / 16 * 8 + lane % 8) * 36 + j + lane / 8 % 2 * 4),
+                    );
+                    let b0 = [b[0], b[1]];
+                    let b1 = [b[2], b[3]];
+                    c0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c0, a, b0);
+                    c1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c1, a, b1);
+                }
+                j += 8;
+            }
+            // No thread may overwrite staging before the last warp consumes it.
+            thread::sync_threads();
+            base += 128;
+        }
+        let mut i = 0;
+        while i < 4 {
+            let r = row + wr + group + i / 2 * 8;
+            let c = col + wc + part * 2 + i % 2;
+            if r < asc.len() {
+                unsafe {
+                    if c < ws.len() {
+                        *out.get_unchecked_mut(r * ws.len() + c) =
+                            bf(mul(mul(c0[i] as f32, asc[r]), ws[c]));
+                    }
+                    if c + 8 < ws.len() {
+                        *out.get_unchecked_mut(r * ws.len() + c + 8) =
+                            bf(mul(mul(c1[i] as f32, asc[r]), ws[c + 8]));
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    #[kernel]
+    pub fn linear_square_partials(
+        q: &[i8],
+        asc: &[f32],
+        w: &[i8],
+        ws: &[f32],
+        width: u32,
+        partitions: u32,
+        mut out: DisjointSlice<i32>,
+    ) {
+        static mut A: SharedArray<u32, 2304, 16> = SharedArray::UNINIT;
+        static mut B: SharedArray<u32, 2304, 16> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let lane = t % 32;
+        let warp_id = t / 32;
+        let tiles_n = ws.len().div_ceil(32);
+        let tiles = asc.len().div_ceil(32) * tiles_n;
+        let partition = thread::blockIdx_x() as usize / tiles;
+        let tile = thread::blockIdx_x() as usize % tiles;
+        let span = (width as usize).div_ceil(128).div_ceil(partitions as usize) * 128;
+        let begin = partition * span;
+        let end = (begin + span).min(width as usize);
+        let row = tile / tiles_n * 32;
+        let col = tile % tiles_n * 32;
+        let wr = warp_id / 2 * 16;
+        let wc = warp_id % 2 * 16;
+        let group = lane / 4;
+        let part = lane % 4;
+        let k = width as usize;
+        let a_shared = unsafe { SharedArray::as_raw_mut_ptr(&raw mut A) };
+        let b_shared = unsafe { SharedArray::as_raw_mut_ptr(&raw mut B) };
+        let mut c0 = [0_i32; 4];
+        let mut c1 = [0_i32; 4];
+        if begin < end {
+            unsafe {
+                stage_square_projection_tile(
+                    a_shared,
+                    b_shared,
+                    q,
+                    w,
+                    asc.len(),
+                    ws.len(),
+                    k,
+                    row,
+                    col,
+                    t,
+                    begin,
+                );
+            }
+        }
+        let mut base = begin;
+        while base < end {
+            unsafe {
+                cuda_device::async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            let slot = (base - begin) / 128 % 2;
+            if base + 128 < end {
+                unsafe {
+                    stage_square_projection_tile(
+                        a_shared.add((1 - slot) * 1152),
+                        b_shared.add((1 - slot) * 1152),
+                        q,
+                        w,
+                        asc.len(),
+                        ws.len(),
+                        k,
+                        row,
+                        col,
+                        t,
+                        base + 128,
+                    );
+                }
+            }
+            let a_tile = unsafe { a_shared.add(slot * 1152) };
+            let b_tile = unsafe { b_shared.add(slot * 1152) };
+            let mut j = 0;
+            while j < 32 {
+                unsafe {
+                    // Each lane supplies an aligned row of one of four 8x8
+                    // b16 matrices. Their bytes are the same INT8 MMA fragments.
+                    let a = cuda_device::wmma::ldmatrix_x4(
+                        a_tile.add((wr + lane % 16) * 36 + j + lane / 16 * 4),
+                    );
+                    let b = cuda_device::wmma::ldmatrix_x4(
+                        b_tile.add((wc + lane / 16 * 8 + lane % 8) * 36 + j + lane / 8 % 2 * 4),
+                    );
+                    let b0 = [b[0], b[1]];
+                    let b1 = [b[2], b[3]];
+                    c0 = cuda_device::wmma::mma_m16n8k32_s32_s8(c0, a, b0);
+                    c1 = cuda_device::wmma::mma_m16n8k32_s32_s8(c1, a, b1);
+                }
+                j += 8;
+            }
+            // No thread may overwrite staging before the last warp consumes it.
+            thread::sync_threads();
+            base += 128;
+        }
+        let mut i = 0;
+        while i < 4 {
+            let r = row + wr + group + i / 2 * 8;
+            let c = col + wc + part * 2 + i % 2;
+            if r < asc.len() {
+                unsafe {
+                    if c < ws.len() {
+                        *out.get_unchecked_mut((partition * asc.len() + r) * ws.len() + c) = c0[i];
+                    }
+                    if c + 8 < ws.len() {
+                        *out.get_unchecked_mut((partition * asc.len() + r) * ws.len() + c + 8) =
+                            c1[i];
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    /// Exact INT32 partial reduction, then the original ordered FP32 epilogue.
+    #[kernel]
+    pub fn linear_square_reduce(
+        partial: &[i32],
+        asc: &[f32],
+        ws: &[f32],
+        partitions: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d().get();
+        let size = asc.len() * ws.len();
+        if index >= size {
+            return;
+        }
+        let mut total = 0_i32;
+        let mut part = 0;
+        // Model widths bound the sum of absolute INT8 products below i32::MAX.
+        while part < partitions as usize {
+            total += partial[part * size + index];
+            part += 1;
+        }
+        unsafe {
+            *out.get_unchecked_mut(index) = bf(mul(
+                mul(total as f32, asc[index / ws.len()]),
+                ws[index % ws.len()],
+            ));
         }
     }
     /// Double-buffered 16x32 tile gives small row batches more independent CTAs.

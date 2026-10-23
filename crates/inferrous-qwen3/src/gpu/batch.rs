@@ -120,6 +120,7 @@ struct Step {
     shape: (usize, usize, usize),
     w: Workspace,
     certificate: Option<CertificateWorkspace>,
+    projection_partials: Option<DeviceBuffer<i32>>,
     input: DeviceBuffer<u32>,
     info: DeviceBuffer<u32>,
     query_tiles: DeviceBuffer<u32>,
@@ -134,10 +135,16 @@ impl Step {
         shape: (usize, usize, usize),
         table_len: usize,
         certified: bool,
+        split_projection: bool,
     ) -> Result<Self> {
         let (n, output_rows, stride) = shape;
         Ok(Self {
             graph: None,
+            projection_partials: if split_projection && n == 32 {
+                Some(DeviceBuffer::zeroed(stream, 4 * 32 * 4096)?)
+            } else {
+                None
+            },
             shape,
             certificate: if certified && output_rows == 32 {
                 Some(CertificateWorkspace::new(stream)?)
@@ -592,6 +599,8 @@ impl BatchEngine {
                         shape,
                         table.len(),
                         self.certified_head.is_some(),
+                        self.config.tuned_projections
+                            && self.config.hardware == crate::config::HardwareProfile::RtxPro6000,
                     )?);
                 }
                 let step = storage.as_mut().expect("allocated above");
@@ -750,6 +759,7 @@ impl BatchEngine {
                 &mut w.q,
                 w.map4.as_ref(),
                 policy,
+                step.projection_partials.as_mut(),
             )?;
             gpu.linear_quantized(
                 &w.quant4,
@@ -758,6 +768,7 @@ impl BatchEngine {
                 &mut w.k,
                 w.map4.as_ref(),
                 policy,
+                step.projection_partials.as_mut(),
             )?;
             gpu.linear_quantized(
                 &w.quant4,
@@ -766,6 +777,7 @@ impl BatchEngine {
                 &mut w.v,
                 w.map4.as_ref(),
                 policy,
+                step.projection_partials.as_mut(),
             )?;
             unsafe {
                 gpu.module.prepare_qk_paged(
@@ -882,6 +894,7 @@ impl BatchEngine {
                 w.map4.as_ref(),
                 false,
                 policy,
+                step.projection_partials.as_mut(),
             )?;
             gpu.norm_quantize(
                 &w.residual,
@@ -920,6 +933,7 @@ impl BatchEngine {
                     &mut w.gate,
                     w.map4.as_ref(),
                     policy,
+                    step.projection_partials.as_mut(),
                 )?;
                 gpu.linear_quantized(
                     &w.quant4,
@@ -928,6 +942,7 @@ impl BatchEngine {
                     &mut w.up,
                     w.map4.as_ref(),
                     policy,
+                    step.projection_partials.as_mut(),
                 )?;
                 unsafe {
                     gpu.module.swiglu(
@@ -952,6 +967,7 @@ impl BatchEngine {
                 w.map12.as_ref(),
                 false,
                 policy,
+                step.projection_partials.as_mut(),
             )?;
         }
         if outputs > 0 {

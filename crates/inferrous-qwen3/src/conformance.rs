@@ -1882,3 +1882,267 @@ fn certified_head_captured_profile() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn square_projection_reference() -> anyhow::Result<()> {
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    let mut cases: Vec<_> = [
+        1_usize, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+    ]
+    .into_iter()
+    .map(|nr| {
+        (
+            nr,
+            if nr % 2 == 0 { 257 } else { 129 },
+            if nr <= 32 { 128 } else { 384 },
+            "mixed",
+        )
+    })
+    .collect();
+    cases.extend([
+        (1, 129, 12288, "maximum"),
+        (17, 129, 12288, "minimum"),
+        (5, 1024, 4096, "mixed"),
+    ]);
+    for (nr, n, k, pattern) in cases {
+        let input: Vec<i8> = (0..nr * k)
+            .map(|i| match pattern {
+                "maximum" => 127,
+                "minimum" => -128,
+                _ => {
+                    (((i as u32).wrapping_mul(1664525).wrapping_add(1013904223) >> 16) as u8) as i8
+                }
+            })
+            .collect();
+        let weight: Vec<i8> = (0..n * k)
+            .map(|i| {
+                if pattern == "mixed" {
+                    (((i as u32).wrapping_mul(22695477).wrapping_add(91) >> 13) as u8) as i8
+                } else {
+                    127
+                }
+            })
+            .collect();
+        let asc: Vec<f32> = (0..nr).map(|r| 0.00013 * (r % 7 + 1) as f32).collect();
+        let ws: Vec<f32> = (0..n).map(|c| 0.00017 * (c % 13 + 1) as f32).collect();
+        let sentinel = -12345.25_f32;
+        let mut expected = vec![sentinel.to_bits(); nr * n + 64];
+        // Independent signed 64-bit host dot products, then the declared two
+        // FP32 scales and finite BF16 round-to-nearest/ties-to-even conversion.
+        // Even the maximum supported dot magnitude is below signed i32 range.
+        for r in 0..nr {
+            for c in 0..n {
+                let mut dot = 0_i64;
+                for j in 0..k {
+                    dot += input[r * k + j] as i64 * weight[c * k + j] as i64;
+                }
+                assert!(dot >= i32::MIN as i64 && dot <= i32::MAX as i64);
+                let x = (dot as f32 * asc[r]) * ws[c];
+                assert!(x.is_finite());
+                let bits = x.to_bits();
+                expected[r * n + c] = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000;
+            }
+        }
+        let q = DeviceBuffer::from_host(&stream, &input)?;
+        let w = DeviceBuffer::from_host(&stream, &weight)?;
+        let a = DeviceBuffer::from_host(&stream, &asc)?;
+        let b = DeviceBuffer::from_host(&stream, &ws)?;
+        let mut output = DeviceBuffer::from_host(&stream, &vec![sentinel; nr * n + 64])?;
+        for variant in 0..1 {
+            for graph in [false, true] {
+                output.copy_from_host(&stream, &vec![sentinel; nr * n + 64])?;
+                // SAFETY: K is a positive multiple of 128, tail copies zero-fill
+                // invalid rows/columns, and each of 128 threads owns its fragments.
+                // Output guards preserve trailing sentinels; captured buffers outlive graphs.
+                let mut launch = || -> anyhow::Result<()> {
+                    unsafe {
+                        module.linear_square_pipeline(
+                            &stream,
+                            rows(nr.div_ceil(32) * n.div_ceil(32), 128),
+                            &q,
+                            &a,
+                            &w,
+                            &b,
+                            k as u32,
+                            &mut output,
+                        )?;
+                        Ok(())
+                    }
+                };
+                if graph {
+                    let capture = unsafe { crate::graph::Graph::capture(&stream, false, launch)? };
+                    unsafe {
+                        capture.launch()?;
+                    }
+                    stream.synchronize()?;
+                } else {
+                    launch()?;
+                }
+                let actual: Vec<u32> = output
+                    .to_host_vec(&stream)?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "square projection {nr}x{n}x{k}/{pattern}/variant={variant}/graph={graph}"
+                );
+                println!(
+                    "SQUARE_PROJECTION_REFERENCE {}",
+                    serde_json::json!({"rows":nr,"n":n,"k":k,"pattern":pattern,"variant":variant,"graph":graph})
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn split_square_projection_reference() -> anyhow::Result<()> {
+    let context = CudaContext::new(0)?;
+    let stream = context.new_stream()?;
+    let module = device::load(&context)?;
+    let mut cases: Vec<_> = [
+        1_usize, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+    ]
+    .into_iter()
+    .map(|nr| {
+        (
+            nr,
+            if nr % 2 == 0 { 257 } else { 129 },
+            if nr <= 32 { 128 } else { 384 },
+            "mixed",
+        )
+    })
+    .collect();
+    cases.extend([
+        (1, 129, 12288, "maximum"),
+        (17, 129, 12288, "minimum"),
+        (5, 1024, 4096, "mixed"),
+    ]);
+    for (nr, n, k, pattern) in cases {
+        let input: Vec<i8> = (0..nr * k)
+            .map(|i| match pattern {
+                "maximum" => 127,
+                "minimum" => -128,
+                _ => {
+                    (((i as u32).wrapping_mul(1664525).wrapping_add(1013904223) >> 16) as u8) as i8
+                }
+            })
+            .collect();
+        let weight: Vec<i8> = (0..n * k)
+            .map(|i| {
+                if pattern == "mixed" {
+                    (((i as u32).wrapping_mul(22695477).wrapping_add(91) >> 13) as u8) as i8
+                } else {
+                    127
+                }
+            })
+            .collect();
+        let asc: Vec<f32> = (0..nr).map(|r| 0.00013 * (r % 7 + 1) as f32).collect();
+        let ws: Vec<f32> = (0..n).map(|c| 0.00017 * (c % 13 + 1) as f32).collect();
+        let sentinel = -12345.25_f32;
+        let mut expected = vec![sentinel.to_bits(); nr * n + 64];
+        // Independent signed 64-bit host dot products, then the declared two
+        // FP32 scales and finite BF16 round-to-nearest/ties-to-even conversion.
+        // Even the maximum supported dot magnitude is below signed i32 range.
+        for r in 0..nr {
+            for c in 0..n {
+                let mut dot = 0_i64;
+                for j in 0..k {
+                    dot += input[r * k + j] as i64 * weight[c * k + j] as i64;
+                }
+                assert!(dot >= i32::MIN as i64 && dot <= i32::MAX as i64);
+                let x = (dot as f32 * asc[r]) * ws[c];
+                assert!(x.is_finite());
+                let bits = x.to_bits();
+                expected[r * n + c] = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000;
+            }
+        }
+        let q = DeviceBuffer::from_host(&stream, &input)?;
+        let w = DeviceBuffer::from_host(&stream, &weight)?;
+        let a = DeviceBuffer::from_host(&stream, &asc)?;
+        let b = DeviceBuffer::from_host(&stream, &ws)?;
+        let mut output = DeviceBuffer::from_host(&stream, &vec![sentinel; nr * n + 64])?;
+        for partitions in [1_usize, 2, 4, 8] {
+            let guard = 0x13579bdf_i32;
+            let span = k.div_ceil(128).div_ceil(partitions) * 128;
+            let mut expected_parts = vec![guard; partitions * nr * n + 64];
+            for part in 0..partitions {
+                for r in 0..nr {
+                    for c in 0..n {
+                        let mut dot = 0_i64;
+                        for j in part * span..((part + 1) * span).min(k) {
+                            dot += input[r * k + j] as i64 * weight[c * k + j] as i64;
+                        }
+                        expected_parts[(part * nr + r) * n + c] = i32::try_from(dot)?;
+                    }
+                }
+            }
+            let mut partial =
+                DeviceBuffer::from_host(&stream, &vec![guard; partitions * nr * n + 64])?;
+            for graph in [false, true] {
+                output.copy_from_host(&stream, &vec![sentinel; nr * n + 64])?;
+                partial.copy_from_host(&stream, &vec![guard; partitions * nr * n + 64])?;
+                // SAFETY: K is a positive multiple of 128, tail copies zero-fill
+                // invalid rows/columns, and each of 128 threads owns its fragments.
+                // Output guards preserve trailing sentinels; captured buffers outlive graphs.
+                let mut launch = || -> anyhow::Result<()> {
+                    unsafe {
+                        module.linear_square_partials(
+                            &stream,
+                            rows(partitions * nr.div_ceil(32) * n.div_ceil(32), 128),
+                            &q,
+                            &a,
+                            &w,
+                            &b,
+                            k as u32,
+                            partitions as u32,
+                            &mut partial,
+                        )?;
+                        module.linear_square_reduce(
+                            &stream,
+                            cfg(nr * n),
+                            &partial,
+                            &a,
+                            &b,
+                            partitions as u32,
+                            &mut output,
+                        )?;
+                        Ok(())
+                    }
+                };
+                if graph {
+                    let capture = unsafe { crate::graph::Graph::capture(&stream, false, launch)? };
+                    unsafe {
+                        capture.launch()?;
+                    }
+                    stream.synchronize()?;
+                } else {
+                    launch()?;
+                }
+                assert_eq!(
+                    partial.to_host_vec(&stream)?,
+                    expected_parts,
+                    "partial/guard mismatch"
+                );
+                let actual: Vec<u32> = output
+                    .to_host_vec(&stream)?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "square projection {nr}x{n}x{k}/{pattern}/partitions={partitions}/graph={graph}"
+                );
+                println!(
+                    "SPLIT_SQUARE_REFERENCE {}",
+                    serde_json::json!({"rows":nr,"n":n,"k":k,"pattern":pattern,"partitions":partitions,"graph":graph})
+                );
+            }
+        }
+    }
+    Ok(())
+}

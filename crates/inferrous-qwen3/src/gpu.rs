@@ -444,6 +444,7 @@ impl GpuModel {
         map: Option<&DeviceBuffer<u64>>,
         prefetch: bool,
         policy: ProjectionPolicy,
+        partial: Option<&mut DeviceBuffer<i32>>,
     ) -> Result<()> {
         if scale.len() == 1 && w.k == 12288 {
             // SAFETY: the preceding SwiGLU produced this exact completed maximum;
@@ -487,7 +488,7 @@ impl GpuModel {
                 )?;
             }
         } else {
-            self.linear_quantized(q, scale, w, out, map, policy)?;
+            self.linear_quantized(q, scale, w, out, map, policy, partial)?;
             self.residual(residual, out, combined)?;
         }
         Ok(())
@@ -526,8 +527,42 @@ impl GpuModel {
         out: &mut Buffer,
         map: Option<&DeviceBuffer<u64>>,
         policy: ProjectionPolicy,
+        partial: Option<&mut DeviceBuffer<i32>>,
     ) -> Result<()> {
         let nr = scale.len();
+        if let Some(partial) = partial {
+            if policy == ProjectionPolicy::TunedBatch && nr == 32 && w.n == 4096 {
+                anyhow::ensure!(
+                    [4096, 12288].contains(&w.k) && partial.len() == 4 * 32 * 4096,
+                    "invalid split projection scratch or shape"
+                );
+                // SAFETY: the Step owns this scratch before capture. Integer partials
+                // cannot overflow at model widths; the same stream orders reduction.
+                unsafe {
+                    self.module.linear_square_partials(
+                        &self.stream,
+                        rows(4 * nr.div_ceil(32) * w.n.div_ceil(32), 128),
+                        q,
+                        scale,
+                        &w.w,
+                        &w.scale,
+                        w.k as u32,
+                        4,
+                        partial,
+                    )?;
+                    self.module.linear_square_reduce(
+                        &self.stream,
+                        cfg(nr * w.n),
+                        partial,
+                        scale,
+                        &w.scale,
+                        4,
+                        out,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
         // Cold-weight CUDA-event measurements on the 5090 favor wider tiles
         // for small MLP batches and DP4A for two to four down-projection rows.
         // Keep the original PRO 6000/legacy dispatch independently selectable.
@@ -735,6 +770,7 @@ impl GpuModel {
                     &mut w.q,
                     w.map4.as_ref(),
                     policy,
+                    None,
                 )?;
                 self.linear_quantized(
                     &w.quant4,
@@ -743,6 +779,7 @@ impl GpuModel {
                     &mut w.k,
                     w.map4.as_ref(),
                     policy,
+                    None,
                 )?;
                 self.linear_quantized(
                     &w.quant4,
@@ -751,6 +788,7 @@ impl GpuModel {
                     &mut w.v,
                     w.map4.as_ref(),
                     policy,
+                    None,
                 )?;
             }
             if l == 4 {
@@ -847,6 +885,7 @@ impl GpuModel {
                 w.map4.as_ref(),
                 pf,
                 policy,
+                None,
             )?;
             if l == 4 {
                 self.trace(trace, step, "debug.a", &w.attention)?;
@@ -894,6 +933,7 @@ impl GpuModel {
                     &mut w.gate,
                     w.map4.as_ref(),
                     policy,
+                    None,
                 )?;
                 self.linear_quantized(
                     &w.quant4,
@@ -902,6 +942,7 @@ impl GpuModel {
                     &mut w.up,
                     w.map4.as_ref(),
                     policy,
+                    None,
                 )?;
             }
             if l == 4 {
@@ -933,6 +974,7 @@ impl GpuModel {
                 w.map12.as_ref(),
                 pf,
                 policy,
+                None,
             )?;
             if l == 4 {
                 self.trace(trace, step, "debug.act", &w.act)?;
