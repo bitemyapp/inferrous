@@ -52,3 +52,57 @@ The primary-checkout runtime sources exactly match the validated model worktree.
 `head-certified-retained-v1/summary.json` has SHA-256 `a031e5c0412e8e59391377b569b487ec18500822b3ff7fa072ecf4baf5be0488`, identity `0a6516831d7d4198f65d7572cf147deb59126e015513b9a5d5dae932cdb51868`, built identity `65b135a9cef7af8d466a8e81fac83c7536d3ef72bc1f8e17f573974bca4bcbca`, regression `8ea91158d8705fb7a0011b40a0584e96db9a60108dfad8d3657fb5e24afd94be`, and source patch `5cf1f749844c2b4330b36fbc1e947b8aca264b0cde8f85a961c8ec93cc58138d`. Rebuilt release/checked test executables are `e266bdd16a9e04fb6eac63b0cab482e5aceb1cd61ca5b697c4439a5932afa896` / `65cff6fbe0c86e8db4717c7218b5b35bd37db0d2cb0b07e1d978b824c2971eae`. Complete pinned inputs and result hashes were rechecked after completion. The earlier native checks apply to the identical runtime sources; they are not mislabeled as fresh native runs of these new test executables.
 
 The allocation-saving packed-weight center passes its operator checks but is rejected: its complete screen is 4.258 ms versus 3.569 ms for precomputed digits. [Its separate record](../../research/exact-head-certification.md#packed-weight-center-follow-up-rejected) preserves the source and results. The original independent numerical discrepancy, fastest-stock requirement in every requested case, and final matrix/report remain unfinished.
+
+## Broader output-count screen
+
+An isolated follow-up screens nine output counts with the retained runtime kernels. Eighty independent comparisons per release/checked build cover ten partial matrix shapes, both center tiles, eager/graph execution and forced/normal fallback. Every integer center and original-order output matches; complete operator memcheck/racecheck report zero errors or warnings. The full-vocabulary screen checks every output and both integer-center tiles, using six captured normalized inputs repeated to the requested row count.
+
+| Outputs | Preceding grouped head, ms | Complete 32-column center, ms | Complete 64-column center, ms |
+|---|---:|---:|---:|
+| 1 | 0.622624 | 1.554464 | 1.556512 |
+| 2 | 0.856128 | 1.622048 | 1.617984 |
+| 4 | 0.927808 | 1.794112 | 1.787968 |
+| 8 | 1.380384 | 2.067520 | 2.060320 |
+| 16 | 2.293792 | 2.492416 | 2.482176 |
+| 24 | 3.809312 | 2.794240 | 2.782208 |
+| 32 | 4.139008 | 3.552256 | 3.545088 |
+| 48 | 6.475776 | 6.029312 | 6.050816 |
+| 64 | 8.538112 | 6.895616 | 6.914048 |
+
+These are unpaired operator screens with three excluded warmups and seven measured CUDA-event samples, cache eviction outside timing and no overlapping builds. The certified path loses for one through sixteen outputs. Twenty-four, forty-eight and sixty-four outputs merit model evaluation, but this screen does not extend production dispatch beyond exactly thirty-two. The thirty-two-output preceding grouped baseline is distinct from the already retained certified implementation.
+
+Artifacts are `head-certified-shapes-v1/`: completion SHA-256 `751023bd3deb11b5b9989f98a8a93abbe111628ebf8c8ee221d7766a4cef58de`, identity `cf7a4bc6374f35e683d901c061b0dccf0e9944c5a683202e95eb8707d8e904f0`, source patch `1f300a02f04e7948c94b09f9f6c591d6bf51e78e105c38630641e527748ed0ab`, and profiles `ce51f33adbbd42a4786b5d2045bc1cf90e50a7b91485843d26b233b094ea4dc4`. Pinned sources/binaries, execution receipts, validation records, profiles and telemetry were rechecked remotely after completion.
+
+## Grouped-bound operator follow-up
+
+Partitioning the original-order error bound across contiguous coordinate groups reduces exact fallback. The [bound derivation](../../research/exact-head-certification.md#partitioned-weighted-bound) preserves the original output contract. A CPU screen of eleven layouts over six captured inputs finds no incorrect certifications. Its GPU implementation adds dynamic input-group norms and precomputed FP64 weight-group norms, while keeping the integer center, representation-error allowance and original-order fallback unchanged.
+
+Four hundred independent comparisons per release/checked build cover all preceding shapes and execution modes with whole-row and 4/16/32/64-group bounds. Every integer center and original-order output matches; group metadata is separately checked against host upper bounds. Complete operator memcheck/racecheck pass. Forty full-vocabulary profile records check all original outputs, reset complete-stage output sentinels and compare every integer center.
+
+| Bound | Complete, 16 outputs, ms | Fallback, 16 outputs | Complete, 32 outputs, ms | Fallback, 32 outputs | Certification alone, 32 outputs, ms |
+|---|---:|---:|---:|---:|---:|
+| Whole row, retained | 2.481152 | 19.9094% | 3.543776 | 20.5754% | 0.116704 |
+| 4 contiguous groups | 2.500608 | 18.3778% | 3.496672 | 19.0056% | 0.184320 |
+| 16 contiguous groups | 2.588672 | 16.6939% | 3.518464 | 17.2929% | 0.346112 |
+| 32 contiguous groups | 2.768896 | 15.8883% | 3.670752 | 16.4619% | 0.555008 |
+| 64 contiguous groups | 3.161792 | 15.0228% | 4.029152 | 15.5976% | 0.978944 |
+
+The preceding grouped head measures 2.300960/4.153344 ms at sixteen/thirty-two outputs in this run. Grouped certification does not close the sixteen-output gap. At thirty-two outputs, four groups improve the unpaired complete operator by only about 1.3%; the extra FP64 accumulation cost offsets most fallback savings. Larger group counts are slower despite fewer ambiguous outputs. No grouped-bound model integration or dispatch change is retained. Complete timings include the additional dynamic group-norm kernel; phase timings are separate diagnostics and must not be added as paired measurements. Each group adds 1,215,488 bytes of persistent weight metadata, outside the event interval.
+
+GPU artifacts are `head-certified-groups-v1/`: completion SHA-256 `a22e7b9de5f7f6272fbe40a10ffa1a139b5ae1150a4f3ca405ccadff47d10ad0`, identity `f1e88fc0aa21095d89e2a2a419a59ae827e230c5dfc5bbbcb159c637369d5cc6`, patch `cefeced773261a0e023d104f4be236e0233b1697e7d0b2b934dbf0ac3d900a7d`, profiles `83da9bc7ace20d8a69d41f19acce23529a0ae9b210ea04d9b893964f6eff6ac1`, and telemetry `95310fe3d1c6a958b2a0aba520ccbb2c47bdfe894f26a29542f49f18042cfa7a`. Release/checked executables are `f932721d71e83558d18bf392b0ba01bcf699068760916302282cb5bc3b382382` / `70ad2a46dc06eba29adaf4c5f4b2bd04cd8e20cb0a32e898e2ef25e9384e4350`. All pinned identities and validation receipts were rechecked after completion. CPU artifacts are `head-interval-groups-v1/`, report `77d8a8896219c73cb193ce5c1e37ab3c1f4af294802486dd783d8202415001d5` and receipt `663cce2e409a9b1de14349f731d59102c6684bb8fa94a1b35fbdef4aab161185`.
+
+### Upward FP32 group accumulation
+
+A separate variant replaces only the positive grouped dot product with outward FP32 conversions, products and additions, widening its result exactly before the original FP64 certificate arithmetic. Both builds pass four hundred independent comparisons, now including input/weight rows at both supported nonzero magnitude endpoints. Complete memcheck/racecheck pass, and all forty profile records preserve original outputs. Release and checked disassembly confirms `FMUL.RP` / `FADD.RP` without flush-to-zero modifiers for the group sum.
+
+| Bound | Complete, 16 outputs, ms | Complete, 32 outputs, ms | Certification alone, 32 outputs, ms |
+|---|---:|---:|---:|
+| Whole row, retained | 2.484224 | 3.546112 | — |
+| 4 groups, upward FP32 | 2.494464 | 3.494656 | 0.175840 |
+| 16 groups, upward FP32 | 2.563840 | 3.491840 | 0.313344 |
+| 32 groups, upward FP32 | 2.710528 | 3.611648 | 0.495616 |
+| 64 groups, upward FP32 | 3.031040 | 3.919872 | 0.874496 |
+
+The preceding grouped head measures 2.310176/4.157440 ms. The best thirty-two-output variant improves the retained operator by about 1.5% in this unpaired screen, while all sixteen-output variants and larger group counts still regress. Do not retain this implementation or infer a model gain. The slight widening of the four-group bound adds a few fallback outputs; larger-group fallback fractions round to the preceding table's values. Weight storage and dynamic preparation remain unchanged from the FP64 prototype.
+
+Artifacts are `head-certified-groups-f32-v1/`: completion SHA-256 `09a051f16b663b479742ed4c65c37205d53eb7836f8243b0565351f594f7e396`, identity `e21a6b8b00a3fe0631b29edfdd689861c3a8889c15fc1f3de995302344a39b9a`, patch `5b961adef364930732a96c4f6f5995c66d39e9d72f58997a117fe33c63d3e7c3`, and profiles `14db421d56984087a281db1549bcecb87c7bc0854cb6b5c3da899b148e95b5c0`. Release/checked executables are `b7a9050feddbe950cc7aad3997d944507c4e853711a2c94b03dc2c771b881eca` / `b74429f8585cc9a318d4d2d5889d73fdd0d952a86b3e2ffec162a7e6e6d61532`; grouped-kernel disassembly hashes are `90d2218ee01cd72a3de127a994b956daa125a949e932f822faa9a5f21f0b402d` / `d13c34478cc1f4b1a05f5748babf9260c193d73aca6ed31654340afbabd52ae4`. Complete identities, binary hashes, execution/validation receipts and profile/telemetry hashes were rechecked remotely. Production remains at retained CLI `da73a3b4`; the original numerical acceptance gate and every-case stock target remain unresolved.
