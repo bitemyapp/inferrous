@@ -1005,3 +1005,32 @@ Separate uninstrumented controls run the same executable, configuration, request
 The four commands capture 156 device-wide telemetry samples, including initialization. Sampled maximum memory is 77,015/77,027 MiB for batch control/profile and 77,453/77,465 MiB for solo control/profile. These are sampled whole-invocation maxima, not exact peaks, per-request allocations or KV occupancy; their differences are not a controlled collector-overhead measurement. No fixed GPU clocks are imposed.
 
 Artifacts are `clean-work/pro6000-baseline/retained-profiles-v1/`: completion SHA-256 `b5f6cb7686537e40db73debb458101fe1baf58e21d0a251f1a2dbeda5d981b68`, identity `5b96b39794e6d2345d63ec9480fc4d18cb7cd770ed4042d945d32701f5e0a47e`, independent audit `8761501edf2a90c1f9ca8f1a6e357185b57983611d6918d765dfd46e780b7a61`, and collector `632e3bb0079a4f060bad7eeab8becaf77cd28ba3e7b94385c2de93f068735df1`. The batch/solo CSV identities are `4e70d4b0d74cd399f2f5ae995a6e1efb70b342413b380414a84a563945fd0fff` / `f5e65f6d155e39bfa02b00380cf0c919343915213706032c43cd45c85a180b34`. All commands are terminal and the GPU is idle. The final matrix plan is unchanged with zero output files; numerical acceptance, every-case stock wins and the final report remain open.
+
+## Square projection tile: exact, no batch-32 gain
+
+The current batch profile motivates a new isolated 32×32 INT8 projection tile in `/home/callen/work/inferrous-square-projection`, based on `812a79e`. Four warps each accumulate a 16×16 region, sharing double-buffered 32×128 activation and weight stripes. Compared with the retained 16×32 narrow tile, this reuses each weight stripe across twice as many rows. Integer accumulation and the two ordered FP32 scales followed by BF16 rounding remain unchanged. The source adds one staging helper, one kernel and opt-in conformance/profile tests; production dispatch is byte-identical to the base.
+
+Release and checked builds each pass forty independent host-reference cases: twenty shape/pattern inputs in eager and graph modes, covering row boundaries through 257, column tails at 129/257, K=128/384/4096/12288, signed extrema and trailing output sentinels. Expected results use signed INT64 host dots with checked INT32 range, ordered FP32 scales and explicit BF16 ties-to-even rounding. Unfiltered focused memcheck and racecheck repeat all forty cases with zero errors/hazards/warnings. These checks cover the new operator, not model integration or independent full-model numerical acceptance.
+
+Both builds report 54 registers, 19,456 shared bytes and zero stack/local bytes for the new kernel. The existing narrow kernel uses 44 registers and 15,360 shared bytes; the existing 32×64 pipelined tile uses 50 registers and 28,672 shared bytes. Resource counts alone do not establish a performance gain.
+
+After compilation and all four validation commands finish, the operator screen rotates thirty-two distinct weight allocations, checks every final output against DP4A, excludes three warmups and records seven CUDA-event samples per variant/shape. All thirty-six records are complete. This is an unpaired operator screen with telemetry, not a model benchmark or stock comparison. The table reports median microseconds per projection; K is input width and N is output width.
+
+| Rows | K | N | Narrow 16×32 | New square 32×32 | Existing 32×64 |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 4096 | 1024 | 13.910 | 14.944 | 16.332 |
+| 16 | 4096 | 4096 | 16.979 | 18.066 | 19.539 |
+| 16 | 4096 | 12288 | 33.545 | 34.121 | 34.438 |
+| 16 | 12288 | 4096 | 51.847 | 53.611 | 55.749 |
+| 32 | 4096 | 1024 | 13.963 | 16.352 | 16.988 |
+| 32 | 4096 | 4096 | 16.910 | 18.352 | 19.786 |
+| 32 | 4096 | 12288 | 34.312 | 34.442 | 34.763 |
+| 32 | 12288 | 4096 | 51.404 | 53.716 | 55.829 |
+| 64 | 4096 | 1024 | 16.073 | 17.486 | 18.336 |
+| 64 | 4096 | 4096 | 21.264 | 19.347 | 19.476 |
+| 64 | 4096 | 12288 | 61.321 | 39.367 | 41.353 |
+| 64 | 12288 | 4096 | 62.601 | 57.435 | 56.903 |
+
+Reject batch-32 integration: the new kernel loses to narrow at all four tested widths, including all three widths where production selects narrow for thirty-two rows. The 1024-output production path instead selects split-K, which is not part of this screen. At sixty-four rows the new tile is 1.050× the faster screened existing variant for K=4096/N=12288, and 1.007× for K=N=4096. These isolated gains do not establish a model improvement or justify production retention; the candidate remains available for a later prefill-specific investigation if warranted. No model timing, dispatch change or arithmetic-contract change follows from this screen.
+
+Workstation artifacts are `clean-work/pro6000-baseline/square-projection-v1/`: completion SHA-256 `30191fbd4032a86a8d6f61bf169e2aacec596674e681648ffdc331ff0ff6eb85`, source identity `7f003ddc16356a928dfacb8a4fedc00af244884ee9629ef72255af7686fd06d8`, source patch `b7cc6afab42f20aab185baf18ba69e4074523d75deab42ae64469b1b60c9de2e`, and independent audit `db9700e08c7dd820d32eeaf7b041150dc41b9325379dbf56fc47a8d3f5ac0e1f`. Frozen release/checked test binaries are `74bf987b4b03f4ded405e0b3ad8ec01c628f339ac1a06581e6b2677f4ffd5934` / `84d4f2b8084db83e7e30751b5640710532e02ffb9ccc637e7e7629262e6d222e`. The audit verifies source additions, unchanged dispatch, all build/validation/profile receipts, all case/measurement inventories, independently recomputed medians and both resource summaries. Both runners are terminal. The retained inference binary and final matrix remain unchanged; numerical acceptance and stock-performance work are still open.
