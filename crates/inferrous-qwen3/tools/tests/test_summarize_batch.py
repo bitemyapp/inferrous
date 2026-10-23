@@ -1,8 +1,13 @@
 """Keep stock timestamp domains and ragged/recomputed accounting explicit."""
 import importlib.util
 import copy
+import contextlib
+import io
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("summarize_batch", Path(__file__).parents[1] / "summarize_batch.py")
 summary = importlib.util.module_from_spec(spec)
@@ -46,6 +51,63 @@ class SummaryTests(unittest.TestCase):
         record["recompute_steps"].pop()
         with self.assertRaises(ValueError):
             summary.measurements(record)
+
+    def test_ragged_streams_keep_distinct_latencies_and_slots(self):
+        record = self.record()
+        record["generations"][1]["backend_metrics"].update(first_token_latency=2.0, last_token_ts=12.0)
+        streams = summary.stream_measurements(record)
+        self.assertEqual(streams[0]["native_first_token_seconds"], [0.5])
+        self.assertEqual(streams[1]["native_first_token_seconds"], [2.0])
+        self.assertEqual(streams[0]["native_per_stream_post_first_seconds_per_token"], [1.0])
+        self.assertEqual(streams[1]["native_per_stream_post_first_seconds_per_token"], [2.0])
+        self.assertEqual(summary.measurements(record)["native_per_stream_post_first_seconds_per_token"], [1.0, 2.0])
+
+    def test_single_output_missing_timestamps_and_zero_interval_are_distinct(self):
+        record = self.record()
+        record["requests"][0]["max_tokens"] = 1
+        record["generations"][0]["token_ids"] = [1]
+        record["generations"][1]["backend_metrics"]["last_token_ts"] = 10.0
+        streams = summary.stream_measurements(record)
+        self.assertEqual(streams[0]["native_per_stream_post_first_seconds_per_token"], [])
+        self.assertEqual(streams[1]["native_per_stream_post_first_seconds_per_token"], [0.0])
+        self.assertEqual(streams[1]["native_per_stream_post_first_tokens_per_second"], [])
+        del record["generations"][1]["backend_metrics"]["last_token_ts"]
+        self.assertEqual(summary.stream_measurements(record)[1]["native_per_stream_post_first_seconds_per_token"], [])
+
+    def test_recompute_slot_latencies_follow_only_active_submissions(self):
+        record = self.record()
+        record.update(cache_mode="recompute", recompute_steps=[dict(slots=slots, elapsed_seconds=elapsed)
+                      for slots, elapsed in [([0, 1], 0.5), ([0, 1], 2.5), ([0], 3.5), ([0], 9.5)]])
+        streams = summary.stream_measurements(record)
+        self.assertEqual(streams[0]["native_per_stream_post_first_seconds_per_token"], [3.0])
+        self.assertEqual(streams[1]["native_per_stream_post_first_seconds_per_token"], [2.0])
+
+    def test_cli_stream_distributions_exclude_each_files_warmups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for arm in range(2):
+                path = Path(directory) / f"arm-{arm}.jsonl"
+                paths.append(str(path))
+                records = []
+                for run in range(3):
+                    record = self.record()
+                    record.update(run=run, workload="ragged")
+                    for slot, request in enumerate(record["requests"]):
+                        request["prompt_ids"] = [42] * (slot + 1)
+                        record["generations"][slot]["backend_metrics"]["first_token_latency"] = (
+                            1000.0 if run == 0 else float(1 + arm * 2 + run + slot * 10))
+                    records.append(record)
+                path.write_text("".join(json.dumps(record) + "\n" for record in records))
+            stdout = io.StringIO()
+            with patch("sys.argv", ["summarize_batch.py", *paths, "--warmup", "1", "--min-samples", "4"]), contextlib.redirect_stdout(stdout):
+                summary.main()
+            result, = json.loads(stdout.getvalue())
+            self.assertEqual(result["metrics"]["api_seconds"]["n"], 4)
+            self.assertEqual(result["metrics"]["native_first_token_seconds"]["n"], 8)
+            for slot, stream in enumerate(result["streams"]):
+                self.assertEqual((stream["slot"], stream["prompt_length"]), (slot, slot + 1))
+                self.assertEqual(stream["metrics"]["native_first_token_seconds"]["n"], 4)
+                self.assertEqual(stream["metrics"]["native_first_token_seconds"]["p50"], 3.5 + slot * 10)
 
     def test_incomplete_output_cannot_be_timed_as_a_complete_request(self):
         record = self.record()

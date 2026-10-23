@@ -101,20 +101,19 @@ def prefix_metrics(record, local):
     return values
 
 
-def measurements(record):
+def stream_measurements(record):
+    """Native timings by request slot; preserve ragged/admission differences."""
     local = record.get("backend") == "inferrous-paged"
     requests = record["requests"]
     generations = record["batch"]["generations"] if local else record["generations"]
     if not requests or len(generations) != len(requests) or any(r["max_tokens"] < 1 or len(g["token_ids"]) != r["max_tokens"] for g, r in zip(generations, requests)):
         raise ValueError("incomplete batch or generation")
-    seconds = checked_time(record["generate_seconds"] if local else record["request_seconds"],
-                           "API seconds", positive=True)
     if not local and record["cache_mode"] == "recompute":
         elapsed = [checked_time(step["elapsed_seconds"], "recomputation elapsed seconds")
                    for step in record["recompute_steps"]]
         if any(after < before for before, after in zip(elapsed, elapsed[1:])):
             raise ValueError("invalid timing: recomputation elapsed seconds move backwards")
-    first_tokens, completions, per_stream_decode = [], [], []
+    streams = []
     for slot, generation in enumerate(generations):
         count = len(generation["token_ids"])
         if local:
@@ -146,17 +145,31 @@ def measurements(record):
             completion = first + decode if first is not None and decode is not None else None
         if decode is not None:
             checked_time(decode, "decode interval")
-        if first is not None:
-            first_tokens.append(first)
-        if completion is not None:
-            completions.append(completion)
+        values = dict(native_first_token_seconds=[] if first is None else [first],
+                      native_completion_seconds=[] if completion is None else [completion],
+                      native_per_stream_post_first_seconds_per_token=[],
+                      native_per_stream_post_first_tokens_per_second=[])
+        if count > 1 and decode is not None:
+            values["native_per_stream_post_first_seconds_per_token"] = [decode / (count - 1)]
         if count > 1 and decode is not None and decode > 0:
-            per_stream_decode.append((count - 1) / decode)
+            values["native_per_stream_post_first_tokens_per_second"] = [(count - 1) / decode]
+        if any(not math.isfinite(value) or value < 0 for samples in values.values() for value in samples):
+            raise ValueError("invalid timing value")
+        streams.append(values)
+    return streams
+
+
+def measurements(record):
+    local = record.get("backend") == "inferrous-paged"
+    generations = record["batch"]["generations"] if local else record["generations"]
+    seconds = checked_time(record["generate_seconds"] if local else record["request_seconds"],
+                           "API seconds", positive=True)
+    streams = stream_measurements(record)
     values = dict(api_seconds=[seconds], aggregate_output_tokens_per_second=[sum(len(g["token_ids"]) for g in generations) / seconds],
-                native_first_token_seconds=first_tokens, native_completion_seconds=completions,
-                native_per_stream_post_first_tokens_per_second=per_stream_decode,
                 reused_tokens=reused_tokens(record, local),
                 processed_tokens=[record["batch"]["processed_tokens"]] if local else [])
+    values.update({metric: [value for stream in streams for value in stream[metric]]
+                   for metric in streams[0]})
     values.update(prefix_metrics(record, local))
     if any(not math.isfinite(value) or value < 0 for samples in values.values() for value in samples):
         raise ValueError("invalid timing or accounting value")
@@ -185,10 +198,14 @@ def main():
             values = measurements(record)
             if record["run"] < args.warmup:
                 continue
-            group = groups.setdefault(key, dict(metadata=metadata, files=set(), metrics=defaultdict(list)))
+            group = groups.setdefault(key, dict(metadata=metadata, files=set(), metrics=defaultdict(list),
+                                               streams=[defaultdict(list) for _ in record["requests"]]))
             group["files"].add(str(path))
             for metric, samples in values.items():
                 group["metrics"][metric].extend(samples)
+            for slot, stream in enumerate(stream_measurements(record)):
+                for metric, samples in stream.items():
+                    group["streams"][slot][metric].extend(samples)
         for run_numbers in runs.values():
             if run_numbers != list(range(len(run_numbers))):
                 raise ValueError(f"{path}: missing, reordered or duplicate repetitions")
@@ -203,6 +220,10 @@ def main():
                               prompt_lengths=[len(r["prompt_ids"]) for r in requests],
                               output_lengths=[r["max_tokens"] for r in requests],
                               files=sorted(group["files"]), warmups_per_workload_per_file=args.warmup,
+                              streams=[dict(slot=slot, prompt_length=len(requests[slot]["prompt_ids"]),
+                                            output_length=requests[slot]["max_tokens"],
+                                            metrics={metric: distribution(values) for metric, values in stream.items()})
+                                       for slot, stream in enumerate(group["streams"])],
                               metrics={metric: distribution(values) for metric, values in group["metrics"].items()}))
     if not summaries:
         raise ValueError("no measured records")
