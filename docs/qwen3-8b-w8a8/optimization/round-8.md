@@ -1134,3 +1134,36 @@ Each complete-head and fallback-only screen runs original/dense/dense/original a
 Reject the dense fallback: both candidate arms are slower in both scopes, and the extra storage has no compensating measured gain. Dense fallback uses fewer registers (48 release/45 checked versus 56/63 for packed); all variants have 1,024 shared bytes and zero stack/local storage. Lower register use does not establish faster execution. No production allocation, dispatch or model trial follows from this experiment.
 
 Artifacts are `dense-fallback-v1/`: source identity `6f26e616c24371eb08fdd47641c32e7fb22fc55349d232cd09eaef01b29d0f0e`, patch `829e48cfb71ae1e50085b71d7a0a67be25bebd069fce779c42b5fce3264adbe2`, completion `2b22b315942f981e7c39f8a307b0425737067f5d27de916575a3d28e7bc7fc92`, profile records `741bd0e26f12b5c79978dcfda2b741f70fb94c0e4aec1598840aefb267020d76`, and complete audit `8e8f60f038e5e4ad43e8ef473f5525753335f75fec8e87086ecc820492d153d7`. Frozen release/checked test binaries are `a0dbc7ad1d43f1888dc2c5b7fdc45f3814526a6e049b2a211d6bd10e88e2c758` / `ecb42d3bc06a1b894e76cc030b3066e912367790adcc1e062b941b22115a3ad8`. All runners are terminal. Production remains the qualified split-K CLI, with the original numerical gate and final performance/matrix work still open.
+
+## Wider ordered PV tiles: no broad gain
+
+The fresh solo profile identifies ordered PV as 35.08% of long-prefill eager kernel time. An isolated `/home/callen/work/inferrous-wide-pv` worktree evaluates sharing each staged 64×32 BF16 value stripe across eight or sixteen consecutive prompt rows, with 256/512 threads respectively. Each warp retains one row's four GQA sums, the original separate FP32 products/additions, ascending key order and final BF16 rounding. Wider probability buffers retain separate alternating slots; complete-copy and CTA barriers fence consumption and reuse. Padded members load the last valid row and never publish an output. Production's four-row grouping and dispatch remain unchanged.
+
+Both builds pass 160 complete comparisons against an independent CPU sequential FP32 reference with explicit BF16 rounding; the original paged GPU control also matches that reference. The cases span one through seventeen rows plus 31/32/33, uniform/mixed probabilities, every partial group size from one through eight/sixteen, shuffled physical pages, sequence boundaries, page crossings and causal tails at stride 512. Scores beyond each causal end contain NaNs, and every eager/graph invocation starts with fresh output guards. Focused memcheck and racecheck repeat all 160 cases with zero errors/hazards/warnings. This independently checks the stated small-context inputs; subsequent 32K operator cases compare every result with the retained four-row kernel, not a new native-length CPU oracle or full-model test.
+
+The complete operator screen covers sixteen row/stride shapes. Each runs four/eight/sixteen/sixteen/eight/four-row arms, with three excluded warmups and seven CUDA-event measurements per arm, yielding fourteen samples per variant and ninety-six raw records. Each arm resets output sentinels and verifies the complete result and trailing guard. A 256 MiB cache eviction precedes each event interval; fixture creation, allocation and transfer are excluded. These are PV-only measurements using constructed probabilities, not model latencies. Median microseconds follow.
+
+| Rows | Score stride | Four-row baseline | Eight-row tile | Sixteen-row tile |
+|---:|---:|---:|---:|---:|
+| 1 | 64 | 8.192 | 8.192 | 8.192 |
+| 7 | 512 | 16.384 | 18.432 | 24.576 |
+| 17 | 4096 | 77.824 | 96.256 | 153.456 |
+| 33 | 32768 | 806.768 | 800.800 | 1164.144 |
+| 32 | 512 | 18.432 | 18.432 | 25.600 |
+| 128 | 512 | 38.912 | 36.864 | 43.008 |
+| 256 | 512 | 55.296 | 57.344 | 57.344 |
+| 512 | 512 | 71.680 | 71.680 | 73.760 |
+| 32 | 4096 | 102.400 | 100.352 | 155.648 |
+| 128 | 4096 | 284.672 | 266.240 | 321.536 |
+| 256 | 4096 | 509.984 | 521.952 | 514.080 |
+| 512 | 4096 | 977.968 | 945.040 | 984.816 |
+| 32 | 32768 | 793.376 | 747.520 | 1166.336 |
+| 128 | 32768 | 2384.752 | 2220.400 | 2577.408 |
+| 256 | 32768 | 4454.416 | 4514.304 | 4478.352 |
+| 512 | 32768 | 8951.680 | 9052.736 | 9078.784 |
+
+Reject the sixteen-row variant and do not integrate the eight-row variant from this screen. Eight rows produce 1.056–1.074× speedups at 128 rows, but regress at 256 rows across all three strides, and are 1.1% slower at the important 512-row/32K shape. The 512-row/4K gain is only 1.035×, while smaller partial groups can regress substantially. The isolated wins do not establish a useful broad long-prefill improvement or justify a new model selector; no full-model speedup is claimed.
+
+Release register counts are 56/61/60 for four/eight/sixteen rows; checked counts are 68/70/68. Shared storage rises from 17,408 to 25,600/41,984 bytes. All have zero stack/local storage. These counts constrain a future design but do not independently explain its timing. The audit rechecks unchanged production dispatch, source/binary/receipt identities, all reference and sanitizer inventories, coverage of every partial group size, all ninety-six event records, recomputed medians/ratios and extracted resources.
+
+Artifacts are `wide-pv-v1/`: source identity `d87bb002fa0b3753f909745fe75c0f56420934119dbd589b9e6bf7cb71078b28`, patch `99c38fc27a65219eeee99f796f8d6c63de9e2dac61b9bc6ed0aac924c3663637`, completion `b5a4e63072bd55e3318435c7720e6496cf773867e3baacd22d2aaaabd1d3a040`, and audit `7dc6809d15692e39b05ec8f479e13719d76136bbd366cdaf331d39fd153c7e9c`. Frozen release/checked test binaries are `1fda5d824eeb98d8913919f9d7c7d9e7d602a97080c4ba5f128bf44419cb1e36` / `e3b4d4a92bf6c06c85d50fbeac948727bdd19d09196355adfff20bcfc85f6e18`. The runner is terminal. Production remains the qualified split-K CLI; the original numerical gate, every-case stock wins and unexecuted v4 matrix remain open.

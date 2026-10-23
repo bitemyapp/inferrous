@@ -10,6 +10,8 @@ The retained split-K candidate has a separate complete dispatch trace for batch-
 
 The [fresh retained split-K sustained-output profiles](optimization/round-8.md#retained-split-k-profiles-and-direct-weight-fallback-rejection) now repeat both final-configuration workloads with uninstrumented controls. They contain 88,824 batch and 78,405 solo records with complete zero-dropped/invalid footers, preserve all 3,168 generated tokens and match the predecessor's sequences. Batch graph time is 23.28% remaining narrow projections, 20.84% split-K partials, 18.83% exact head fallback and 11.01% integer head center. Long-prefill attention remains 77.44% of eager time. The recorded direct-weight fallback follow-up passes correctness and sanitizers but regresses in complete-head timing and is rejected.
 
+An isolated [wider PV tile screen](optimization/round-8.md#wider-ordered-pv-tiles-no-broad-gain) then checks eight/sixteen-row sharing with the original ordered arithmetic. All independent and sanitizer cases pass, but neither variant provides a broad gain across the sixteen measured shapes. In particular, both are slower at 512 rows and 32K stride. The production four-row PV kernel remains selected; the operator-only prototypes are not included in this checkout.
+
 Choose a fresh output path and a request array described in the [session guide](sessions.md). For cold-prefix profiling, copy the appropriate hardware configuration and set `prefix_cache_entries: 0`; record whether logit verification and CUDA graphs are enabled.
 
 ```sh
