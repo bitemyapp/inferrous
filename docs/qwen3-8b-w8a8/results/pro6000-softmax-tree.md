@@ -1,6 +1,6 @@
 # RTX PRO 6000 exact-order softmax experiments
 
-All work runs on `ssh wx-workstation`. A 128-thread paged-softmax variant replaces twelve block-wide barriers with warp shuffles while preserving the original reduction tree. It passes bitwise operator comparisons and scoped sanitizers, with modest short/wide operator gains. An isolated model trial is running; no production change or model-level improvement is established. A single-warp follow-up is rejected for long-context regressions. A loop-unroll hint produces byte-identical machine code and is not a distinct compiled optimization.
+All work ran on `ssh wx-workstation`. A 128-thread paged-softmax variant replaces twelve block-wide barriers with warp shuffles while preserving the original reduction tree. It passes bitwise operator comparisons, scoped sanitizers and a complete original-logit model regression. Its paired model trial shows two small consistent recomputation gains, but no broad model-level benefit beyond arm drift; the variant is not retained. A single-warp follow-up is rejected for long-context regressions. A loop-unroll hint produces byte-identical machine code and is not a distinct compiled optimization. Production and the original numerical gate remain unchanged.
 
 ## Arithmetic and synchronization
 
@@ -41,17 +41,36 @@ The unroll follow-up adds `#[unroll(4)]` to the three element loops of the first
 
 ## Isolated model trial
 
-`inferrous-softmax-model`, based on `89c074f`, selects only the first 128-thread variant for the PRO profile when `tuned_attention` is enabled. The original kernel remains available as the operator control and for other dispatches. The runner builds release/checked tests and a CLI, requires both complete ordinary suites, then runs separate hash verification and a paired timing pilot. Native-session qualification, full-model sanitizer coverage and a retention decision remain separate work if the pilot supports the change.
+`inferrous-softmax-model`, based on `89c074f`, selects only the first 128-thread variant for the PRO profile when `tuned_attention` is enabled. The original kernel remains available as the operator control and for other dispatches. The runner built release/checked tests and a CLI, required both complete ordinary suites, then ran separate hash verification and a paired timing pilot. No native-session or full-model sanitizer campaign follows the decision not to retain this candidate; the scoped operator results above do not substitute for those checks.
 
-Both ordinary suites now pass all twenty-three tests, including the 324-case bitwise softmax test, in 70.04 seconds release and 70.53 seconds checked. The validated-build receipt is `softmax-model-v1/validation.json`, SHA-256 `e5398f3d2132c941321142cc2af21aefabb9ff1f64818cec04701237811bd513`. Separate CLI hash verification is running; timing arms are gated on its complete success.
+Both ordinary suites pass all twenty-three tests, including the 324-case bitwise softmax test, in 70.04 seconds release and 70.53 seconds checked. The validated-build receipt is `softmax-model-v1/validation.json`, SHA-256 `e5398f3d2132c941321142cc2af21aefabb9ff1f64818cec04701237811bd513`. Separate CLI verification preserves all 1,656 complete-vocabulary hashes per repetition across seven suites, each containing two repetitions of all ten workloads. Both binaries agree across cold reuse, prefix reuse and full recomputation, including the candidate's separate 64 GiB allocation. All timing arms started after this complete regression check passed.
 
-The planned verification covers the existing ten-workload manifest in cold, prefix-reuse and recompute modes, both binaries, two repetitions, and a separate 64 GiB candidate allocation. The timing pilot covers solo 8K/two outputs, batch-32 prompt-129/eight outputs, batch-32 prompt-five/thirty-two outputs and batch-32 prompt-513/two outputs, each in all three modes. Each original/candidate/candidate/original suite has three excluded warmups and ten measurements, giving twenty samples per binary and case. The original retained CLI is `da73a3b486c9704b15254430d1d9eb9ff5bc4322bd7f50e59c979e0c3ee4d74b`; candidate is `9c6a2d304b23da19b610c9cf9005a73d1088bee72e1e3af8457299eed368e008`. This is a pending focused trial, not the full stock matrix or an acceptance waiver.
+The completed timing pilot covers solo 8K/two outputs, batch-32 prompt-129/eight outputs, batch-32 prompt-five/thirty-two outputs and batch-32 prompt-513/two outputs, each in all three modes. Each original/candidate/candidate/original suite has three excluded warmups and ten measurements, giving twenty samples per binary and case. The original retained CLI is `da73a3b486c9704b15254430d1d9eb9ff5bc4322bd7f50e59c979e0c3ee4d74b`; candidate is `9c6a2d304b23da19b610c9cf9005a73d1088bee72e1e3af8457299eed368e008`. This is a focused model trial, not the full stock matrix or an acceptance waiver.
 
 Pilot configurations use 12 GiB KV, thirty-two slots, 512-row prefill chunks, graphs and the retained tuning flags. Prefix-enabled timing permits 128 entries; cold/recomputed configurations disable them. Timing disables logit verification, while the separate verification probes enable it. The 64 GiB allocation is a correctness probe, not a timing configuration. These policies remain distinct from the frozen final matrix's 64 GiB / thirty-two-entry configuration.
 
+| Mode | Batch / prompt / outputs | Original API median, ms | Candidate API median, ms | Candidate / original |
+|---|---|---:|---:|---:|
+| Cold | 1 / 8192 / 2 | 2116.756 | 2121.979 | 1.0025 |
+| Cold | 32 / 129 / 8 | 368.455 | 368.403 | 0.9999 |
+| Cold | 32 / 5 / 32 | 424.690 | 424.839 | 1.0004 |
+| Cold | 32 / 513 / 2 | 1252.708 | 1248.077 | 0.9963 |
+| Prefix | 1 / 8192 / 2 | 45.937 | 45.770 | 0.9964 |
+| Prefix | 32 / 129 / 8 | 101.901 | 101.471 | 0.9958 |
+| Prefix | 32 / 5 / 32 | 419.688 | 417.270 | 0.9942 |
+| Prefix | 32 / 513 / 2 | 28.443 | 28.412 | 0.9989 |
+| Recompute | 1 / 8192 / 2 | 4259.705 | 4271.604 | 1.0028 |
+| Recompute | 32 / 129 / 8 | 2314.502 | 2310.147 | 0.9981 |
+| Recompute | 32 / 5 / 32 | 1659.709 | 1656.829 | 0.9983 |
+| Recompute | 32 / 513 / 2 | 2502.391 | 2493.919 | 0.9966 |
+
+Both candidate arm medians beat both baseline arm medians only for batch-32 recomputation at prompts 129 and 513, with pooled gains of 0.19% and 0.34%. Preserve those observations, but do not infer a broad improvement. Baseline drift is material elsewhere: cold solo 8K moves from 2104.910 to 2125.946 ms, while prefix batch-32 prompt-129 moves from 102.558 to 101.191 ms. The corresponding candidate arms lie between those baseline arms. All pooled changes are below 0.6% in magnitude. The screen does not justify retaining another production path; the earlier short/wide operator gains do not materially reduce the model-level gaps.
+
+Active telemetry samples across the whole campaign, including verification and process transitions, span 1462–2272 MHz SM clocks, 57–87°C and 90.13–307.53 W. These are not per-API-call measurements or proof of a particular cause of drift. The final audit checks all nineteen raw suites, original/candidate identities, complete workload/repetition order, configurations, full output lengths, every reported median, log hashes and telemetry integrity. The runner is terminal and no GPU process from this campaign remains.
+
 ## Artifacts
 
-All paths below are relative to `clean-work/pro6000-baseline/` on the workstation. The three operator campaigns are terminal. Their combined audit verifies source/binary identities, seven successful command receipts per campaign, log hashes, complete comparison counts and embedded cubin provenance. The model campaign is separate and remains live at this checkpoint.
+All paths below are relative to `clean-work/pro6000-baseline/` on the workstation. All four campaigns are terminal. The combined operator audit verifies source/binary identities, seven successful command receipts per campaign, log hashes, complete comparison counts and embedded cubin provenance. The model audit is separate.
 
 | Artifact | SHA-256 |
 |---|---|
@@ -62,3 +81,7 @@ All paths below are relative to `clean-work/pro6000-baseline/` on the workstatio
 | `softmax-model-v1/identity.json` | `1fc8c6b05ed09266ff767dda9087762f38100fddddcb01a441176cf8fd62ea47` |
 | `softmax-model-v1/source.patch` | `74acd5abfac5feb0c7aeb236ea45eb037638d6a11cb5d02f7f20dbd0633d545c` |
 | `softmax-model-v1/run.py` | `06558db5cc5beb902d79ed4ee5838503ba537bdb3197f59d14f671967961e3b2` |
+| `softmax-model-v1/paired/full-hash-verification.json` | `7ca012b70fd670f3e5e8d81e182b3cb56c57917bbd0c6bdd6d3ede7c8efd1b78` |
+| `softmax-model-v1/paired/summary.json` | `86b65fcdab66dd6dd74900d48297d969504eb6114f0c8cc6f3a3b8353dd1b690` |
+| `softmax-model-v1/summary.json` | `72bbebbe6fea6a0610e644e59280f87b4835fdcdf8586204cad3ffbe11cad1e7` |
+| `softmax-model-v1/audit.json` | `17b14d533d835a3d10229ea796cc91f1d55655f7fbee0657f45d36b168494882` |
