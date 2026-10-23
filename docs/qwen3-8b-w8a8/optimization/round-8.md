@@ -941,3 +941,27 @@ The initial runner successfully built the new test but resolved its relative exe
 Recovery v3 preserves those successful runs and audits the CLI differences before focused memcheck. Program headers, host instructions, embedded GPU image data and all other allocated sections match the retained CLI exactly, except the build ID and twenty-one source-location line fields in `.data.rel.ro`. Every changed field resolves to `crates/inferrous-qwen3/src/gpu/batch.rs`, advances by exactly two, and restoring those line numbers restores the entire section. Non-runtime symbol/string tables also differ. Removing the `cfg(test)` hook reproduces the original production source prefix exactly. The rebuilt CLI is `4eadba3ed4043b9d40ca54d9eec471d3c808cf020b5da06e21635c13baabc0dc`; the frozen measurement CLI remains `da73a3b4`, and the matrix plan and all its input pins remain unchanged.
 
 Focused unfiltered memcheck of the new test passes all four cases in 21.45 seconds with zero errors. Release/checked test executables and all parent command/log receipts are pinned in `failure-paths-v3/summary.json`, SHA-256 `8a851034c304a7345b5fa38a4a741a01103253838423d2cc9032c8c2d49ae9fd`. The source patch is `3a31318b910b806b83c9c642111b965680d5f6d7435c1ce3d200b2b6366cde82`, executable audit `b658ea287d334a574fd616d027efaa47215bd22a16616d0520fd3ed095ad226c`, and final source/receipt/coverage audit `1fa4a4a2a21de7df101bed9a32890a9c277548954eecffa47ee7639651ad9820`. The runner is terminal. Retain this test coverage; original numerical acceptance, every-case stock wins and complete matrix/reporting remain unfinished.
+
+## Validated device telemetry and sampled memory reporting
+
+The matrix executor previously accepted telemetry based only on its row/column count. It now requires the exact recorded header and units, expected device, valid timestamps, finite nonnegative metric values and utilization within 0–100%. Each successful suite receipt contains observed sample count/span, maximum timestamp gap and minimum/median/maximum for memory, utilization, clocks, temperature and power. Wall-clock reversals are counted and leave span/gap fields unknown while preserving valid metric samples; they do not force an otherwise successful inference suite to rerun. Resume recomputes these values from the hash-verified raw CSV and rejects an edited derived summary. The [benchmark guide](../benchmarks.md#executing-a-frozen-comparison-plan) defines the units and observation boundary.
+
+All 82 Python harness tests pass on `ssh wx-workstation`, including six added tests covering summary extrema/gaps, single-sample semantics, malformed/nonfinite/unit-invalid data, wall-clock reversal handling, wrong-device suite rejection and altered summary rejection on resume. The CPU-only process/monitor integration fixture uses the real query schema and still passes. No Rust source or inference binary changes.
+
+A separate workstation audit re-summarizes nine preserved eight-column telemetry files and independently checks every metric's extrema/median, sample count, elapsed span and maximum gap. All 5,055 samples pass. These captures are historical whole-campaign/invocation observations, not new memory benchmarks or matched per-workload measurements:
+
+| Capture | Samples | Largest observed memory, MiB | Largest sample gap, seconds |
+|---|---:|---:|---:|
+| Certified-head pilot, including 12 GiB timing arms and 64 GiB verification | 1854 | 77453 | 0.541 |
+| Stock native capacity: B12X compiled | 368 | 78347 | 0.503 |
+| Stock native capacity: B12X graph | 356 | 78167 | 0.504 |
+| Stock native capacity: FlashAttention compiled | 348 | 78013 | 0.504 |
+| Stock native capacity: FlashAttention graph | 337 | 77853 | 0.504 |
+| Stock native capacity: FlashInfer compiled | 321 | 79383 | 0.504 |
+| Stock native capacity: FlashInfer graph | 310 | 79101 | 0.514 |
+| Stock native capacity: Triton attention compiled | 586 | 78085 | 0.504 |
+| Stock native capacity: Triton attention graph | 575 | 77855 | 0.504 |
+
+The local capture mixes configurations and correctness/timing phases; each stock capture includes initialization and five capacity workloads. These values therefore cannot rank equal-workload engine memory. They include device-wide contributions and may miss short-lived peaks between observations. They do not establish occupied KV high-water marks, actual admission waves, forced pool saturation or simultaneous native-batch residency.
+
+Artifacts are `clean-work/pro6000-baseline/telemetry-summary-v2/`: independent audit SHA-256 `7e696b592648f4999627448b3ca9d1163075737be1241f1cee79c87b087ebc5b`; executor source `9c08c5c17194d18255d675bf47cf7e65bbda142467bc9955636471cc737fa15b`. The final v2 policy reports wall-clock reversals rather than rejecting an otherwise valid suite; all historical captures have zero reversals, and their metric summaries remain unchanged from the initial v1 audit. The report pins all raw inputs, source/test/log identities and the successful no-execution preflight. The v3 matrix plan and all input pins remain unchanged; none of its fifty-four output files exists. The executor identity recorded by future suite receipts changes, so older executor receipts cannot be silently reused. Numerical acceptance, complete matrix execution and final metric/capacity reporting remain open.

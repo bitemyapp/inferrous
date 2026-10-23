@@ -12,6 +12,10 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 import execute_batch_plan as runner
 import test_compare_batch_performance as fixtures
 
+TELEMETRY_HEADER = ('timestamp, name, utilization.gpu [%], memory.used [MiB], '
+                    'clocks.current.sm [MHz], clocks.current.memory [MHz], temperature.gpu, power.draw [W]\n')
+TELEMETRY_SAMPLE = '2026/10/23 12:00:00.000, test-gpu, 1 %, 2 MiB, 3 MHz, 4 MHz, 5, 6 W\n'
+
 
 class ExecutionPlanTests(unittest.TestCase):
     def setUp(self):
@@ -48,7 +52,7 @@ class ExecutionPlanTests(unittest.TestCase):
         for name in ['stdout', 'stderr', 'telemetry_stderr']:
             paths[name].write_text('')
         paths['process'].write_text(json.dumps(dict(pid=123, argv=job['argv'])))
-        paths['telemetry'].write_text('time,name,util,memory,sm,mem,temp,power\n0,test-gpu,1,2,3,4,5,6\n')
+        paths['telemetry'].write_text(TELEMETRY_HEADER + TELEMETRY_SAMPLE)
         return 0
 
     def execute(self, side_effect=None):
@@ -74,8 +78,8 @@ import sys,time
 if '--query-compute-apps=pid' in sys.argv:
     pass
 else:
-    print('time,name,util,memory,sm,mem,temp,power', flush=True)
-    print('0,test-gpu,0,0,0,0,0,0', flush=True)
+    print('timestamp, name, utilization.gpu [%], memory.used [MiB], clocks.current.sm [MHz], clocks.current.memory [MHz], temperature.gpu, power.draw [W]', flush=True)
+    print('2026/10/23 12:00:00.000, test-gpu, 0 %, 0 MiB, 0 MHz, 0 MHz, 0, 0 W', flush=True)
     while True:
         time.sleep(1)
 ''')
@@ -104,6 +108,7 @@ print('CPU-only backend completed',flush=True)
         self.assertTrue(result['complete'])
         self.assertEqual(result['exit_code'], 0)
         self.assertEqual(result['telemetry_samples'], 1)
+        self.assertEqual(result['gpu_telemetry']['metrics']['memory_used_mib']['maximum'], 0)
         paths = runner.paths_for(self.output)
         process = json.loads(paths['process'].read_text())
         self.assertGreater(process['pid'], 0)
@@ -119,6 +124,24 @@ print('CPU-only backend completed',flush=True)
         self.assertFalse(json.loads(runner.paths_for(self.output)['result'].read_text())['complete'])
         with self.assertRaisesRegex(RuntimeError, 'failed or changed'):
             self.execute()
+
+    def test_modified_derived_telemetry_cannot_be_resumed(self):
+        self.execute()
+        result_path = runner.paths_for(self.output)['result']
+        result = json.loads(result_path.read_text())
+        result['gpu_telemetry']['metrics']['memory_used_mib']['maximum'] = 9999
+        result_path.write_text(json.dumps(result))
+        with self.assertRaisesRegex(ValueError, 'telemetry summary changed'):
+            self.execute()
+
+    def test_complete_output_with_wrong_device_telemetry_is_rejected(self):
+        def wrong_device(plan, job, paths):
+            self.fake_run(plan, job, paths)
+            paths['telemetry'].write_text(TELEMETRY_HEADER + TELEMETRY_SAMPLE.replace('test-gpu', 'other-gpu'))
+            return 0
+        with self.assertRaisesRegex(ValueError, 'telemetry device mismatch'):
+            self.execute(wrong_device)
+        self.assertFalse(json.loads(runner.paths_for(self.output)['result'].read_text())['complete'])
 
     def test_partial_or_active_artifacts_cannot_trigger_a_restart(self):
         self.save_records(self.output, self.records[:1])
@@ -211,6 +234,54 @@ print('CPU-only backend completed',flush=True)
         changed_warmup['argv'][changed_warmup['argv'].index('--warmup') + 1] = '0'
         with self.assertRaisesRegex(ValueError, 'warmup/sample policy'):
             runner.execute_comparison(self.plan, changed_warmup, 'executor-sha')
+
+
+class TelemetrySummaryTests(unittest.TestCase):
+    def summarize(self, text):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'telemetry.csv'
+            path.write_text(text)
+            return runner.summarize_telemetry(path, 'test-gpu')
+
+    def test_sampled_extrema_and_gaps_preserve_whole_suite_scope(self):
+        rows = [TELEMETRY_SAMPLE,
+                '2026/10/23 12:00:00.500, test-gpu, 100 %, 90000 MiB, 1500 MHz, 14001 MHz, 80, 300.25 W\n',
+                '2026/10/23 12:00:02.000, test-gpu, 0 %, 47 MiB, 180 MHz, 405 MHz, 40, 12 W\n']
+        result = self.summarize(TELEMETRY_HEADER + ''.join(rows))
+        self.assertEqual(result['samples'], 3)
+        self.assertEqual(result['sample_span_seconds'], 2)
+        self.assertEqual(result['backward_timestamp_steps'], 0)
+        self.assertEqual(result['maximum_sample_gap_seconds'], 1.5)
+        self.assertEqual(result['metrics']['memory_used_mib'], dict(minimum=2, median=47, maximum=90000))
+        self.assertEqual(result['metrics']['power_watts']['maximum'], 300.25)
+        self.assertIn('setup, warmups and other processes', result['scope'])
+        self.assertIn('not an exact peak', result['scope'])
+
+    def test_single_sample_has_no_observed_sampling_gap(self):
+        result = self.summarize(TELEMETRY_HEADER + TELEMETRY_SAMPLE)
+        self.assertEqual(result['sample_span_seconds'], 0)
+        self.assertIsNone(result['maximum_sample_gap_seconds'])
+
+    def test_invalid_numeric_values_units_and_header_are_rejected(self):
+        for old, new in [('1 %', '101 %'), ('2 MiB', '-2 MiB'), ('2 MiB', 'nan MiB'),
+                         ('6 W', 'inf W'), ('3 MHz', 'N/A'), ('2 MiB', '2 GiB'), ('6 W', 'true W')]:
+            with self.subTest(value=new), self.assertRaisesRegex(ValueError, 'telemetry'):
+                self.summarize(TELEMETRY_HEADER + TELEMETRY_SAMPLE.replace(old, new))
+        for text in ['', TELEMETRY_HEADER, TELEMETRY_HEADER.replace('MiB', 'GiB') + TELEMETRY_SAMPLE,
+                     TELEMETRY_HEADER + TELEMETRY_SAMPLE.rstrip() + ', extra\n']:
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'telemetry'):
+                self.summarize(text)
+
+    def test_malformed_timestamps_reject_but_wall_clock_reversal_marks_time_unknown(self):
+        with self.assertRaisesRegex(ValueError, 'telemetry timestamp'):
+            self.summarize(TELEMETRY_HEADER + TELEMETRY_SAMPLE.replace('2026/10/23', 'not-a-date'))
+        later = TELEMETRY_SAMPLE.replace('12:00:00.000', '12:00:01.000')
+        result = self.summarize(TELEMETRY_HEADER + later + TELEMETRY_SAMPLE)
+        self.assertEqual(result['samples'], 2)
+        self.assertEqual(result['backward_timestamp_steps'], 1)
+        self.assertIsNone(result['sample_span_seconds'])
+        self.assertIsNone(result['maximum_sample_gap_seconds'])
+        self.assertEqual(result['metrics']['memory_used_mib']['maximum'], 2)
 
 
 if __name__ == '__main__':

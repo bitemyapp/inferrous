@@ -4,7 +4,7 @@
 
 - [Engine guide](qwen3-8b-w8a8/README.md): design, numerical contract, build, tests and reproduction.
 - [Paged sessions and batching](qwen3-8b-w8a8/sessions.md): configuration, CLI, ownership and validation status.
-- [Benchmarks](qwen3-8b-w8a8/benchmarks.md): workloads, timing boundaries and comparisons with stock engines.
+- [Benchmarks](qwen3-8b-w8a8/benchmarks.md): workloads, timing boundaries, device-wide sampled-memory reporting and comparisons with stock engines.
 - [Kernel profiling and racecheck coverage](qwen3-8b-w8a8/profiling.md): opt-in CUPTI traces, complete-record validation, timing boundaries and exhaustive partition coverage audits.
 - [Validation coverage](qwen3-8b-w8a8/coverage.md) and [known numerical discrepancies](qwen3-8b-w8a8/discrepancies.md).
 - [Torch reference cache-mode sensitivity](qwen3-8b-w8a8/results/pro6000-reference-cache-modes.md): full-model cached/recomputed differences on identical token histories, fresh controls and the unchanged acceptance boundary.

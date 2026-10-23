@@ -6,12 +6,15 @@ performance acceptance. Those remain prerequisites and a separate final audit.
 """
 import argparse
 import csv
+from datetime import datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
+from statistics import median
 import time
 
 from compare_batch_performance import collect
@@ -164,6 +167,53 @@ def require_idle_gpu():
         raise RuntimeError('GPU already has a compute process; leave it running and resume later')
 
 
+def summarize_telemetry(path, device):
+    """Validate device-wide samples; never infer per-request or exact peak usage."""
+    header = ['timestamp', 'name', 'utilization.gpu [%]', 'memory.used [MiB]',
+              'clocks.current.sm [MHz]', 'clocks.current.memory [MHz]',
+              'temperature.gpu', 'power.draw [W]']
+    fields = [('utilization_percent', '%'), ('memory_used_mib', 'MiB'),
+              ('sm_clock_mhz', 'MHz'), ('memory_clock_mhz', 'MHz'),
+              ('temperature_celsius', ''), ('power_watts', 'W')]
+    with Path(path).open() as stream:
+        rows = [[cell.strip() for cell in row] for row in csv.reader(stream)]
+    if len(rows) < 2 or rows[0] != header or any(len(row) != len(header) for row in rows[1:]):
+        raise ValueError('missing or malformed GPU telemetry')
+    timestamps = []
+    values = {name: [] for name, _ in fields}
+    for row in rows[1:]:
+        if row[1] != device:
+            raise ValueError('GPU telemetry device mismatch')
+        try:
+            timestamp = datetime.strptime(row[0], '%Y/%m/%d %H:%M:%S.%f')
+        except ValueError as error:
+            raise ValueError('invalid GPU telemetry timestamp') from error
+        timestamps.append(timestamp)
+        for cell, (name, unit) in zip(row[2:], fields):
+            suffix = ' ' + unit if unit else ''
+            if suffix and not cell.endswith(suffix):
+                raise ValueError(f'invalid GPU telemetry units: {name}')
+            number = cell[:-len(suffix)] if suffix else cell
+            try:
+                value = float(number)
+            except ValueError as error:
+                raise ValueError(f'invalid GPU telemetry value: {name}') from error
+            if not math.isfinite(value) or value < 0 or (name == 'utilization_percent' and value > 100):
+                raise ValueError(f'invalid GPU telemetry value: {name}')
+            values[name].append(value)
+    gaps = [(after - before).total_seconds() for before, after in zip(timestamps, timestamps[1:])]
+    backwards = sum(gap < 0 for gap in gaps)
+    return dict(device=device, samples=len(timestamps), first_timestamp=rows[1][0],
+                last_timestamp=rows[-1][0], backward_timestamp_steps=backwards,
+                sample_span_seconds=None if backwards else (timestamps[-1] - timestamps[0]).total_seconds(),
+                maximum_sample_gap_seconds=max(gaps) if gaps and not backwards else None,
+                scope='Device-wide samples over the whole captured interval; setup, warmups and other processes may contribute. '
+                      'The maximum memory sample is not an exact peak, per-request allocation or KV occupancy.',
+                timestamp_clock='host-local wall clock',
+                metrics={name: dict(minimum=min(samples), median=median(samples), maximum=max(samples))
+                         for name, samples in values.items()})
+
+
 def run_measured(plan, job, paths):
     environment = os.environ | plan['environment']
     with paths['telemetry'].open('x') as telemetry, paths['telemetry_stderr'].open('x') as monitor_error:
@@ -198,6 +248,9 @@ def execute_suite(plan, job, device, executor_sha256):
         if set(saved['artifact_sha256']) != expected_paths or any(sha(Path(path)) != digest for path, digest in saved['artifact_sha256'].items()):
             raise ValueError('completed suite artifacts changed')
         validate_suite(plan, job, device)
+        telemetry = summarize_telemetry(paths['telemetry'], device)
+        if saved.get('gpu_telemetry') != telemetry or saved['telemetry_samples'] != telemetry['samples']:
+            raise ValueError('completed suite telemetry summary changed')
         return saved
     if output.exists() or any(path.exists() for path in paths.values()):
         raise RuntimeError(f'{job["name"]}: partial or active suite; refuse to overwrite or restart it')
@@ -212,11 +265,9 @@ def execute_suite(plan, job, device, executor_sha256):
             raise RuntimeError(f'suite process exited {result["exit_code"]}')
         verify_inputs(plan)
         validation = validate_suite(plan, job, device)
-        with paths['telemetry'].open() as stream:
-            samples = list(csv.reader(stream))
-        if len(samples) < 2 or any(len(row) != 8 for row in samples):
-            raise ValueError('missing or malformed GPU telemetry')
-        result.update(complete=True, validation=validation, telemetry_samples=len(samples) - 1,
+        telemetry = summarize_telemetry(paths['telemetry'], device)
+        result.update(complete=True, validation=validation, telemetry_samples=telemetry['samples'],
+                      gpu_telemetry=telemetry,
                       artifact_sha256={str(path): sha(path) for path in [output] + [p for name, p in paths.items() if name != 'result']})
     except Exception as error:
         result['error'] = repr(error)
