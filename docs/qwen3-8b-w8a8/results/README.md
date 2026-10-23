@@ -4,6 +4,7 @@ Each optimization round's raw artifacts (measurement JSONL, logs, profiles, scri
 
 | Page | Records |
 |---|---|
+| [RTX PRO 6000 acceptance audit](pro6000-acceptance-audit.md) | Current requirements, retained versus historical/isolated evidence, fresh capacity probes and remaining acceptance work |
 | [Initial baseline, first optimization pass and round 2 (2026-10-02)](rounds-1-2.md) | [round 1 record](../optimization/round-1.md), [round 2 record](../optimization/round-2.md) |
 | [Round 3 (2026-10-03)](round-3.md) | [round 3 record](../optimization/round-3.md) |
 | [Round 4 (2026-10-03)](round-4.md) | [round 4 record](../optimization/round-4.md) |

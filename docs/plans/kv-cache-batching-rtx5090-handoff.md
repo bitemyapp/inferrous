@@ -1,6 +1,6 @@
 # RTX 5090 KV cache and batching handoff
 
-Resumed on the RTX PRO 6000 at `ssh wx-workstation`; see [round 8](../qwen3-8b-w8a8/optimization/round-8.md) for current work and evidence. All builds, tests and benchmarks now run on that remote workstation. The historical RTX 5090 checkpoint below remains unchanged in scope; its raw local artifacts are not assumed to exist on the PRO machine.
+Resumed on the RTX PRO 6000 at `ssh wx-workstation`; see the [current acceptance audit](../qwen3-8b-w8a8/results/pro6000-acceptance-audit.md) for requirement status and [round 8](../qwen3-8b-w8a8/optimization/round-8.md) for the work history. All builds, tests and benchmarks now run on that remote workstation. The historical RTX 5090 checkpoint below remains unchanged in scope; its raw local artifacts are not assumed to exist on the PRO machine.
 
 Paused at the user's request on 2026-10-20. Resume branch `feat/kv-cache-batching-rtx5090` in [bitemyapp/inferrous](https://github.com/bitemyapp/inferrous/tree/feat/kv-cache-batching-rtx5090). The latest implementation commit is `53ef642` (`Pipeline RTX 5090 projections and reuse staged head inputs`); this handoff follows it without changing production code. The checkout is `/home/callen/work/inferrous`. No benchmark, test or sanitizer job remained running at handoff.
 

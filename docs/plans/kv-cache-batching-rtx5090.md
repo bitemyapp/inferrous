@@ -1,6 +1,6 @@
 # KV cache, batching and RTX 5090 performance work
 
-Resumed on 2026-10-20 using the RTX PRO 6000 at `ssh wx-workstation`. All builds, tests and benchmarks run remotely. [Round 8](../qwen3-8b-w8a8/optimization/round-8.md) tracks the new work separately from the historical RTX 5090 checkpoints below. The full performance matrix and acceptance audit remain required.
+Resumed on 2026-10-20 using the RTX PRO 6000 at `ssh wx-workstation`. All builds, tests and benchmarks run remotely. [Round 8](../qwen3-8b-w8a8/optimization/round-8.md) tracks the new work separately from the historical RTX 5090 checkpoints below. The [current interim acceptance audit](../qwen3-8b-w8a8/results/pro6000-acceptance-audit.md) maps evidence and gaps to these requirements. The full performance matrix and final completion audit remain required.
 
 Started 2026-10-20 on `feat/kv-cache-batching-rtx5090`, from the validated local setup commit `491f1c2`. The original release executable and measurements are preserved under `clean-work/kv-batch-baseline/`. This document tracks implementation and evidence; unchecked items remain requirements, not claims of completion.
 
