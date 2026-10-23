@@ -12,6 +12,8 @@ The [fresh retained split-K sustained-output profiles](optimization/round-8.md#r
 
 An isolated [wider PV tile screen](optimization/round-8.md#wider-ordered-pv-tiles-no-broad-gain) then checks eight/sixteen-row sharing with the original ordered arithmetic. All independent and sanitizer cases pass, but neither variant provides a broad gain across the sixteen measured shapes. In particular, both are slower at 512 rows and 32K stride. The production four-row PV kernel remains selected; the operator-only prototypes are not included in this checkout.
 
+The subsequent [two-rows-per-thread PV prototype](optimization/round-8.md#two-ordered-pv-rows-per-thread) passes independent checks and both sanitizers and improves the larger operator shapes, including 1.147×/1.122× at 512 rows and 4K/32K strides. Small shapes regress. An isolated model trial restricts dispatch to the measured larger row counts with full eight-row groups; operator gains alone do not establish a retained model improvement.
+
 Choose a fresh output path and a request array described in the [session guide](sessions.md). For cold-prefix profiling, copy the appropriate hardware configuration and set `prefix_cache_entries: 0`; record whether logit verification and CUDA graphs are enabled.
 
 ```sh

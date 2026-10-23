@@ -1167,3 +1167,38 @@ Reject the sixteen-row variant and do not integrate the eight-row variant from t
 Release register counts are 56/61/60 for four/eight/sixteen rows; checked counts are 68/70/68. Shared storage rises from 17,408 to 25,600/41,984 bytes. All have zero stack/local storage. These counts constrain a future design but do not independently explain its timing. The audit rechecks unchanged production dispatch, source/binary/receipt identities, all reference and sanitizer inventories, coverage of every partial group size, all ninety-six event records, recomputed medians/ratios and extracted resources.
 
 Artifacts are `wide-pv-v1/`: source identity `d87bb002fa0b3753f909745fe75c0f56420934119dbd589b9e6bf7cb71078b28`, patch `99c38fc27a65219eeee99f796f8d6c63de9e2dac61b9bc6ed0aac924c3663637`, completion `b5a4e63072bd55e3318435c7720e6496cf773867e3baacd22d2aaaabd1d3a040`, and audit `7dc6809d15692e39b05ec8f479e13719d76136bbd366cdaf331d39fd153c7e9c`. Frozen release/checked test binaries are `1fda5d824eeb98d8913919f9d7c7d9e7d602a97080c4ba5f128bf44419cb1e36` / `e3b4d4a92bf6c06c85d50fbeac948727bdd19d09196355adfff20bcfc85f6e18`. The runner is terminal. Production remains the qualified split-K CLI; the original numerical gate, every-case stock wins and unexecuted v4 matrix remain open.
+
+## Two ordered PV rows per thread
+
+The next isolated prototype changes reuse within each thread. Four warps cover eight consecutive query rows; each thread keeps eight independent accumulators for two rows and four GQA heads. One loaded BF16 value serves both rows. The first row's loop stops at its own causal end, and the second row consumes its remaining key separately. Padded rows duplicate the last valid row without publishing outputs. All sums retain ascending key order, separate FP32 multiplication/addition and the original BF16 cast. The 128 threads collectively stage two value vectors and four probability vectors each, with the same alternating buffers and synchronization discipline.
+
+All eighty independent cases pass in release and checked builds and under unfiltered focused memcheck/racecheck, with zero errors/hazards/warnings. The reference retains the preceding experiment's twenty row counts, two probability patterns, shuffled pages, sequence/page boundaries, NaN causal tails, fresh output guards and eager/graph execution. It covers every partial group size from one through eight. The independent CPU computes every ordered sum and explicit BF16 rounding; the existing paged control also matches. Larger timing shapes compare all outputs and guards with the original four-row kernel.
+
+The sixteen-shape A/B/B/A screen uses three excluded warmups and seven event measurements per arm, yielding fourteen samples per variant and sixty-four records. A 256 MiB eviction precedes each interval; input construction, allocation and transfers are excluded. Median microseconds follow. These are constructed-probability PV operator measurements, not model latency results.
+
+| Rows | Score stride | Four-row baseline | Two rows per thread |
+|---:|---:|---:|---:|
+| 1 | 64 | 8.192 | 8.192 |
+| 7 | 512 | 16.128 | 20.480 |
+| 17 | 4096 | 77.824 | 120.832 |
+| 33 | 32768 | 798.720 | 921.600 |
+| 32 | 512 | 18.432 | 22.528 |
+| 128 | 512 | 38.912 | 32.768 |
+| 256 | 512 | 55.296 | 53.248 |
+| 512 | 512 | 71.696 | 67.616 |
+| 32 | 4096 | 102.400 | 120.832 |
+| 128 | 4096 | 282.624 | 235.408 |
+| 256 | 4096 | 509.840 | 477.216 |
+| 512 | 4096 | 974.608 | 849.664 |
+| 32 | 32768 | 788.480 | 920.576 |
+| 128 | 32768 | 2364.736 | 1977.344 |
+| 256 | 32768 | 4394.880 | 4012.416 |
+| 512 | 32768 | 8846.208 | 7885.568 |
+
+The larger shapes warrant an isolated model trial: 128-row speedups are 1.187–1.201×, and 512-row/4K and /32K speedups are 1.147× and 1.122×. Thirty-two-row and small partial-group cases regress. The 32K/512 baseline arms drift from 8.410 to 9.261 ms while candidate arms are 7.914 and 7.867 ms; both candidate arms improve, but the pooled ratio should not hide that drift. Release/checked register counts rise from 56/68 to 72/86; shared storage rises from 17,408 to 25,600 bytes, with zero stack/local storage in both kernels.
+
+The operator worktree `/home/callen/work/inferrous-paired-pv` and its completed artifacts are immutable. `paired-pv-v1/` records source identity `fc2a3654831ce02e44dcc4a7f9f264036efa65ad02cf7dccdf965a3382639743`, patch `b6da30b4072b1c30f2a7b62bb95fb9dad071f41d44181dc42a3259074a6438c5`, completion `167ca9bc095f561ff494196a1634e9d39bc7e2d373455396b8835c543be4fb83` and audit `f8747dd5a257f01723b09bdfeaf9c982fdd3f7bad12f81e055e33495a54de9bc`. Frozen release/checked test binaries are `5c0e56708a9b3a449b5dd4947f66746e19e4567e520489fe66904230e0038839` / `73c86aacaebe1e51e9151704219b933487b009926a6e627e2988d16201950e32`. The audit verifies source/binary/receipt identities, all case inventories, event records, recomputed statistics and resources, and unchanged production dispatch.
+
+A separate `/home/callen/work/inferrous-paired-pv-model` worktree tests model dispatch only for tiled PRO prefill with 128/256/512 input rows and entirely full eight-row groups. It owns separate value-group metadata in `Step`, resets the count before each submission, keeps four-row QK grouping and excludes decode. Both ordinary suites pass twenty-six tests (84.23/84.02 seconds). The first three cold/graph/chunk-512 suites match exactly across retained/release/checked CLIs: six workloads and ninety-six full-vocabulary hashes per repetition, with two repetitions. The broader eighteen-suite comparison and four-workload paired timing screen are separate follow-ups; this early result does not establish their completion. This candidate is not retained; production remains the split-K CLI, and the original numerical and final-stock gates remain open.
+
+The initial model evidence is under `paired-pv-model-v1/`: source identity `391771d035f574f7886ef08e7226f87e392725d1d5a44eb2fa086b4e44785416`, patch `fe21c805e51b4e3ed8dd5bbe16ff6c91d199f366a4848901d683b9ff9b3b087d`, build completion `7626390468fcaabd9e2635653ce97022c0d759370dd70de5f8dfc065c69c9054`, and ordinary-suite completion `552e3252c1733d4bab9151b2d007d403c2ad08996780b848599824067d948b73`. Frozen release/checked CLIs are `7307072880c59bf86bc9d62dadc863fe08f06fff0f7086705663b4725f4f2aa6` / `cfc32d114c120722730c44e8aa31fea5c7fd4392fff9327483ff220bae3fba3a`. The separate three-suite early comparison is `paired-pv-model-qualification-v1/early-cold-graph512-regression.json`, SHA-256 `e8cc23a5ca8b0ce41bcd4f1eef9b2268ecfc7a4337e58c25632175108a33075b`.
