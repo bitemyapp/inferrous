@@ -1218,4 +1218,29 @@ The first model A/B/B/A screen compares the retained split-K CLI with the isolat
 
 The short cases are effectively unchanged. Both candidate arms improve the two longer-prefill cases, supporting broader qualification without claiming a stock win. The 358 whole-interval telemetry samples span setup, warmups and measurements: median SM clocks per arm are 1,515–1,537 MHz, maximum temperature is 82°C and maximum sampled device memory is 77,455 MiB. These are device-wide observations, not exact per-workload peaks or allocation deltas; sequential timing samples do not establish independent confidence intervals.
 
-Artifacts are `paired-pv-model-paired-v1/`: input identity `580bb8fbee7eacb8667a188308a91e7bcc719e79318d57c5ded11ae947cdf5e7`, completion `edd6fde151f2df08bf0790262d5733e93bb667e765cba3dd7b6ec563b64ff565`, and audit `6f0316cc90dfb9d2fa9d26b4a472a066a38e5aabe5e4d9ed278d30705afe99e3`. This screen is complete and its runner is terminal. A fresh `paired-pv-model-paired-v2/` trial expands to twenty measured samples per binary/workload across cold reuse, warm prefixes and true recomputation. Four native tests and integrated memcheck/new-family racecheck are queued under `paired-pv-model-native-sanitizers-v1/`, conditional on the expanded audit confirming the longer-prefill gains. Those follow-ups are not yet recorded as passes. Production and the frozen v4 final-matrix plan remain unchanged; original numerical acceptance, every-case stock wins and the final report remain unfinished.
+Artifacts are `paired-pv-model-paired-v1/`: input identity `580bb8fbee7eacb8667a188308a91e7bcc719e79318d57c5ded11ae947cdf5e7`, completion `edd6fde151f2df08bf0790262d5733e93bb667e765cba3dd7b6ec563b64ff565`, and audit `6f0316cc90dfb9d2fa9d26b4a472a066a38e5aabe5e4d9ed278d30705afe99e3`. This screen is complete and its runner is terminal. The expanded twenty-sample trial is recorded below. Four native tests and integrated memcheck/new-family racecheck remain under qualification in `paired-pv-model-native-sanitizers-v1/`; they are not yet recorded as passes. Production and the frozen v4 final-matrix plan remain unchanged; original numerical acceptance, every-case stock wins and the final report remain unfinished.
+
+## Expanded paired-row PV model trial
+
+A fresh A/B/B/A trial repeats all four workloads in cold reuse, warm-prefix reuse and genuine full-prefix recomputation. Each of the twelve resident suites excludes three warmups and measures ten repetitions per workload, yielding twenty measured samples per binary/workload/mode and 624 complete records. The 64 GiB/batch-thirty-two/chunk-512 configuration and frozen binaries match the initial screen; prefix mode enables thirty-two retained entries. Full-logit transfer remains disabled during timing, with exact qualification supplied separately above. The audit checks every generated token and finish reason, all processed/reused-token counts, page release, configuration/model/binary identity, receipts and telemetry, and recomputes every median and arm comparison.
+
+The workload column gives batch size / prompt tokens / output tokens per request. Times are median API milliseconds; negative changes mean lower candidate latency.
+
+| Mode | Workload | Retained | Candidate | Latency change | First/second arm-pair changes |
+|---|---|---:|---:|---:|---:|
+| Cold | 1/5/8 | 50.110 | 50.396 | +0.57% | +0.90% / −0.16% |
+| Cold | 1/513/2 | 48.717 | 48.711 | −0.01% | +1.13% / −1.01% |
+| Cold | 1/8192/2 | 2093.700 | 2018.848 | −3.58% | −2.49% / −4.38% |
+| Cold | 4/2048/2 | 891.475 | 869.898 | −2.42% | −1.48% / −3.16% |
+| Prefix | 1/5/8 | 50.277 | 50.302 | +0.05% | −0.66% / +0.24% |
+| Prefix | 1/513/2 | 12.641 | 12.619 | −0.18% | −0.48% / +0.20% |
+| Prefix | 1/8192/2 | 45.777 | 45.611 | −0.36% | −1.07% / +0.32% |
+| Prefix | 4/2048/2 | 51.850 | 50.883 | −1.86% | −2.59% / −1.25% |
+| Recompute | 1/5/8 | 69.846 | 69.967 | +0.17% | +0.23% / +0.27% |
+| Recompute | 1/513/2 | 88.252 | 89.115 | +0.98% | +2.07% / −0.12% |
+| Recompute | 1/8192/2 | 4259.503 | 4103.569 | −3.66% | −3.05% / −3.89% |
+| Recompute | 4/2048/2 | 1791.079 | 1759.902 | −1.74% | −1.52% / −1.90% |
+
+The longer-prefill gains repeat in both arm pairs: solo 8K improves 3.58% cold and 3.66% recomputed, while four 2K prompts improve 2.42% cold, 1.86% with warm prefixes and 1.74% recomputed. The other cases have no consistent useful improvement. In particular, 513-token recomputation is 0.98% slower overall, with +2.07%/−0.12% arm changes; do not describe it as a win or infer a uniform speedup. The 1,339 whole-interval telemetry samples reach 87°C and 77,455 MiB sampled device memory; per-arm median SM clocks range from 1,492 to 2,212 MHz across these different workloads/modes. These device-wide samples include setup and warmups and are not exact per-case peaks or evidence of causation.
+
+Artifacts are `paired-pv-model-paired-v2/`: input identity `3f9a0230a6ed87065f2758732bdfb2694d4577ed56303f879fc58c5d431e4734`, completion `257e3cf339cf29d09c21a637c458717f8bd0fa27c31943826c545851d0dbb739` and audit `8bfc4a332e3b8376e7772b5cb1b61ea02cef00cc2fc49022c5480ad64dd22bba`. The timing runner is terminal. Its successful audit allowed the native/sanitizer queue to start; those results remain pending. The sanitizer workload uses two requests with 320/513 prompt tokens and two outputs each. Source review identifies a reused prefill `Step` shape of 128 input rows, one output row and stride 512: full eight-row groups are followed by ragged groups, requiring `value_tile_count` to reset before fallback. `paired-pv-model-native-sanitizers-v1/workload-review.json` (`6bb620103a1d9d3ffe624d7d44cbb78a1835d9bfe3fd60e3bbab9d07ea0bee5b`) records that expectation; only the actual inventory and output comparison can establish execution coverage. No production retention, final stock ranking or original numerical-gate acceptance follows from the timing result alone.
