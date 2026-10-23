@@ -12,7 +12,7 @@
 - [Results summaries](qwen3-8b-w8a8/results/README.md) for every round.
 - [Round 8: RTX PRO 6000 batching](qwen3-8b-w8a8/optimization/round-8.md): remote-only builds/tests/benchmarks, complete aggregate sanitizer coverage, operator screens, explicit attention-reference investigation and full-matrix preparation.
 - [RTX PRO 6000 asynchronous projections and 32-row head](qwen3-8b-w8a8/results/pro6000-async-projections-head32.md): rejected projections and a retained head with paired model gains, sanitizer checks and native-session validation.
-- [Exact-output head certification](research/exact-head-certification.md): guarded numerical contract, integer-center reconstruction, directed error bounds and the first complete operator screen.
+- [Exact-output head certification](research/exact-head-certification.md): guarded numerical contract, complete operator comparisons, and isolated model correctness/native-capacity validation; paired model timing remains pending.
 - [RTX PRO 6000 cache-mode pilots](qwen3-8b-w8a8/results/pro6000-cache-mode-pilots.md): completed stock prefix/recomputation screens, matching local medians and pilot limitations.
 - [RTX PRO 6000 segmented-attention operators](qwen3-8b-w8a8/results/pro6000-segmented-attention.md): independent-reference and sanitizer checks, complete shape timings and the short-context gap.
 - [RTX PRO 6000 128-row projections](qwen3-8b-w8a8/results/pro6000-m128-projections.md): complete correctness/sanitizer checks and the rejected operator screen.
