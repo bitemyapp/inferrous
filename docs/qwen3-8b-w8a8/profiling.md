@@ -4,6 +4,8 @@ The Nix shell includes CUDA 13.4 CUPTI headers and libraries. `tools/profile_ker
 
 On `wx-workstation`, set `CUDA_HOME=/usr/local/cuda-13.1`. The wrapper supports both `lib` and `lib64` toolkit layouts and selects the current kernel activity record declared by that toolkit's primary CUPTI header. The collector rejects a header/runtime API version mismatch before collecting records. CUDA 13.1 on the RTX PRO 6000 has been exercised with complete batch-32 and 8K traces; these are separate from the RTX 5090 traces below.
 
+The [retained-binary sustained-output profiles](optimization/round-8.md#retained-binary-sustained-output-profiles) use the certified-head CLI and final 64 GiB cold configuration. Batch-32/prompt-129 and solo/prompt-8192 requests each generate thirty-two outputs over three invocations, yielding 78,456 and 78,405 complete kernel records. Their audited controls preserve generated tokens and accounting. These current profiles supplement the historical eight-output traces; they are not numerical acceptance or performance-ranking evidence.
+
 Choose a fresh output path and a request array described in the [session guide](sessions.md). For cold-prefix profiling, copy the appropriate hardware configuration and set `prefix_cache_entries: 0`; record whether logit verification and CUDA graphs are enabled.
 
 ```sh
