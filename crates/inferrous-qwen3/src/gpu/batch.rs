@@ -1,0 +1,1826 @@
+//! Paged, ragged execution with reusable session ownership and bounded scratch.
+use super::certified_head::{CertificateWorkspace, CertifiedHead};
+use super::*;
+use crate::{
+    cache::{CacheLease, CachePool, CacheUsage},
+    config::{CacheMode, EngineConfig, PAGE_TOKENS},
+};
+use anyhow::ensure;
+use serde::Serialize;
+use std::collections::VecDeque;
+
+pub struct Session<'engine> {
+    owner: &'engine BatchEngine,
+    cache: CacheLease,
+    tokens: Vec<u32>,
+}
+impl<'engine> Session<'engine> {
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+    pub fn cached_tokens(&self) -> usize {
+        self.cache.written_tokens()
+    }
+
+    pub fn append(&mut self, tokens: &[u32]) -> Result<()> {
+        ensure!(
+            self.tokens
+                .len()
+                .checked_add(tokens.len())
+                .is_some_and(|n| n < self.owner.config.max_context),
+            "session exceeds context"
+        );
+        ensure!(
+            tokens.iter().all(|&id| (id as usize) < VOCAB),
+            "token outside vocabulary"
+        );
+        self.tokens.extend_from_slice(tokens);
+        Ok(())
+    }
+
+    /// Fork immutable full pages; the unfinished tail is recomputed privately.
+    pub fn fork(&self) -> Result<Session<'engine>> {
+        let cached = self.cache.written_tokens() / PAGE_TOKENS * PAGE_TOKENS;
+        Ok(Session {
+            owner: self.owner,
+            cache: self.cache.fork_prefix(cached)?,
+            tokens: self.tokens.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionOptions {
+    pub max_tokens: usize,
+    pub stop_ids: Vec<u32>,
+    pub cache: CacheMode,
+}
+
+#[derive(Serialize)]
+pub struct BatchGeneration {
+    pub generations: Vec<Generation>,
+    pub elapsed_seconds: f64,
+    pub processed_tokens: usize,
+    pub reused_tokens: usize,
+}
+
+/// Lifetime totals for automatic prefix-cache operations, including admission retries.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct PrefixCacheCounters {
+    pub lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub matched_tokens: u64,
+    pub capacity_evictions: u64,
+    pub entry_limit_evictions: u64,
+    pub replacements: u64,
+    pub cleared_entries: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PrefixCacheStats {
+    pub counters: PrefixCacheCounters,
+    pub resident_entries: usize,
+    /// Logical token references; overlapping prefixes can share physical pages.
+    pub resident_tokens: usize,
+}
+
+struct Prefix {
+    tokens: Vec<u32>,
+    cache: CacheLease,
+}
+
+/// Partition packed rows without ever sharing a tile across sequence slots or
+/// nonconsecutive positions. Each pair is (first row, count), with count <= LIMIT.
+fn query_tiles<const LIMIT: usize>(info: &[u32]) -> Result<Vec<u32>> {
+    ensure!((1..=8).contains(&LIMIT), "invalid query tile limit");
+    ensure!(info.len() % 2 == 0, "incomplete query row metadata");
+    ensure!(info.len() / 2 <= 1024, "too many query rows");
+    let mut tiles = Vec::new();
+    let mut first = 0;
+    while first < info.len() / 2 {
+        let mut count = 1;
+        while count < LIMIT && first + count < info.len() / 2 {
+            let row = first + count;
+            if info[row * 2] != info[first * 2]
+                || info[(row - 1) * 2 + 1].checked_add(1) != Some(info[row * 2 + 1])
+            {
+                break;
+            }
+            count += 1;
+        }
+        tiles.extend([first as u32, count as u32]);
+        first += count;
+    }
+    Ok(tiles)
+}
+
+struct Step {
+    // Captured storage must be destroyed before any of its allocations.
+    graph: Option<Graph>,
+    shape: (usize, usize, usize),
+    w: Workspace,
+    certificate: Option<CertificateWorkspace>,
+    projection_partials: Option<DeviceBuffer<i32>>,
+    input: DeviceBuffer<u32>,
+    info: DeviceBuffer<u32>,
+    query_tiles: DeviceBuffer<u32>,
+    query_tile_count: usize,
+    value_tiles: DeviceBuffer<u32>,
+    value_tile_count: usize,
+    table: DeviceBuffer<u32>,
+    outputs: DeviceBuffer<u32>,
+    stream: Arc<CudaStream>,
+}
+impl Step {
+    fn new(
+        stream: &Arc<CudaStream>,
+        shape: (usize, usize, usize),
+        table_len: usize,
+        certified: bool,
+        split_projection: bool,
+    ) -> Result<Self> {
+        let (n, output_rows, stride) = shape;
+        Ok(Self {
+            graph: None,
+            projection_partials: if split_projection && n == 32 {
+                Some(DeviceBuffer::zeroed(stream, 4 * 32 * 4096)?)
+            } else {
+                None
+            },
+            shape,
+            certificate: if certified && output_rows == 32 {
+                Some(CertificateWorkspace::new(stream)?)
+            } else {
+                None
+            },
+            w: Workspace::with_shape(stream, n, output_rows.max(1), stride)?,
+            input: DeviceBuffer::zeroed(stream, n)?,
+            info: DeviceBuffer::zeroed(stream, n * 2)?,
+            query_tiles: DeviceBuffer::zeroed(stream, n * 2)?,
+            query_tile_count: 0,
+            value_tiles: DeviceBuffer::zeroed(stream, n * 2)?,
+            value_tile_count: 0,
+            table: DeviceBuffer::zeroed(stream, table_len)?,
+            outputs: DeviceBuffer::zeroed(stream, output_rows.max(1))?,
+            stream: stream.clone(),
+        })
+    }
+}
+impl Drop for Step {
+    fn drop(&mut self) {
+        // Also fence a partially enqueued forward pass before fields are freed.
+        self.stream.context().record_err(self.stream.synchronize());
+    }
+}
+
+struct Execution {
+    // A step can capture these caches: fence and destroy its graph first.
+    decode: Option<Step>,
+    prefill: Option<Step>,
+    prefixes: VecDeque<Prefix>,
+    prefix_counters: PrefixCacheCounters,
+    caches: Vec<Cache>,
+    poisoned: bool,
+}
+
+struct ExecutionFence(Option<Arc<CudaStream>>);
+impl Drop for ExecutionFence {
+    fn drop(&mut self) {
+        // A host panic must also fence before caller-owned leases can unwind.
+        if let Some(stream) = &self.0 {
+            stream.context().record_err(stream.synchronize());
+        }
+    }
+}
+
+pub struct BatchEngine {
+    execution: Mutex<Execution>,
+    pool: CachePool,
+    gpu: GpuModel,
+    certified_head: Option<CertifiedHead>,
+    config: EngineConfig,
+    model_root: String,
+    device_name: String,
+}
+
+impl BatchEngine {
+    pub fn new(model: &Model, config: EngineConfig) -> Result<Self> {
+        config.validate(model.max_context())?;
+        let device_name = CudaContext::new(0)?.device_name()?;
+        config.hardware.validate_device(&device_name)?;
+        let pool = CachePool::with_byte_budget(PAGE_TOKENS, config.kv_cache_bytes)?;
+        let gpu = GpuModel::weights_only(model)?;
+        let certified_head = if config.tuned_head
+            && config.max_batch >= 32
+            && config.hardware == crate::config::HardwareProfile::RtxPro6000
+        {
+            Some(CertifiedHead::new(&gpu.stream, &model.head)?)
+        } else {
+            None
+        };
+        let elements = pool.usage().total_pages * PAGE_TOKENS * 1024;
+        let caches = (0..36)
+            .map(|_| {
+                Ok(Cache {
+                    k: DeviceBuffer::zeroed(&gpu.stream, elements)?,
+                    v: DeviceBuffer::zeroed(&gpu.stream, elements)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        gpu.stream.synchronize()?;
+        Ok(Self {
+            execution: Mutex::new(Execution {
+                caches,
+                decode: None,
+                prefill: None,
+                prefixes: VecDeque::new(),
+                prefix_counters: PrefixCacheCounters::default(),
+                poisoned: false,
+            }),
+            pool,
+            gpu,
+            certified_head,
+            config,
+            model_root: model.root.clone(),
+            device_name,
+        })
+    }
+
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+    pub fn cache_usage(&self) -> CacheUsage {
+        self.pool.usage()
+    }
+    /// Engine-wide snapshot. Callers with concurrent requests must not interpret
+    /// differences between snapshots as counters for one individual request.
+    pub fn prefix_cache_stats(&self) -> Result<PrefixCacheStats> {
+        let execution = self
+            .execution
+            .lock()
+            .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?;
+        Ok(PrefixCacheStats {
+            counters: execution.prefix_counters,
+            resident_entries: execution.prefixes.len(),
+            resident_tokens: execution.prefixes.iter().map(|p| p.tokens.len()).sum(),
+        })
+    }
+    pub fn clear_prefixes(&self) -> Result<()> {
+        let mut execution = self
+            .execution
+            .lock()
+            .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?;
+        execution.prefix_counters.cleared_entries += execution.prefixes.len() as u64;
+        execution.prefixes.clear();
+        Ok(())
+    }
+
+    pub fn session(&self, prompt: &[u32]) -> Result<Session<'_>> {
+        self.make_session(prompt, true)
+    }
+
+    fn make_session(&self, prompt: &[u32], reuse: bool) -> Result<Session<'_>> {
+        Request {
+            prompt_ids: prompt.to_vec(),
+            max_tokens: 1,
+            stop_ids: vec![],
+        }
+        .validate_for_context(self.config.max_context)?;
+        let mut execution = self
+            .execution
+            .lock()
+            .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?;
+        ensure!(
+            !execution.poisoned,
+            "batch engine failed previously; recreate it"
+        );
+        let best = if reuse {
+            execution
+                .prefixes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.tokens.len() < prompt.len() && prompt.starts_with(&p.tokens))
+                .max_by_key(|(_, p)| p.tokens.len())
+                .map(|(i, _)| i)
+        } else {
+            None
+        };
+        let cache = if let Some(index) = best {
+            let prefix = execution.prefixes.remove(index).expect("index found above");
+            let lease = prefix.cache.fork_prefix(prefix.tokens.len())?;
+            execution.prefixes.push_back(prefix);
+            lease
+        } else {
+            self.pool.lease(0)?
+        };
+        if reuse && self.config.prefix_cache_entries > 0 {
+            execution.prefix_counters.lookups += 1;
+            if best.is_some() {
+                execution.prefix_counters.hits += 1;
+                execution.prefix_counters.matched_tokens += cache.written_tokens() as u64;
+            } else {
+                execution.prefix_counters.misses += 1;
+            }
+        }
+        Ok(Session {
+            owner: self,
+            cache,
+            tokens: prompt.to_vec(),
+        })
+    }
+
+    fn reserve(
+        &self,
+        execution: &mut Execution,
+        session: &mut Session<'_>,
+        tokens: usize,
+    ) -> Result<()> {
+        loop {
+            match session.cache.reserve(tokens) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if execution.prefixes.pop_front().is_none() {
+                        return Err(error);
+                    }
+                    execution.prefix_counters.capacity_evictions += 1;
+                }
+            }
+        }
+    }
+
+    fn remember(&self, session: &Session<'_>, prompt_len: usize) -> Result<()> {
+        if self.config.prefix_cache_entries == 0 {
+            return Ok(());
+        }
+        let length = session
+            .cache
+            .written_tokens()
+            .min(prompt_len.saturating_sub(1))
+            / PAGE_TOKENS
+            * PAGE_TOKENS;
+        if length == 0 {
+            return Ok(());
+        }
+        let tokens = session.tokens[..length].to_vec();
+        let mut execution = self
+            .execution
+            .lock()
+            .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?;
+        if let Some(index) = execution.prefixes.iter().position(|p| p.tokens == tokens) {
+            execution.prefixes.remove(index);
+            execution.prefix_counters.replacements += 1;
+        }
+        execution.prefixes.push_back(Prefix {
+            tokens,
+            cache: session.cache.fork_prefix(length)?,
+        });
+        while execution.prefixes.len() > self.config.prefix_cache_entries {
+            execution.prefixes.pop_front();
+            execution.prefix_counters.entry_limit_evictions += 1;
+        }
+        Ok(())
+    }
+
+    /// Admit bounded waves when a submitted batch exceeds available KV capacity.
+    pub fn generate(
+        &self,
+        model: &Model,
+        requests: &[Request],
+        cache: CacheMode,
+    ) -> Result<BatchGeneration> {
+        ensure!(!requests.is_empty(), "empty batch");
+        for request in requests {
+            request.validate_for_context(self.config.max_context)?;
+        }
+        let start = Instant::now();
+        let mut result = BatchGeneration {
+            generations: Vec::new(),
+            elapsed_seconds: 0.0,
+            processed_tokens: 0,
+            reused_tokens: 0,
+        };
+        let mut index = 0;
+        while index < requests.len() {
+            let first = index;
+            let mut sessions = Vec::new();
+            let mut options = Vec::new();
+            while index < requests.len() && sessions.len() < self.config.max_batch {
+                let request = &requests[index];
+                let mut session =
+                    self.make_session(&request.prompt_ids, cache == CacheMode::Reuse)?;
+                let mut execution = self
+                    .execution
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?;
+                let admitted = self.reserve(
+                    &mut execution,
+                    &mut session,
+                    request.prompt_ids.len() + request.max_tokens,
+                );
+                if let Err(error) = admitted {
+                    if sessions.is_empty() {
+                        return Err(error);
+                    }
+                    break;
+                }
+                sessions.push(session);
+                options.push(SessionOptions {
+                    max_tokens: request.max_tokens,
+                    stop_ids: request.stop_ids.clone(),
+                    cache,
+                });
+                index += 1;
+            }
+            let queue_seconds = start.elapsed().as_secs_f64();
+            let mut wave = self.generate_sessions(model, &mut sessions, &options)?;
+            for generation in &mut wave.generations {
+                generation.request_seconds += queue_seconds;
+                generation.step_seconds[0] += queue_seconds;
+            }
+            result.processed_tokens += wave.processed_tokens;
+            result.reused_tokens += wave.reused_tokens;
+            result.generations.extend(wave.generations);
+            if cache == CacheMode::Reuse {
+                for (offset, session) in sessions.iter().enumerate() {
+                    self.remember(session, requests[first + offset].prompt_ids.len())?;
+                }
+            }
+        }
+        result.elapsed_seconds = start.elapsed().as_secs_f64();
+        Ok(result)
+    }
+
+    /// Sessions borrow their engine, so device storage outlives every page lease.
+    pub fn generate_sessions(
+        &self,
+        model: &Model,
+        sessions: &mut [Session<'_>],
+        options: &[SessionOptions],
+    ) -> Result<BatchGeneration> {
+        ensure!(
+            model.root == self.model_root,
+            "session model does not match resident weights"
+        );
+        ensure!(
+            !sessions.is_empty()
+                && sessions.len() <= self.config.max_batch
+                && sessions.len() == options.len(),
+            "invalid session batch size"
+        );
+        for (session, option) in sessions.iter().zip(options) {
+            ensure!(
+                std::ptr::eq(session.owner, self) && self.pool.owns(&session.cache),
+                "session belongs to another engine"
+            );
+            Request {
+                prompt_ids: session.tokens.clone(),
+                max_tokens: option.max_tokens,
+                stop_ids: option.stop_ids.clone(),
+            }
+            .validate_for_context(self.config.max_context)?;
+        }
+        let mut execution = self
+            .execution
+            .lock()
+            .map_err(|_| anyhow::anyhow!("batch execution mutex poisoned"))?;
+        ensure!(
+            !execution.poisoned,
+            "batch engine failed previously; recreate it"
+        );
+        self.gpu.stream.synchronize()?;
+        let mut lease_fence = ExecutionFence(Some(self.gpu.stream.clone()));
+        for (session, option) in sessions.iter_mut().zip(options) {
+            if option.cache == CacheMode::Recompute {
+                session.cache.reset();
+            }
+            self.reserve(
+                &mut execution,
+                session,
+                session.tokens.len() + option.max_tokens,
+            )?;
+        }
+        let start = Instant::now();
+        let reused_tokens = sessions.iter().map(|s| s.cache.written_tokens()).sum();
+        let mut generations: Vec<_> = sessions
+            .iter()
+            .map(|_| Generation {
+                token_ids: Vec::new(),
+                text: String::new(),
+                finish_reason: "length".into(),
+                step_seconds: Vec::new(),
+                request_seconds: 0.0,
+                logit_sha256: Vec::new(),
+            })
+            .collect();
+        let mut last_emission = vec![start; sessions.len()];
+        let mut done = vec![false; sessions.len()];
+        let mut processed_tokens = 0;
+        let pages_per_sequence = self.config.max_context.div_ceil(PAGE_TOKENS);
+        // All transient GPU storage belongs to Execution/Step. An error still
+        // fences it before caller-owned session leases can be released.
+        let outcome = (|| -> Result<()> {
+            while done.iter().any(|&finished| !finished) {
+                // No sequence can advance by more than the whole token chunk.
+                // Bound the next visible prefix before packing rows, allowing
+                // larger early chunks while keeping each score allocation bounded.
+                let score_stride = sessions
+                    .iter()
+                    .zip(&done)
+                    .filter(|(_, finished)| !**finished)
+                    .map(|(session, _)| {
+                        session
+                            .tokens
+                            .len()
+                            .min(session.cache.written_tokens() + self.config.prefill_chunk)
+                    })
+                    .max()
+                    .expect("an unfinished sequence exists")
+                    .next_power_of_two()
+                    .max(PAGE_TOKENS);
+                let row_budget = self
+                    .config
+                    .prefill_chunk
+                    .min(self.config.score_scratch_bytes / (32 * score_stride * 4));
+                let mut input = Vec::new();
+                let mut info = Vec::new();
+                let mut output_rows = Vec::new();
+                let mut output_slots = Vec::new();
+                let mut ends = Vec::new();
+                let mut remaining = done.iter().filter(|&&finished| !finished).count();
+                let mut visible = 0;
+                for (slot, session) in sessions.iter().enumerate() {
+                    if done[slot] {
+                        continue;
+                    }
+                    let begin = session.cache.written_tokens();
+                    ensure!(
+                        begin < session.tokens.len(),
+                        "session has no unprocessed token"
+                    );
+                    let quota = (row_budget - input.len()) / remaining;
+                    remaining -= 1;
+                    let end = session.tokens.len().min(begin + quota);
+                    session.cache.check_append(end)?;
+                    for position in begin..end {
+                        input.push(session.tokens[position]);
+                        info.extend([slot as u32, position as u32]);
+                    }
+                    ends.push((slot, end));
+                    visible = visible.max(end);
+                    if end == session.tokens.len() {
+                        output_rows.push((input.len() - 1) as u32);
+                        output_slots.push(slot);
+                    }
+                }
+                let stride = visible.next_power_of_two().max(PAGE_TOKENS);
+                let shape = (input.len(), output_rows.len(), stride);
+                let mut table = vec![u32::MAX; self.config.max_batch * pages_per_sequence];
+                for (slot, session) in sessions.iter().enumerate() {
+                    for (logical, page) in session.cache.pages().iter().enumerate() {
+                        table[slot * pages_per_sequence + logical] = page.index();
+                    }
+                }
+                let Execution {
+                    caches,
+                    decode,
+                    prefill,
+                    ..
+                } = &mut *execution;
+                let storage = if input.len() == output_slots.len() {
+                    decode
+                } else {
+                    prefill
+                };
+                if storage.as_ref().is_none_or(|step| step.shape != shape) {
+                    // Release the previous shape before allocating its replacement,
+                    // avoiding a temporary doubling of the score workspace.
+                    drop(storage.take());
+                    *storage = Some(Step::new(
+                        &self.gpu.stream,
+                        shape,
+                        table.len(),
+                        self.certified_head.is_some(),
+                        self.config.tuned_projections
+                            && self.config.hardware == crate::config::HardwareProfile::RtxPro6000,
+                    )?);
+                }
+                let step = storage.as_mut().expect("allocated above");
+                step.input.copy_from_host(&self.gpu.stream, &input)?;
+                step.info.copy_from_host(&self.gpu.stream, &info)?;
+                step.query_tile_count = input.len();
+                step.value_tile_count = 0;
+                if self.config.tiled_attention && input.len() != output_slots.len() {
+                    let mut tiles = query_tiles::<4>(&info)?;
+                    step.query_tile_count = tiles.len() / 2;
+                    tiles.resize(input.len() * 2, 0);
+                    step.query_tiles.copy_from_host(&self.gpu.stream, &tiles)?;
+                    // The isolated operator screen qualifies only these larger
+                    // row counts with completely occupied eight-row groups.
+                    // Decode remains excluded, so no graph launch count changes.
+                    if self.config.hardware == crate::config::HardwareProfile::RtxPro6000
+                        && matches!(input.len(), 128 | 256 | 512)
+                    {
+                        let mut values = query_tiles::<8>(&info)?;
+                        if values.chunks_exact(2).all(|tile| tile[1] == 8) {
+                            step.value_tile_count = values.len() / 2;
+                            values.resize(input.len() * 2, 0);
+                            step.value_tiles.copy_from_host(&self.gpu.stream, &values)?;
+                        }
+                    }
+                }
+                step.table.copy_from_host(&self.gpu.stream, &table)?;
+                if !output_rows.is_empty() {
+                    step.outputs
+                        .copy_from_host(&self.gpu.stream, &output_rows)?;
+                }
+                if self.config.cuda_graphs && input.len() == output_slots.len() {
+                    if step.graph.is_none() {
+                        // SAFETY: Step and Execution own all captured buffers.
+                        // Metadata copies complete before capture/replay, and the
+                        // execution mutex excludes every concurrent mutation.
+                        // Multirow kernels use ordinary full-completion edges.
+                        step.graph = Some(unsafe {
+                            Graph::capture(&self.gpu.stream, false, || {
+                                self.forward(step, caches, pages_per_sequence)
+                            })?
+                        });
+                    }
+                    unsafe {
+                        step.graph.as_ref().expect("captured above").launch()?;
+                    }
+                } else {
+                    self.forward(step, caches, pages_per_sequence)?;
+                }
+                #[cfg(test)]
+                tests::after_enqueue(&self.gpu.stream)?;
+                self.gpu.stream.synchronize()?;
+                for (slot, end) in ends {
+                    sessions[slot].cache.commit_append(end)?;
+                }
+                processed_tokens += input.len();
+                if output_slots.is_empty() {
+                    continue;
+                }
+                let next = step.w.next.to_host_vec(&self.gpu.stream)?;
+                let logits = if self.config.verify_logits {
+                    Some(step.w.logits.to_host_vec(&self.gpu.stream)?)
+                } else {
+                    None
+                };
+                for (row, &slot) in output_slots.iter().enumerate() {
+                    let token = next[row];
+                    ensure!((token as usize) < VOCAB, "nonfinite or empty logits");
+                    let generation = &mut generations[slot];
+                    if let Some(logits) = &logits {
+                        generation
+                            .logit_sha256
+                            .push(logit_hash(&logits[row * VOCAB..(row + 1) * VOCAB]));
+                    }
+                    let now = Instant::now();
+                    generation
+                        .step_seconds
+                        .push(now.duration_since(last_emission[slot]).as_secs_f64());
+                    last_emission[slot] = now;
+                    generation.token_ids.push(token);
+                    sessions[slot].tokens.push(token);
+                    if options[slot].stop_ids.contains(&token) {
+                        generation.finish_reason = "stop".into();
+                        done[slot] = true;
+                    } else if generation.token_ids.len() == options[slot].max_tokens {
+                        done[slot] = true;
+                    }
+                    if done[slot] {
+                        generation.request_seconds = start.elapsed().as_secs_f64();
+                    }
+                    if options[slot].cache == CacheMode::Recompute {
+                        sessions[slot].cache.restart()?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let fence = self.gpu.stream.synchronize();
+        if fence.is_ok() {
+            lease_fence.0 = None;
+        }
+        if outcome.is_err() || fence.is_err() {
+            execution.poisoned = true;
+        }
+        outcome?;
+        fence?;
+        for generation in &mut generations {
+            generation.text = model
+                .tokenizer
+                .decode(&generation.token_ids, true)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(BatchGeneration {
+            generations,
+            elapsed_seconds: start.elapsed().as_secs_f64(),
+            processed_tokens,
+            reused_tokens,
+        })
+    }
+
+    fn forward(
+        &self,
+        step: &mut Step,
+        caches: &mut [Cache],
+        pages_per_sequence: usize,
+    ) -> Result<()> {
+        let gpu = &self.gpu;
+        let policy = if self.config.tuned_projections {
+            ProjectionPolicy::TunedBatch
+        } else {
+            ProjectionPolicy::Original
+        };
+        let w = &mut step.w;
+        let (nr, outputs, stride) = step.shape;
+        let tuned_attention = self.config.tuned_attention;
+        // Grouped PV loses occupancy at small batch sizes. QK has independent
+        // key-page tiles and can profit from grouping even for long solo decode.
+        let grouped_scores =
+            tuned_attention && (nr >= 16 || (nr >= 8 && stride >= 512) || stride >= 4096);
+        let grouped_values = tuned_attention && nr >= 16;
+        // Decode has one row per session and cannot satisfy this occupancy
+        // threshold. Only eager prefill can change the tile count/launch grid.
+        let tiled_attention = self.config.tiled_attention && nr >= 2 * step.query_tile_count;
+        // SAFETY: admission validates all tokens, row positions and page leases.
+        // Every producer/consumer is serialized on one stream. Different rows
+        // write distinct sequence positions, and all scratch allocations match
+        // the complete row shapes supplied to the generated kernel interfaces.
+        unsafe {
+            gpu.module.embedding(
+                &gpu.stream,
+                cfg(w.hidden.len()),
+                &step.input,
+                &gpu.embedding,
+                &mut w.hidden,
+            )?;
+        }
+        for (layer, cache) in gpu.layers.iter().zip(caches) {
+            gpu.norm_quantize(
+                &w.hidden,
+                &layer.gains["norm1"],
+                &mut w.norm,
+                &mut w.quant4,
+                &mut w.scales,
+                &mut w.maxima,
+            )?;
+            gpu.linear_quantized(
+                &w.quant4,
+                &w.scales,
+                &layer.weights["q"],
+                &mut w.q,
+                w.map4.as_ref(),
+                policy,
+                step.projection_partials.as_mut(),
+            )?;
+            gpu.linear_quantized(
+                &w.quant4,
+                &w.scales,
+                &layer.weights["k"],
+                &mut w.k,
+                w.map4.as_ref(),
+                policy,
+                step.projection_partials.as_mut(),
+            )?;
+            gpu.linear_quantized(
+                &w.quant4,
+                &w.scales,
+                &layer.weights["v"],
+                &mut w.v,
+                w.map4.as_ref(),
+                policy,
+                step.projection_partials.as_mut(),
+            )?;
+            unsafe {
+                gpu.module.prepare_qk_paged(
+                    &gpu.stream,
+                    rows(nr * 40, 128),
+                    &mut w.q,
+                    &mut w.k,
+                    &w.v,
+                    &layer.gains["qnorm"],
+                    &layer.gains["knorm"],
+                    &gpu.rope,
+                    &step.info,
+                    &step.table,
+                    pages_per_sequence as u32,
+                    &mut cache.k,
+                    &mut cache.v,
+                )?;
+                if tiled_attention {
+                    gpu.module.attention_scores_tiled(
+                        &gpu.stream,
+                        rows(step.query_tile_count * 8 * (stride / 64), 256),
+                        &w.q,
+                        &cache.k,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        (stride / 64) as u32,
+                        &step.query_tiles,
+                        &mut w.scores,
+                    )?;
+                } else if grouped_scores {
+                    gpu.module.attention_scores_grouped(
+                        &gpu.stream,
+                        rows(nr * 8 * (stride / 64), 128),
+                        &w.q,
+                        &cache.k,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        (stride / 64) as u32,
+                        &mut w.scores,
+                    )?;
+                } else {
+                    gpu.module.attention_scores_paged(
+                        &gpu.stream,
+                        rows(nr * 32 * (stride / 64), 128),
+                        &w.q,
+                        &cache.k,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        (stride / 64) as u32,
+                        &mut w.scores,
+                    )?;
+                }
+                gpu.module.attention_softmax_paged(
+                    &gpu.stream,
+                    rows(nr * 32, 128),
+                    &mut w.scores,
+                    &step.info,
+                    stride as u32,
+                )?;
+                if tiled_attention && step.value_tile_count > 0 {
+                    gpu.module.attention_values_tiled_pair(
+                        &gpu.stream,
+                        rows(step.value_tile_count * 32, 128),
+                        &w.scores,
+                        &cache.v,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        &step.value_tiles,
+                        &mut w.attention,
+                    )?;
+                } else if tiled_attention {
+                    gpu.module.attention_values_tiled(
+                        &gpu.stream,
+                        rows(step.query_tile_count * 8 * 4, 128),
+                        &w.scores,
+                        &cache.v,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        &step.query_tiles,
+                        &mut w.attention,
+                    )?;
+                } else if grouped_values {
+                    gpu.module.attention_values_grouped(
+                        &gpu.stream,
+                        rows(nr * 8 * 4, 32),
+                        &w.scores,
+                        &cache.v,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        &mut w.attention,
+                    )?;
+                } else {
+                    gpu.module.attention_values_paged(
+                        &gpu.stream,
+                        rows(nr * 32 * 4, 32),
+                        &w.scores,
+                        &cache.v,
+                        &step.info,
+                        &step.table,
+                        pages_per_sequence as u32,
+                        stride as u32,
+                        &mut w.attention,
+                    )?;
+                }
+            }
+            gpu.linear_residual(
+                &w.attention,
+                &layer.weights["o"],
+                &mut w.quant4,
+                &mut w.scales,
+                &mut w.o,
+                &w.maxima,
+                &w.hidden,
+                &mut w.residual,
+                w.map4.as_ref(),
+                false,
+                policy,
+                step.projection_partials.as_mut(),
+            )?;
+            gpu.norm_quantize(
+                &w.residual,
+                &layer.gains["norm2"],
+                &mut w.norm,
+                &mut w.quant4,
+                &mut w.scales,
+                &mut w.maxima,
+            )?;
+            if nr == 1 {
+                let gate = &layer.weights["gate"];
+                let up = &layer.weights["up"];
+                unsafe {
+                    gpu.module.linear_swiglu(
+                        &gpu.stream,
+                        rows(gate.n.div_ceil(8), 256),
+                        &w.quant4,
+                        &w.scales,
+                        gate.k as u32,
+                        &gate.w,
+                        &gate.scale,
+                        &mut w.gate,
+                        &up.w,
+                        &up.scale,
+                        &mut w.up,
+                        &mut w.act,
+                        &mut w.maxima,
+                        0,
+                    )?;
+                }
+            } else {
+                gpu.linear_quantized(
+                    &w.quant4,
+                    &w.scales,
+                    &layer.weights["gate"],
+                    &mut w.gate,
+                    w.map4.as_ref(),
+                    policy,
+                    step.projection_partials.as_mut(),
+                )?;
+                gpu.linear_quantized(
+                    &w.quant4,
+                    &w.scales,
+                    &layer.weights["up"],
+                    &mut w.up,
+                    w.map4.as_ref(),
+                    policy,
+                    step.projection_partials.as_mut(),
+                )?;
+                unsafe {
+                    gpu.module.swiglu(
+                        &gpu.stream,
+                        cfg(w.act.len()),
+                        &w.gate,
+                        &w.up,
+                        &mut w.act,
+                        &mut w.maxima,
+                    )?;
+                }
+            }
+            gpu.linear_residual(
+                &w.act,
+                &layer.weights["down"],
+                &mut w.quant12,
+                &mut w.scales,
+                &mut w.down,
+                &w.maxima,
+                &w.residual,
+                &mut w.hidden,
+                w.map12.as_ref(),
+                false,
+                policy,
+                step.projection_partials.as_mut(),
+            )?;
+        }
+        if outputs > 0 {
+            gpu.norm(&w.hidden, &gpu.final_gain, &mut w.norm)?;
+            unsafe {
+                let head_group = if self.config.tuned_head {
+                    match outputs {
+                        32 if self.config.hardware
+                            == crate::config::HardwareProfile::RtxPro6000 =>
+                        {
+                            32
+                        }
+                        0..=2 => 1,
+                        3..=4 => 4,
+                        _ if outputs % 16 == 0 || outputs % 16 >= 9 => 16,
+                        _ => 8,
+                    }
+                } else {
+                    1
+                };
+                match head_group {
+                    32 => {
+                        let weights = self
+                            .certified_head
+                            .as_ref()
+                            .expect("PRO tuned head weights");
+                        let scratch = step
+                            .certificate
+                            .as_mut()
+                            .expect("32-output certificate workspace");
+                        gpu.module.head_certificate_inputs(
+                            &gpu.stream,
+                            rows(32, 256),
+                            &w.norm,
+                            &step.outputs,
+                            &mut scratch.digits,
+                            &mut scratch.stats,
+                        )?;
+                        gpu.module.head_integer_nine_products64(
+                            &gpu.stream,
+                            rows(VOCAB.div_ceil(64), 256),
+                            &scratch.digits,
+                            &weights.digits,
+                            32,
+                            VOCAB as u32,
+                            HIDDEN as u32,
+                            &mut scratch.center,
+                        )?;
+                        gpu.module.head_certify(
+                            &gpu.stream,
+                            rows(VOCAB.div_ceil(8), 256),
+                            &scratch.center,
+                            &scratch.stats,
+                            &weights.stats,
+                            32,
+                            VOCAB as u32,
+                            &mut scratch.masks,
+                            &mut w.logits,
+                        )?;
+                        gpu.module.head_certificate_fallback(
+                            &gpu.stream,
+                            rows(VOCAB.div_ceil(8), 256),
+                            &w.norm,
+                            &step.outputs,
+                            &gpu.head.words,
+                            &gpu.head.offsets,
+                            &gpu.head.exceptions,
+                            &scratch.masks,
+                            VOCAB as u32,
+                            &mut w.logits,
+                        )?;
+                    }
+                    4 => gpu.module.head_packed_four(
+                        &gpu.stream,
+                        rows((outputs.div_ceil(4) * VOCAB).div_ceil(8), 256),
+                        &w.norm,
+                        &step.outputs,
+                        &gpu.head.words,
+                        &gpu.head.offsets,
+                        &gpu.head.exceptions,
+                        &mut w.logits,
+                    )?,
+                    8 => gpu.module.head_packed_eight_staged(
+                        &gpu.stream,
+                        rows((outputs.div_ceil(8) * VOCAB).div_ceil(8), 256),
+                        &w.norm,
+                        &step.outputs,
+                        &gpu.head.words,
+                        &gpu.head.offsets,
+                        &gpu.head.exceptions,
+                        &mut w.logits,
+                    )?,
+                    16 => gpu.module.head_packed_sixteen_staged(
+                        &gpu.stream,
+                        rows((outputs.div_ceil(16) * VOCAB).div_ceil(8), 256),
+                        &w.norm,
+                        &step.outputs,
+                        &gpu.head.words,
+                        &gpu.head.offsets,
+                        &gpu.head.exceptions,
+                        &mut w.logits,
+                    )?,
+                    _ => gpu.module.head_packed_rows(
+                        &gpu.stream,
+                        cfg(outputs * VOCAB * 32),
+                        &w.norm,
+                        &step.outputs,
+                        &gpu.head.words,
+                        &gpu.head.offsets,
+                        &gpu.head.exceptions,
+                        &mut w.logits,
+                        0,
+                    )?,
+                }
+                gpu.module.select_token_rows(
+                    &gpu.stream,
+                    rows(outputs, 1024),
+                    &w.logits,
+                    &mut w.next,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HardwareProfile;
+    use anyhow::Context;
+
+    type AfterEnqueueHook = Box<dyn FnOnce(&Arc<CudaStream>) -> Result<()>>;
+    thread_local! {
+        // A one-shot, thread-local hook cannot affect another test's engine.
+        static AFTER_ENQUEUE: std::cell::RefCell<Option<AfterEnqueueHook>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn after_enqueue(stream: &Arc<CudaStream>) -> Result<()> {
+        let hook = AFTER_ENQUEUE.with(|slot| slot.borrow_mut().take());
+        match hook {
+            Some(hook) => hook(stream),
+            None => Ok(()),
+        }
+    }
+
+    #[test]
+    fn query_tiles_preserve_sequence_and_position_boundaries() -> Result<()> {
+        assert_eq!(query_tiles::<4>(&[])?, Vec::<u32>::new());
+        assert!(query_tiles::<4>(&[0]).is_err());
+        assert!(query_tiles::<4>(&vec![0; 2050]).is_err());
+        let info = [
+            1,
+            61,
+            1,
+            62,
+            1,
+            63,
+            1,
+            64,
+            1,
+            65,
+            0,
+            66,
+            0,
+            67,
+            0,
+            69,
+            1,
+            u32::MAX,
+            1,
+            0,
+        ];
+        assert_eq!(
+            query_tiles::<4>(&info)?,
+            [0, 4, 4, 1, 5, 2, 7, 1, 8, 1, 9, 1]
+        );
+        assert_eq!(query_tiles::<8>(&info)?, [0, 5, 5, 2, 7, 1, 8, 1, 9, 1]);
+        assert!(query_tiles::<0>(&[]).is_err());
+        assert!(query_tiles::<9>(&[]).is_err());
+        let full: Vec<u32> = (0..128).flat_map(|r| [r / 64, r % 64]).collect();
+        assert_eq!(
+            query_tiles::<8>(&full)?,
+            (0..128).step_by(8).flat_map(|r| [r, 8]).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    fn request(length: usize, seed: u32, outputs: usize) -> Request {
+        Request {
+            prompt_ids: (0..length)
+                .map(|i| 42 + (i as u32 * 17 + seed) % 1000)
+                .collect(),
+            max_tokens: outputs,
+            stop_ids: vec![],
+        }
+    }
+
+    fn test_hardware() -> Result<HardwareProfile> {
+        let name = CudaContext::new(0)?.device_name()?;
+        for profile in [HardwareProfile::Rtx5090, HardwareProfile::RtxPro6000] {
+            if profile.validate_device(&name).is_ok() {
+                return Ok(profile);
+            }
+        }
+        anyhow::bail!("no test profile for {name}")
+    }
+
+    fn same(actual: &Generation, expected: &Generation) {
+        assert_eq!(actual.token_ids, expected.token_ids);
+        assert_eq!(actual.logit_sha256, expected.logit_sha256);
+        assert_eq!(actual.finish_reason, expected.finish_reason);
+        assert_eq!(actual.text, expected.text);
+    }
+
+    #[test]
+    fn queued_execution_failure_fences_and_preserves_session_ownership() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE")
+            .context("set CLEAN_MODEL_BUNDLE for failure-path validation")?;
+        let model = Model::load(Path::new(&bundle))?;
+        for graphs in [false, true] {
+            for panic in [false, true] {
+                let mut config = EngineConfig::for_hardware(test_hardware()?, 4096);
+                config.max_batch = 1;
+                config.kv_cache_bytes = 512 << 20;
+                config.prefix_cache_entries = 0;
+                config.cuda_graphs = graphs;
+                let engine = BatchEngine::new(&model, config)?;
+                let request = request(65, 29, 1);
+                let mut session = engine.session(&request.prompt_ids)?;
+                let option = SessionOptions {
+                    max_tokens: 1,
+                    stop_ids: vec![],
+                    cache: CacheMode::Reuse,
+                };
+                engine.generate_sessions(
+                    &model,
+                    std::slice::from_mut(&mut session),
+                    std::slice::from_ref(&option),
+                )?;
+                assert_eq!(session.cached_tokens(), 65);
+                let fork = session.fork()?;
+                assert_eq!(fork.cached_tokens(), 64);
+                let tokens = session.tokens().to_vec();
+                let completed = Arc::new(AtomicBool::new(false));
+                let event = Arc::new(Mutex::new(None));
+                let hook_completed = completed.clone();
+                let hook_event = event.clone();
+                AFTER_ENQUEUE.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some(Box::new(move |stream| {
+                        // Hold the stream busy after real model work. The
+                        // callback touches only host state, never CUDA APIs.
+                        stream.launch_host_function(move || {
+                            std::thread::sleep(Duration::from_millis(250));
+                            hook_completed.store(true, Ordering::SeqCst);
+                        })?;
+                        let marker = stream.record_event(None)?;
+                        assert!(!marker.query()?, "fault must follow queued work");
+                        *hook_event.lock().unwrap() = Some(marker);
+                        if panic {
+                            std::panic::panic_any("injected post-enqueue panic");
+                        }
+                        anyhow::bail!("injected post-enqueue error")
+                    }));
+                });
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    engine.generate_sessions(
+                        &model,
+                        std::slice::from_mut(&mut session),
+                        std::slice::from_ref(&option),
+                    )
+                }));
+                AFTER_ENQUEUE.with(|slot| assert!(slot.borrow().is_none()));
+                // These checks do not synchronize: the engine must have
+                // completed the queued callback/marker before returning.
+                assert!(completed.load(Ordering::SeqCst));
+                assert!(event.lock().unwrap().as_ref().unwrap().query()?);
+                assert!(engine.gpu.stream.query()?);
+                if panic {
+                    let payload = match outcome {
+                        Err(payload) => payload,
+                        Ok(_) => panic!("injected panic was not propagated"),
+                    };
+                    assert_eq!(
+                        payload.downcast_ref::<&str>(),
+                        Some(&"injected post-enqueue panic")
+                    );
+                    assert!(engine.execution.is_poisoned());
+                } else {
+                    let error = outcome
+                        .expect("error injection must not panic")
+                        .err()
+                        .expect("injected error was not propagated");
+                    assert_eq!(error.to_string(), "injected post-enqueue error");
+                    assert!(engine.execution.lock().unwrap().poisoned);
+                }
+                assert_eq!(session.cached_tokens(), 65);
+                assert_eq!(session.tokens(), tokens);
+                assert_eq!(fork.cached_tokens(), 64);
+                let execution = match engine.execution.lock() {
+                    Ok(execution) => execution,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                assert_eq!(execution.decode.as_ref().unwrap().graph.is_some(), graphs);
+                drop(execution);
+                let retry = engine
+                    .generate_sessions(
+                        &model,
+                        std::slice::from_mut(&mut session),
+                        std::slice::from_ref(&option),
+                    )
+                    .err()
+                    .expect("a failed engine must reject reuse");
+                assert_eq!(
+                    retry.to_string(),
+                    if panic {
+                        "batch execution mutex poisoned"
+                    } else {
+                        "batch engine failed previously; recreate it"
+                    }
+                );
+                drop(fork);
+                drop(session);
+                assert_eq!(engine.cache_usage().used_pages, 0);
+                assert_eq!(engine.cache_usage().references, 0);
+                eprintln!(
+                    "failure path graphs={graphs} panic={panic}: fenced, uncommitted, poisoned, released"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CLEAN_LONG_MODEL_BUNDLE with 32768 RoPE positions and 9 GiB KV capacity"]
+    fn native_context_ragged_recompute_and_chunk_invariance() -> Result<()> {
+        let bundle = std::env::var_os("CLEAN_LONG_MODEL_BUNDLE")
+            .context("set CLEAN_LONG_MODEL_BUNDLE to an extended 32768-token bundle")?;
+        let model = Model::load(Path::new(&bundle))?;
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 32768);
+        config.max_batch = 4;
+        config.kv_cache_bytes = 9 << 30;
+        let mut engine = BatchEngine::new(&model, config)?;
+        let requests: Vec<_> = [8192, 16384, 32766]
+            .into_iter()
+            .enumerate()
+            .map(|(i, length)| request(length, i as u32 + 50, 2))
+            .collect();
+        let cold = engine.generate(&model, &requests, CacheMode::Reuse)?;
+        eprintln!("native context cold pass: {:.3}s", cold.elapsed_seconds);
+        assert_eq!(cold.reused_tokens, 0);
+        assert_eq!(cold.processed_tokens, 8193 + 16385 + 32767);
+        let warm = engine.generate(&model, &requests, CacheMode::Reuse)?;
+        eprintln!("native context warm pass: {:.3}s", warm.elapsed_seconds);
+        assert_eq!(warm.reused_tokens, 8128 + 16320 + 32704);
+        assert_eq!(
+            warm.processed_tokens + warm.reused_tokens,
+            cold.processed_tokens
+        );
+        for (actual, expected) in warm.generations.iter().zip(&cold.generations) {
+            same(actual, expected);
+        }
+        engine.clear_prefixes()?;
+        engine.config.prefill_chunk = 128;
+        engine.config.cuda_graphs = false;
+        engine.config.tiled_attention = true;
+        engine.config.tuned_attention = true;
+        engine.config.tuned_projections = true;
+        engine.config.tuned_head = true;
+        let fresh = engine.generate(&model, &requests, CacheMode::Recompute)?;
+        assert_eq!(fresh.reused_tokens, 0);
+        assert_eq!(fresh.processed_tokens, 2 * (8192 + 16384 + 32766) + 3);
+        for (actual, expected) in fresh.generations.iter().zip(&cold.generations) {
+            same(actual, expected);
+        }
+        assert_eq!(engine.cache_usage().used_pages, 0);
+        eprintln!(
+            "native context cold {:.3}s; warm {:.3}s; recompute {:.3}s",
+            cold.elapsed_seconds, warm.elapsed_seconds, fresh.elapsed_seconds
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CLEAN_LONG_MODEL_BUNDLE and 64 GiB KV capacity"]
+    fn head32_native_session_continuation() -> Result<()> {
+        let bundle =
+            std::env::var_os("CLEAN_LONG_MODEL_BUNDLE").context("set CLEAN_LONG_MODEL_BUNDLE")?;
+        let model = Model::load(Path::new(&bundle))?;
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 32768);
+        config.max_batch = 32;
+        config.kv_cache_bytes = 64 << 30;
+        config.prefix_cache_entries = 0;
+        config.tuned_projections = true;
+        config.tuned_attention = true;
+        config.tiled_attention = true;
+        config.tuned_head = false;
+        config.verify_logits = true;
+        let requests: Vec<_> = (0..32)
+            .map(|i| {
+                request(
+                    match i {
+                        0 => 8192,
+                        1 => 16384,
+                        2 => 32764,
+                        _ => 5 + i,
+                    },
+                    i as u32,
+                    1,
+                )
+            })
+            .collect();
+        let warm_option = SessionOptions {
+            max_tokens: 1,
+            stop_ids: vec![],
+            cache: CacheMode::Reuse,
+        };
+        let options = vec![
+            SessionOptions {
+                max_tokens: 2,
+                ..warm_option.clone()
+            };
+            32
+        ];
+        let baseline = BatchEngine::new(&model, config.clone())?;
+        let mut sessions = requests
+            .iter()
+            .map(|r| baseline.session(&r.prompt_ids))
+            .collect::<Result<Vec<_>>>()?;
+        let mut expected_warm = Vec::new();
+        for session in &mut sessions {
+            let mut result = baseline.generate_sessions(
+                &model,
+                std::slice::from_mut(session),
+                std::slice::from_ref(&warm_option),
+            )?;
+            expected_warm.push(result.generations.remove(0));
+        }
+        // Every stream now has exactly one unprocessed token, so both continued
+        // steps compute exactly 32 heads, including native-context hidden rows.
+        assert!(
+            sessions
+                .iter()
+                .all(|s| s.cached_tokens() + 1 == s.tokens().len())
+        );
+        let expected = baseline.generate_sessions(&model, &mut sessions, &options)?;
+        assert_eq!(expected.processed_tokens, 64);
+        assert_eq!(
+            expected
+                .generations
+                .iter()
+                .map(|g| g.logit_sha256.len())
+                .sum::<usize>(),
+            64
+        );
+        drop(sessions);
+        assert_eq!(baseline.cache_usage().used_pages, 0);
+        drop(baseline);
+        config.tuned_head = true;
+        for (chunk, graphs, reverse) in [(512, true, false), (128, false, true)] {
+            config.prefill_chunk = chunk;
+            config.cuda_graphs = graphs;
+            let engine = BatchEngine::new(&model, config.clone())?;
+            let mut sessions = requests
+                .iter()
+                .map(|r| engine.session(&r.prompt_ids))
+                .collect::<Result<Vec<_>>>()?;
+            for (i, session) in sessions.iter_mut().enumerate() {
+                let actual = engine.generate_sessions(
+                    &model,
+                    std::slice::from_mut(session),
+                    std::slice::from_ref(&warm_option),
+                )?;
+                same(&actual.generations[0], &expected_warm[i]);
+            }
+            assert!(
+                sessions
+                    .iter()
+                    .all(|s| s.cached_tokens() + 1 == s.tokens().len())
+            );
+            if reverse {
+                sessions.reverse();
+            }
+            let actual = engine.generate_sessions(&model, &mut sessions, &options)?;
+            assert_eq!(actual.processed_tokens, 64);
+            assert_eq!(actual.reused_tokens, expected.reused_tokens);
+            for (i, generation) in actual.generations.iter().enumerate() {
+                same(
+                    generation,
+                    &expected.generations[if reverse { 31 - i } else { i }],
+                );
+            }
+            assert_eq!(sessions[if reverse { 29 } else { 2 }].tokens().len(), 32767);
+            drop(sessions);
+            assert_eq!(engine.cache_usage().used_pages, 0);
+            println!(
+                "HEAD32_NATIVE {}",
+                serde_json::json!({"chunk":chunk,"graphs":graphs,"reverse":reverse,"continuation_hashes":64,"warm_hashes":32,"kv_bytes":64_u64 << 30,"longest_final_tokens":32767})
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn head32_model_preserves_full_logits() -> Result<()> {
+        let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE").context("set CLEAN_MODEL_BUNDLE")?;
+        let model = Model::load(Path::new(&bundle))?;
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 4096);
+        config.max_batch = 32;
+        config.kv_cache_bytes = 512 << 20;
+        config.tuned_projections = true;
+        config.tuned_attention = true;
+        config.tiled_attention = true;
+        config.tuned_head = false;
+        let requests: Vec<_> = (0..32)
+            .map(|i| request([5, 65, 129][i % 3], i as u32, if i < 16 { 3 } else { 2 }))
+            .collect();
+        let baseline = BatchEngine::new(&model, config.clone())?;
+        let expected = baseline.generate(&model, &requests, CacheMode::Reuse)?;
+        assert!(
+            expected
+                .generations
+                .iter()
+                .all(|g| g.logit_sha256.len() >= 2)
+        );
+        drop(baseline);
+        config.tuned_head = true;
+        for (chunk, graphs) in [(64, false), (512, true)] {
+            config.prefill_chunk = chunk;
+            config.cuda_graphs = graphs;
+            let engine = BatchEngine::new(&model, config.clone())?;
+            for reverse in [false, true] {
+                let batch: Vec<_> = if reverse {
+                    requests.iter().rev().cloned().collect()
+                } else {
+                    requests.clone()
+                };
+                for (run, mode) in [CacheMode::Reuse, CacheMode::Reuse, CacheMode::Recompute]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let actual = engine.generate(&model, &batch, mode)?;
+                    for (index, actual) in actual.generations.iter().enumerate() {
+                        same(
+                            actual,
+                            &expected.generations[if reverse { 31 - index } else { index }],
+                        );
+                    }
+                    println!(
+                        "HEAD32_MODEL {}",
+                        serde_json::json!({"chunk":chunk,"graphs":graphs,"reverse":reverse,"run":run,"hashes":actual.generations.iter().map(|g| g.logit_sha256.len()).sum::<usize>()})
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_prefill_matches_original_across_chunks_graphs_and_cache_modes() -> Result<()> {
+        let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE")
+            .context("set CLEAN_MODEL_BUNDLE for batched model validation")?;
+        let model = Model::load(Path::new(&bundle))?;
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 4096);
+        config.max_batch = 16;
+        config.kv_cache_bytes = 512 << 20;
+        config.tuned_attention = false;
+        config.tuned_projections = false;
+        config.tuned_head = false;
+        let requests: Vec<_> = [1, 5, 65, 129, 257, 33, 128, 64, 17, 256, 67, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| request(n, i as u32, 2 + i % 3))
+            .collect();
+        let baseline = BatchEngine::new(&model, config.clone())?;
+        let expected = baseline.generate(&model, &requests, CacheMode::Reuse)?;
+        drop(baseline);
+        config.tiled_attention = true;
+        config.tuned_attention = true;
+        config.tuned_projections = true;
+        config.tuned_head = true;
+        for (chunk, graphs) in [(64, false), (512, true)] {
+            config.prefill_chunk = chunk;
+            config.cuda_graphs = graphs;
+            let engine = BatchEngine::new(&model, config.clone())?;
+            for mode in [CacheMode::Reuse, CacheMode::Reuse, CacheMode::Recompute] {
+                let actual = engine.generate(&model, &requests, mode)?;
+                for (actual, expected) in actual.generations.iter().zip(&expected.generations) {
+                    same(actual, expected);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ragged_sessions_prefixes_and_recomputation_match_legacy() -> Result<()> {
+        let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE")
+            .context("set CLEAN_MODEL_BUNDLE for batched model validation")?;
+        let model = Model::load(Path::new(&bundle))?;
+        let mut config = EngineConfig::for_hardware(test_hardware()?, 4096);
+        config.max_batch = 8;
+        config.kv_cache_bytes = 512 << 20;
+        let mut engine = BatchEngine::new(&model, config)?;
+        let requests: Vec<_> = [1, 5, 65, 129, 257]
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| request(n, i as u32, 4))
+            .collect();
+        // The paged engine intentionally has no legacy execution allocation.
+        // Keep the independent contiguous-cache oracle in a separate model.
+        let oracle = GpuModel::new(&model)?;
+        let expected = requests
+            .iter()
+            .map(|r| oracle.generate(&model, r, None))
+            .collect::<Result<Vec<_>>>()?;
+        let cold = engine.generate(&model, &requests, CacheMode::Reuse)?;
+        assert_eq!(cold.reused_tokens, 0);
+        assert_eq!(
+            cold.processed_tokens,
+            requests
+                .iter()
+                .map(|r| r.prompt_ids.len() + 3)
+                .sum::<usize>()
+        );
+        for (actual, expected) in cold.generations.iter().zip(&expected) {
+            same(actual, expected);
+        }
+        let cold_stats = engine.prefix_cache_stats()?;
+        assert_eq!(cold_stats.counters.lookups, 5);
+        assert_eq!(cold_stats.counters.hits, 0);
+        assert_eq!(cold_stats.counters.misses, 5);
+        assert_eq!(cold_stats.resident_entries, 3);
+        assert_eq!(cold_stats.resident_tokens, 64 + 128 + 256);
+        let warm = engine.generate(&model, &requests, CacheMode::Reuse)?;
+        assert_eq!(warm.reused_tokens, 64 + 128 + 256);
+        assert_eq!(
+            warm.processed_tokens + warm.reused_tokens,
+            cold.processed_tokens
+        );
+        for (actual, expected) in warm.generations.iter().zip(&expected) {
+            same(actual, expected);
+        }
+        let warm_stats = engine.prefix_cache_stats()?;
+        assert_eq!(warm_stats.counters.lookups, 10);
+        assert_eq!(warm_stats.counters.hits, 3);
+        assert_eq!(warm_stats.counters.misses, 7);
+        assert_eq!(warm_stats.counters.matched_tokens, 64 + 128 + 256);
+        assert_eq!(warm_stats.counters.replacements, 3);
+        // Force the workspace budget to split these prefixes into smaller
+        // chunks even though the configured token limit is much larger.
+        engine.config.score_scratch_bytes = 4 << 20;
+        engine.config.validate(model.max_context())?;
+        let recomputed = engine.generate(&model, &requests, CacheMode::Recompute)?;
+        assert_eq!(recomputed.reused_tokens, 0);
+        assert_eq!(
+            engine.prefix_cache_stats()?.counters.lookups,
+            warm_stats.counters.lookups
+        );
+        assert_eq!(
+            recomputed.processed_tokens,
+            requests
+                .iter()
+                .map(|r| 4 * r.prompt_ids.len() + 6)
+                .sum::<usize>()
+        );
+        for (actual, expected) in recomputed.generations.iter().zip(&expected) {
+            same(actual, expected);
+        }
+        engine.config.score_scratch_bytes = 1 << 30;
+        let reversed: Vec<_> = requests.iter().rev().cloned().collect();
+        engine.config.cuda_graphs = false;
+        let reordered = engine.generate(&model, &reversed, CacheMode::Reuse)?;
+        for (actual, expected) in reordered.generations.iter().rev().zip(&expected) {
+            same(actual, expected);
+        }
+        engine.config.cuda_graphs = true;
+
+        // A stopped sequence must not change surviving members or their slot mapping.
+        let mut stopping = requests.clone();
+        stopping[1].stop_ids = vec![expected[1].token_ids[0]];
+        let stopped = engine.generate(&model, &stopping, CacheMode::Reuse)?;
+        assert_eq!(stopped.generations[1].token_ids, expected[1].token_ids[..1]);
+        assert_eq!(
+            stopped.generations[1].logit_sha256,
+            expected[1].logit_sha256[..1]
+        );
+        assert_eq!(stopped.generations[1].finish_reason, "stop");
+        for i in [0, 2, 3, 4] {
+            same(&stopped.generations[i], &expected[i]);
+        }
+        let before_clear = engine.prefix_cache_stats()?;
+        engine.clear_prefixes()?;
+        assert_eq!(engine.cache_usage().used_pages, 0);
+        let after_clear = engine.prefix_cache_stats()?;
+        assert_eq!(after_clear.resident_entries, 0);
+        assert_eq!(after_clear.resident_tokens, 0);
+        assert_eq!(
+            after_clear.counters.cleared_entries - before_clear.counters.cleared_entries,
+            before_clear.resident_entries as u64
+        );
+
+        // Continuing and forking share only initialized full pages. A partial
+        // tail is rebuilt, and dropping either branch cannot invalidate the other.
+        let mut session = engine.session(&requests[3].prompt_ids)?;
+        let option = SessionOptions {
+            max_tokens: 4,
+            stop_ids: vec![],
+            cache: CacheMode::Reuse,
+        };
+        let first = engine.generate_sessions(
+            &model,
+            std::slice::from_mut(&mut session),
+            std::slice::from_ref(&option),
+        )?;
+        same(&first.generations[0], &expected[3]);
+        let mut fork = session.fork()?;
+        assert_eq!(fork.cached_tokens(), 128);
+        session.append(&[31, 32, 33])?;
+        fork.append(&[71, 72])?;
+        let branches = [&session, &fork]
+            .into_iter()
+            .map(|s| {
+                oracle.generate(
+                    &model,
+                    &Request {
+                        prompt_ids: s.tokens().to_vec(),
+                        max_tokens: 4,
+                        stop_ids: vec![],
+                    },
+                    None,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut sessions = [session, fork];
+        let continued =
+            engine.generate_sessions(&model, &mut sessions, &[option.clone(), option.clone()])?;
+        for (actual, expected) in continued.generations.iter().zip(&branches) {
+            same(actual, expected);
+        }
+        // Switching an already shared session to recompute must detach it first.
+        let fork = sessions[0].fork()?;
+        let continuation = oracle.generate(
+            &model,
+            &Request {
+                prompt_ids: sessions[0].tokens().to_vec(),
+                max_tokens: 4,
+                stop_ids: vec![],
+            },
+            None,
+        )?;
+        let uncached = engine.generate_sessions(
+            &model,
+            &mut sessions[..1],
+            &[SessionOptions {
+                cache: CacheMode::Recompute,
+                ..option
+            }],
+        )?;
+        same(&uncached.generations[0], &continuation);
+        assert_eq!(sessions[0].cached_tokens(), 0);
+        drop(fork);
+        drop(sessions);
+        assert_eq!(engine.cache_usage().used_pages, 0);
+
+        // Force capacity waves even though max_batch allows all eight requests.
+        // Eight 512-token reservations need more than this 512 MiB pool.
+        let waves = vec![request(512, 21, 2); 8];
+        let reference = oracle.generate(&model, &waves[0], None)?;
+        let result = engine.generate(&model, &waves, CacheMode::Reuse)?;
+        assert_eq!(result.generations.len(), waves.len());
+        for actual in &result.generations {
+            same(actual, &reference);
+        }
+        engine.clear_prefixes()?;
+        assert_eq!(engine.cache_usage().used_pages, 0);
+        let too_large = request(4090, 1, 2);
+        assert!(
+            engine
+                .generate(&model, &[too_large], CacheMode::Reuse)
+                .is_err()
+        );
+        // A rejected admission must not poison the resident engine.
+        let after = engine.generate(&model, &requests[..1], CacheMode::Reuse)?;
+        same(&after.generations[0], &expected[0]);
+
+        // Distinguish LRU entry limits from physical-capacity pressure.
+        engine.config.prefix_cache_entries = 1;
+        let before_limit = engine.prefix_cache_stats()?;
+        let limited = engine.generate(&model, &requests[2..4], CacheMode::Reuse)?;
+        for (actual, expected) in limited.generations.iter().zip(&expected[2..4]) {
+            same(actual, expected);
+        }
+        let after_limit = engine.prefix_cache_stats()?;
+        assert_eq!(after_limit.resident_entries, 1);
+        assert_eq!(
+            after_limit.counters.entry_limit_evictions
+                - before_limit.counters.entry_limit_evictions,
+            1
+        );
+        let mut capacity_session = engine.session(&[42])?;
+        {
+            let mut execution = engine.execution.lock().unwrap();
+            let tokens = engine.cache_usage().total_pages * PAGE_TOKENS;
+            engine.reserve(&mut execution, &mut capacity_session, tokens)?;
+        }
+        let after_capacity = engine.prefix_cache_stats()?;
+        assert_eq!(after_capacity.resident_entries, 0);
+        assert_eq!(
+            after_capacity.counters.capacity_evictions - after_limit.counters.capacity_evictions,
+            1
+        );
+        drop(capacity_session);
+        assert_eq!(engine.cache_usage().used_pages, 0);
+        Ok(())
+    }
+}

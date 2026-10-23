@@ -1,10 +1,17 @@
 use crate::graph::Graph;
+mod batch;
+pub(crate) mod certified_head;
+#[cfg(test)]
+mod profile;
 use crate::{
     CONTEXT, HIDDEN, VOCAB,
-    kernels::device,
+    kernels::{device, pipeline_device},
     model::{Generation, Model, Request, sha},
 };
 use anyhow::Result;
+pub use batch::{
+    BatchEngine, BatchGeneration, PrefixCacheCounters, PrefixCacheStats, Session, SessionOptions,
+};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, PinnedHostBuffer, simt::LaunchConfig};
 use std::{
     collections::BTreeMap,
@@ -40,12 +47,47 @@ fn grow(mut config: LaunchConfig, prefetch: bool) -> LaunchConfig {
 fn row_prefetch(prefetch: bool, bytes: u32) -> u32 {
     if prefetch { bytes } else { 0 }
 }
+// Prepare every admitted TMA grid outside graph capture. The kernel has one
+// block shape/resource contract; only its number of independent tiles varies.
+struct PipelineProjections {
+    module: pipeline_device::LoadedModule,
+    launches: BTreeMap<
+        usize,
+        cuda_core::PreparedLaunch<pipeline_device::__linear_large_pipeline_CudaKernel>,
+    >,
+}
+impl PipelineProjections {
+    fn new(context: &Arc<CudaContext>) -> Result<Self> {
+        // SAFETY: all uses go through the prepared 256-thread/50,176-byte
+        // contract. Validated model shapes and owned buffers supply the slices.
+        let module = unsafe { pipeline_device::load(context)? };
+        let mut launches = BTreeMap::new();
+        for row_tiles in 1..=16 {
+            for column_tiles in [8, 32, 96] {
+                let blocks = row_tiles * column_tiles;
+                if let std::collections::btree_map::Entry::Vacant(entry) = launches.entry(blocks) {
+                    entry.insert(module.prepare_linear_large_pipeline(
+                        cuda_core::LaunchConfig1D::new(blocks as u32, 256, 50176),
+                    )?);
+                }
+            }
+        }
+        Ok(Self { module, launches })
+    }
+}
+
 struct Matrix {
     w: DeviceBuffer<i8>,
     map: Option<DeviceBuffer<u64>>,
     scale: Buffer,
     k: usize,
     n: usize,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProjectionPolicy {
+    Original,
+    TunedBatch,
 }
 struct PackedHead {
     words: DeviceBuffer<u32>,
@@ -98,6 +140,15 @@ struct Workspace {
 }
 impl Workspace {
     fn new(stream: &Arc<CudaStream>, rows: usize) -> Result<Self> {
+        Self::with_shape(stream, rows, 1, CONTEXT)
+    }
+
+    fn with_shape(
+        stream: &Arc<CudaStream>,
+        rows: usize,
+        output_rows: usize,
+        score_stride: usize,
+    ) -> Result<Self> {
         let f = |width| -> Result<Buffer> { Ok(DeviceBuffer::zeroed(stream, rows * width)?) };
         let mut workspace = Self {
             hidden: f(HIDDEN)?,
@@ -107,7 +158,7 @@ impl Workspace {
             k: f(1024)?,
             v: f(1024)?,
             attention: f(HIDDEN)?,
-            scores: f(32 * CONTEXT)?,
+            scores: f(32 * score_stride)?,
             o: f(HIDDEN)?,
             gate: f(12288)?,
             up: f(12288)?,
@@ -119,10 +170,10 @@ impl Workspace {
             map12: None,
             scales: f(1)?,
             maxima: DeviceBuffer::zeroed(stream, rows)?,
-            logits: DeviceBuffer::zeroed(stream, VOCAB)?,
-            next: DeviceBuffer::zeroed(stream, 1)?,
+            logits: DeviceBuffer::zeroed(stream, output_rows * VOCAB)?,
+            next: DeviceBuffer::zeroed(stream, output_rows)?,
         };
-        if rows >= 256 {
+        if rows >= 128 {
             workspace.map4 = Some(crate::tensor::map(
                 stream,
                 &workspace.quant4,
@@ -212,9 +263,10 @@ impl Execution {
 
 pub struct GpuModel {
     // Drop graphs before captured weights/module; Execution drops graphs before scratch.
-    execution: Mutex<Execution>,
+    execution: Mutex<Option<Execution>>,
     stream: Arc<CudaStream>,
     module: device::LoadedModule,
+    pipeline: PipelineProjections,
     layers: Vec<Layer>,
     embedding: DeviceBuffer<u16>,
     head: PackedHead,
@@ -245,9 +297,20 @@ fn rows(n: usize, threads: u32) -> LaunchConfig {
 }
 impl GpuModel {
     pub fn new(model: &Model) -> Result<Self> {
+        Self::with_legacy_execution(model, true)
+    }
+
+    // BatchEngine owns its paged execution state. Do not allocate a second,
+    // unused 4K cache or capture the legacy decoder's eight graphs for it.
+    fn weights_only(model: &Model) -> Result<Self> {
+        Self::with_legacy_execution(model, false)
+    }
+
+    fn with_legacy_execution(model: &Model, legacy: bool) -> Result<Self> {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.new_stream()?;
         let module = device::load(&ctx)?;
+        let pipeline = PipelineProjections::new(&ctx)?;
         let mut layers = Vec::new();
         for l in &model.layers {
             let gains = l
@@ -275,7 +338,11 @@ impl GpuModel {
             layers.push(Layer { gains, weights });
         }
         let mut gpu = Self {
-            execution: Mutex::new(Execution::new(&stream)?),
+            execution: Mutex::new(if legacy {
+                Some(Execution::new(&stream)?)
+            } else {
+                None
+            }),
             embedding: DeviceBuffer::from_host(&stream, &model.embedding)?,
             head: PackedHead::new(&stream, &model.head)?,
             final_gain: DeviceBuffer::from_host(&stream, &model.final_gain)?,
@@ -283,11 +350,12 @@ impl GpuModel {
             prefetch: std::env::var("CLEAN_PREFETCH").map_or(true, |v| v != "0"),
             stream,
             module,
+            pipeline,
             layers,
         };
         for layer in &mut gpu.layers {
             for weight in layer.weights.values_mut() {
-                if weight.n >= 4096 {
+                if weight.n >= 1024 {
                     weight.map = Some(crate::tensor::map(
                         &gpu.stream,
                         &weight.w,
@@ -298,7 +366,7 @@ impl GpuModel {
                 }
             }
         }
-        {
+        if legacy {
             let mut execution = gpu
                 .execution
                 .lock()
@@ -309,7 +377,9 @@ impl GpuModel {
                 decode,
                 control,
                 ..
-            } = &mut *execution;
+            } = execution
+                .as_mut()
+                .expect("legacy execution allocated above");
             gpu.stream.synchronize()?;
             // Every decode kernel waits on its predecessor before touching data,
             // so graph edges may be programmatic. CLEAN_PDL=0 restores ordinary
@@ -373,6 +443,8 @@ impl GpuModel {
         combined: &mut Buffer,
         map: Option<&DeviceBuffer<u64>>,
         prefetch: bool,
+        policy: ProjectionPolicy,
+        partial: Option<&mut DeviceBuffer<i32>>,
     ) -> Result<()> {
         if scale.len() == 1 && w.k == 12288 {
             // SAFETY: the preceding SwiGLU produced this exact completed maximum;
@@ -416,7 +488,7 @@ impl GpuModel {
                 )?;
             }
         } else {
-            self.linear_quantized(q, scale, w, out, map)?;
+            self.linear_quantized(q, scale, w, out, map, policy, partial)?;
             self.residual(residual, out, combined)?;
         }
         Ok(())
@@ -454,12 +526,101 @@ impl GpuModel {
         w: &Matrix,
         out: &mut Buffer,
         map: Option<&DeviceBuffer<u64>>,
+        policy: ProjectionPolicy,
+        partial: Option<&mut DeviceBuffer<i32>>,
     ) -> Result<()> {
         let nr = scale.len();
+        if let Some(partial) = partial {
+            if policy == ProjectionPolicy::TunedBatch && nr == 32 && w.n == 4096 {
+                anyhow::ensure!(
+                    [4096, 12288].contains(&w.k) && partial.len() == 4 * 32 * 4096,
+                    "invalid split projection scratch or shape"
+                );
+                // SAFETY: the Step owns this scratch before capture. Integer partials
+                // cannot overflow at model widths; the same stream orders reduction.
+                unsafe {
+                    self.module.linear_square_partials(
+                        &self.stream,
+                        rows(4 * nr.div_ceil(32) * w.n.div_ceil(32), 128),
+                        q,
+                        scale,
+                        &w.w,
+                        &w.scale,
+                        w.k as u32,
+                        4,
+                        partial,
+                    )?;
+                    self.module.linear_square_reduce(
+                        &self.stream,
+                        cfg(nr * w.n),
+                        partial,
+                        scale,
+                        &w.scale,
+                        4,
+                        out,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
+        // Cold-weight CUDA-event measurements on the 5090 favor wider tiles
+        // for small MLP batches and DP4A for two to four down-projection rows.
+        // Keep the original PRO 6000/legacy dispatch independently selectable.
+        let tuned_tiled = policy == ProjectionPolicy::TunedBatch
+            && ((nr >= 4 && w.n == 12288) || (nr >= 5 && w.k == 12288));
+        let tuned = policy == ProjectionPolicy::TunedBatch;
+        let tuned_dp4a = tuned && ((w.k == 12288 && nr <= 4) || (w.n == 1024 && nr <= 4));
+        let pipelined_large = tuned
+            && ((w.n == 4096 && nr >= 256)
+                || (w.n == 12288 && (nr == 128 || nr == 1024))
+                || (w.n == 1024 && nr == 1024));
+        let tuned_splitk = tuned && w.n == 1024 && (5..=32).contains(&nr);
+        let narrow = tuned
+            && ((w.n == 1024 && (33..=128).contains(&nr))
+                || (w.n == 4096 && w.k == 4096 && (17..=32).contains(&nr))
+                || (w.n == 4096 && w.k == 12288 && (5..=32).contains(&nr))
+                || (w.n == 12288 && (4..=32).contains(&nr)));
         // SAFETY: fixed graph supplies exact dimensions and distinct buffers. Scratch
         // stays alive across all queued uses. Stream order protects quantizer reuse.
         unsafe {
-            if nr >= 256 && w.n >= 4096 {
+            if pipelined_large {
+                let blocks = nr.div_ceil(64) * w.n.div_ceil(128);
+                self.pipeline.module.linear_large_pipeline(
+                    &self.stream,
+                    self.pipeline
+                        .launches
+                        .get(&blocks)
+                        .expect("admitted projection grid"),
+                    map.expect("pipelined activation map"),
+                    scale,
+                    w.map.as_ref().expect("pipelined weight map"),
+                    &w.scale,
+                    w.k as u32,
+                    out,
+                )?;
+            } else if narrow {
+                self.module.linear_narrow_pipeline(
+                    &self.stream,
+                    rows(nr.div_ceil(16) * w.n.div_ceil(32), 128),
+                    q,
+                    scale,
+                    &w.w,
+                    &w.scale,
+                    w.k as u32,
+                    out,
+                )?;
+            } else if tuned_splitk {
+                self.module.linear_splitk(
+                    &self.stream,
+                    rows(nr.div_ceil(16) * w.n.div_ceil(8), 256),
+                    q,
+                    scale,
+                    &w.w,
+                    &w.scale,
+                    w.k as u32,
+                    out,
+                )?;
+            } else if nr >= 256 && w.n >= 4096 {
                 self.module.linear_large(
                     &self.stream,
                     rows(nr.div_ceil(64) * w.n.div_ceil(128), 256),
@@ -470,7 +631,18 @@ impl GpuModel {
                     w.k as u32,
                     out,
                 )?;
-            } else if nr >= 32 {
+            } else if tuned && (nr >= 32 || tuned_tiled) && !(w.n == 1024 && nr > 512) {
+                self.module.linear_tiled_pipeline(
+                    &self.stream,
+                    rows(nr.div_ceil(32) * w.n.div_ceil(64), 256),
+                    q,
+                    scale,
+                    &w.w,
+                    &w.scale,
+                    w.k as u32,
+                    out,
+                )?;
+            } else if nr >= 32 || tuned_tiled {
                 self.module.linear_tiled(
                     &self.stream,
                     rows(nr.div_ceil(32) * w.n.div_ceil(64), 256),
@@ -481,7 +653,7 @@ impl GpuModel {
                     w.k as u32,
                     out,
                 )?;
-            } else if nr > 1 {
+            } else if nr > 1 && !tuned_dp4a {
                 self.module.linear_splitk(
                     &self.stream,
                     rows(nr.div_ceil(16) * w.n.div_ceil(8), 256),
@@ -535,6 +707,7 @@ impl GpuModel {
         trace: Option<&Path>,
         step: usize,
     ) -> Result<()> {
+        let policy = ProjectionPolicy::Original;
         let nr = w.hidden.len() / HIDDEN;
         // Only single-row decode streams weights once per token; prefill reuses them.
         let pf = nr == 1 && self.prefetch;
@@ -596,6 +769,8 @@ impl GpuModel {
                     &layer.weights["q"],
                     &mut w.q,
                     w.map4.as_ref(),
+                    policy,
+                    None,
                 )?;
                 self.linear_quantized(
                     &w.quant4,
@@ -603,6 +778,8 @@ impl GpuModel {
                     &layer.weights["k"],
                     &mut w.k,
                     w.map4.as_ref(),
+                    policy,
+                    None,
                 )?;
                 self.linear_quantized(
                     &w.quant4,
@@ -610,6 +787,8 @@ impl GpuModel {
                     &layer.weights["v"],
                     &mut w.v,
                     w.map4.as_ref(),
+                    policy,
+                    None,
                 )?;
             }
             if l == 4 {
@@ -705,6 +884,8 @@ impl GpuModel {
                 &mut w.residual,
                 w.map4.as_ref(),
                 pf,
+                policy,
+                None,
             )?;
             if l == 4 {
                 self.trace(trace, step, "debug.a", &w.attention)?;
@@ -751,6 +932,8 @@ impl GpuModel {
                     &layer.weights["gate"],
                     &mut w.gate,
                     w.map4.as_ref(),
+                    policy,
+                    None,
                 )?;
                 self.linear_quantized(
                     &w.quant4,
@@ -758,6 +941,8 @@ impl GpuModel {
                     &layer.weights["up"],
                     &mut w.up,
                     w.map4.as_ref(),
+                    policy,
+                    None,
                 )?;
             }
             if l == 4 {
@@ -788,6 +973,8 @@ impl GpuModel {
                 &mut w.hidden,
                 w.map12.as_ref(),
                 pf,
+                policy,
+                None,
             )?;
             if l == 4 {
                 self.trace(trace, step, "debug.act", &w.act)?;
@@ -842,6 +1029,9 @@ impl GpuModel {
             .execution
             .lock()
             .map_err(|_| anyhow::anyhow!("execution mutex poisoned"))?;
+        let execution = execution
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("legacy generation requires legacy execution state"))?;
         // Also complete any previously failed eager request before reusing scratch.
         self.stream.synchronize()?;
         if execution
@@ -942,11 +1132,11 @@ impl GpuModel {
 #[cfg(test)]
 mod replay_tests {
     use super::*;
+    use anyhow::Context;
     #[test]
     fn reused_graphs_match_eager() -> Result<()> {
-        let Some(bundle) = std::env::var_os("CLEAN_MODEL_BUNDLE") else {
-            return Ok(());
-        };
+        let bundle = std::env::var_os("CLEAN_MODEL_BUNDLE")
+            .context("set CLEAN_MODEL_BUNDLE to run the full-model eager/graph replay test")?;
         let model = Model::load(Path::new(&bundle))?;
         let gpu = GpuModel::new(&model)?;
         // Resize prefill scratch, cross graph/attention dispatch boundaries,

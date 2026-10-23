@@ -1,4 +1,6 @@
 //! Standard Qwen3 with per-channel INT8 weights and dynamic per-token INT8 activations.
+pub mod cache;
+pub mod config;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(feature = "gpu")]

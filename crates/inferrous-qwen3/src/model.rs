@@ -31,6 +31,7 @@ pub(crate) struct Layer {
     pub(crate) weights: BTreeMap<String, Matrix>,
 }
 pub struct Model {
+    max_context: usize,
     pub(crate) layers: Vec<Layer>,
     pub(crate) embedding: Vec<u16>,
     pub(crate) head: Vec<u16>,
@@ -43,6 +44,12 @@ pub fn sha(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 impl Model {
+    /// Validated RoPE capacity; callers cannot enlarge it without loading a
+    /// bundle with the corresponding table and tensor hash.
+    pub fn max_context(&self) -> usize {
+        self.max_context
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = fs::read(path.join("manifest.json"))?;
         let m: Manifest = serde_json::from_slice(&bytes)?;
@@ -50,7 +57,7 @@ impl Model {
             m.format_version == 1
                 && m.profile == PROFILE
                 && m.model_revision == MODEL_REVISION
-                && m.max_context == CONTEXT,
+                && (CONTEXT..=crate::config::NATIVE_CONTEXT).contains(&m.max_context),
             "unsupported clean model profile"
         );
         for (key, n) in [
@@ -153,11 +160,12 @@ impl Model {
             "tokenizer hash mismatch"
         );
         Ok(Self {
+            max_context: m.max_context,
             layers,
             embedding: bfloats("embedding")?,
             head: bfloats("head")?,
             final_gain: floats("final_gain", &[HIDDEN])?,
-            rope: floats("rope", &[CONTEXT, 128])?,
+            rope: floats("rope", &[m.max_context, 128])?,
             root: sha(&bytes),
             tokenizer: tokenizers::Tokenizer::from_bytes(tokenizer_bytes)
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
@@ -174,6 +182,10 @@ pub struct Request {
 }
 impl Request {
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_context(CONTEXT)
+    }
+
+    pub fn validate_for_context(&self, context: usize) -> Result<()> {
         ensure!(
             !self.prompt_ids.is_empty()
                 && self.max_tokens > 0
@@ -181,7 +193,7 @@ impl Request {
                     .prompt_ids
                     .len()
                     .checked_add(self.max_tokens)
-                    .is_some_and(|n| n <= CONTEXT),
+                    .is_some_and(|n| n <= context),
             "request exceeds context or is empty"
         );
         ensure!(

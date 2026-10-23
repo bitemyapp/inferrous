@@ -1,4 +1,9 @@
 /target/
 /clean-work/
+.oxide-artifacts/
+# cuda-oxide intermediates emitted by release doctests.
+/inferrous_qwen3.ll
+/inferrous_qwen3.options
+/inferrous_qwen3.target
 __pycache__/
 *.safetensors

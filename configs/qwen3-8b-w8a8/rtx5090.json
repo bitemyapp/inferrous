@@ -1,0 +1,14 @@
+{
+  "hardware": "rtx5090",
+  "max_context": 32768,
+  "max_batch": 16,
+  "prefill_chunk": 1024,
+  "kv_cache_bytes": 12884901888,
+  "prefix_cache_entries": 32,
+  "verify_logits": false,
+  "cuda_graphs": true,
+  "tuned_projections": true,
+  "tuned_attention": true,
+  "tuned_head": true,
+  "score_scratch_bytes": 1073741824
+}

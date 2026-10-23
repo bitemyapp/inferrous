@@ -1,0 +1,14 @@
+{
+  "hardware": "rtx-pro-6000",
+  "max_context": 32768,
+  "max_batch": 64,
+  "prefill_chunk": 512,
+  "kv_cache_bytes": 68719476736,
+  "prefix_cache_entries": 32,
+  "verify_logits": false,
+  "cuda_graphs": true,
+  "tuned_projections": false,
+  "tuned_attention": false,
+  "tuned_head": false,
+  "score_scratch_bytes": 4294967296
+}

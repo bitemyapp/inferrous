@@ -4,9 +4,11 @@ Measured on one RTX PRO 6000 Blackwell Max-Q (96 GB, 300 W), 2026-10-02–03. Th
 
 **Accuracy limitation:** independent operator tests pass, and every optimization preserves the original Rust baseline's complete vocabulary logits. However, the full-model Torch numerical comparison fails its declared tolerance. Matching three greedy tokens does not establish quality. See [discrepancy notes](discrepancies.md). These are performance measurements of an experimental implementation.
 
+**Precision scope:** the historical Humming tables below predate the harness's effective weight-scale dtype check. The later [round 7 audit](optimization/round-7.md) found that the screened Humming schema allocates channel scales in the model parameter dtype, BF16, while the export contains FP32 scales. That later inspection does not establish the exact runtime dtype of every older version. The older timings remain historical observations; they are not evidence of eligibility or a win under the current strict FP32-scale comparison contract. Current matched reports require recorded FP32 stock scales.
+
 ## Results
 
-All rows use the same Qwen3-8B revision, exported INT8 weights and FP32 channel scales. The body has per-channel symmetric INT8 weights and dynamic per-token INT8 activations; embeddings, output-head values and KV cache remain BF16. The GPU head uses lossless 12-bit storage plus exceptions, reconstructing the original BF16 bits before arithmetic; it introduces no additional quantization. No FP8 substitution, smoothing, rotations, prefix caching or speculative decoding. One request at a time, greedy generation, exactly 32 output tokens, EOS ignored, context limit 4096. Each run uses three warmups and twenty measured resident requests. The sixth pass runs original/candidate/candidate/original serially and pools forty measured requests per implementation and shape; stock columns retain twenty per shape and come from the fifth pass. GPU jobs run serially, without fixed application clocks.
+All rows start from the same Qwen3-8B revision and checkpoint containing exported INT8 weights and FP32 channel scales; this does not establish the stock backend's runtime scale dtype. The body has per-channel symmetric INT8 weights and dynamic per-token INT8 activations; embeddings, output-head values and KV cache remain BF16. The GPU head uses lossless 12-bit storage plus exceptions, reconstructing the original BF16 bits before arithmetic; it introduces no additional quantization. No FP8 substitution, smoothing, rotations, prefix caching or speculative decoding. One request at a time, greedy generation, exactly 32 output tokens, EOS ignored, context limit 4096. Each run uses three warmups and twenty measured resident requests. The sixth pass runs original/candidate/candidate/original serially and pools forty measured requests per implementation and shape; stock columns retain twenty per shape and come from the fifth pass. GPU jobs run serially, without fixed application clocks.
 
 | Prompt tokens | Original decode tok/s | Optimized decode tok/s | Stock FA2 decode tok/s | Stock B12X decode tok/s |
 |---:|---:|---:|---:|---:|
@@ -61,7 +63,7 @@ The separate memory measurements are instrumented runs and do not contribute to 
 
 ## Which stock harness
 
-The fastest **locally tested** eligible harness for this workload is vLLM 0.30.0 with unmodified upstream Humming, dynamic INT8 activations and native CUDA graphs. FlashAttention wins stock request latency; B12X wins stock decode. This is an empirical anchor, not a claim about every engine, batch size or context length. Humming supports INT8 activation and weight types; its other activation types must not be substituted in this comparison. See [Humming's support matrix](https://github.com/vllm-project/humming#support-matrix).
+The fastest **locally tested** stock configuration in these historical solo workloads was vLLM 0.30.0 with unmodified upstream Humming, dynamic INT8 activations and native CUDA graphs. FlashAttention had the lowest measured stock request latency; B12X had the highest measured stock decode throughput. The missing runtime-scale verification described above prevents using those runs as the current precision-matched baseline. These observations also do not establish rankings for other engines, batch sizes or context lengths. Humming supports INT8 activation and weight types; its other activation types must not be substituted in this comparison. See [Humming's support matrix](https://github.com/vllm-project/humming#support-matrix).
 
 | vLLM configuration | Decode tok/s, 5 / 129 / 512 | API ms, 5 / 129 / 512 |
 |---|---|---|
@@ -110,6 +112,7 @@ The Humming package was built from the pinned official source without patches. T
 CUDA_HOME=/usr/local/cuda-13.1 VLLM_USE_FLASHINFER_SAMPLER=0 \
   clean-work/vllm-venv/bin/python crates/inferrous-qwen3/tools/bench_engines.py \
   vllm --model clean-work/model-bundle/hf \
+  --hardware-profile rtx-pro-6000 \
   --requests clean-work/workloads/requests.json \
   --quantization humming --graphs-without-compile --attention-backend FLASH_ATTN \
   --output clean-work/new-stock-run.jsonl --repeat 23
@@ -124,3 +127,106 @@ The second pass adds shared-memory INT8 prefill tiles, exact norm/quantization f
 Nine tests pass in optimized and checked builds: independent operators, distinct-weight fused gate/up/activation, 1,328,443 native-rounding boundary and bit-pattern inputs against independent f64 nearest-even, exhaustive host/GPU BF16 reconstruction, admission/ties, capture cleanup and nineteen changing-input eager/graph comparisons. The latter cover seventeen prompt lengths through 4093, every graph capacity, long-to-short cache reuse and stop handling. All 138 final candidate requests preserve the original token IDs and all 4,416 complete-vocabulary hashes. The checked build matches all three workloads. Operator/argmax/packing memcheck, racecheck and synccheck, plus 512-token prefill and three-output full-model memcheck, report zero errors or hazards. Rust formatting and Python syntax checks pass. The restored optimized binary has the same SHA-256 as the measured binary. Results are retained beside the raw measurements. None of these replaces the still-failing independent full-model numerical gate.
 
 The final 512-token profile attributes 61.4% of GPU time to decode projections, 8.2% to the packed BF16 head, 9.0% to large prefill matrices and 5.1% to prefill attention. Longer prefill is the remaining performance target; preserving exact baseline arithmetic rules out replacing ordered floating-point reductions with a different reduction schedule without a separate numerical/quality decision.
+
+## Paged and stock batch harnesses
+
+Generate the complete native-context matrix on `wx-workstation` with the selected hardware configuration:
+
+```sh
+python3 crates/inferrous-qwen3/tools/make_batch_matrix.py \
+  --config configs/qwen3-8b-w8a8/rtx-pro-6000.json \
+  --output clean-work/new-comparison-matrix
+```
+
+The new directory contains one shared workload file, cold/prefix-enabled configurations, an explicit manifest and capacity-rejection probes. The 96 homogeneous cases cross prompts 5/129/512/2K/4K/8K/16K/near-32K with batches 1/2/4/8/16/32 and output counts 2/32. Near-native prompts reserve their requested outputs within 32,768 tokens. Two ragged cases and one page-growth case bring the total to 99 scenarios, each required in cold reuse, prefix-enabled reuse and true recomputation. Cases exceeding simultaneous residency are retained and annotated with predicted cold admission waves, rather than silently omitted; actual admission and memory behavior still require runtime evidence. Prefix-enabled results must report real cache reuse, including eviction or zero-hit cases. The generator uses the provided KV budget and kernel flags, sets batch capacity 32 and disables logit hashing for timing. It does not select a winning kernel policy or run a benchmark.
+
+Both harnesses traverse workload names in sorted order, matching Rust's `BTreeMap`, so input JSON insertion order cannot change prefix-cache history between engines. Three warmups and twenty measured repetitions are required for final timing tables; generated inputs, passing harness tests and tuning pilots do not satisfy that measurement gate.
+
+`tools/bench_batch.py` runs the paged engine using a JSON object mapping workload names to request arrays. Each array may contain homogeneous or ragged prompts and different positive output limits; timing workloads use empty stop lists. It records every repetition, verifies complete deterministic outputs, and checks the exact processed-token count for full recomputation. The [session guide](sessions.md) describes configuration, native-context preparation and timing boundaries.
+
+Run separate correctness probes with `verify_logits: true`, then compare all binaries and cache modes with `tools/check_batch_regression.py`. Supply the exact workload manifest and expected repetition count. The checker rejects missing workloads, duplicate/reordered runs, mixed model/device/configuration identities within a file, disabled or incomplete hashes, changed requests and incorrect cached/recomputed token accounting. It compares every token, full-vocabulary logit hash and finish reason across all inputs; a matching selected token cannot hide changed logits. The report includes input-file and executable SHA-256 identities. Run this and all other tests/benchmarks on `ssh wx-workstation` for the current PRO 6000 work.
+
+```sh
+python3 crates/inferrous-qwen3/tools/check_batch_regression.py \
+  path/to/original-reuse.jsonl path/to/candidate-reuse.jsonl \
+  path/to/original-recompute.jsonl path/to/candidate-recompute.jsonl \
+  --workloads path/to/verification-workloads.json --repeat 1 \
+  --output path/to/new-hash-verification.json
+```
+
+`tools/bench_engines.py` accepts the same named arrays, while retaining compatibility with the earlier single-request workload objects. `--cache-mode reuse` uses ordinary multi-token generation. `--cache-mode recompute` submits the entire growing prefix as a new one-token request at each step, retires finished sequences, and requires prefix caching disabled. It retains each step's submitted lengths, elapsed times and backend metrics. Two host unit tests verify those submission sequences independently of a GPU. Run them with `python -m unittest discover -s crates/inferrous-qwen3/tools/tests -v` inside the Nix shell.
+
+The pinned stock containers are launched with `tools/stock_container.sh`, which supports `vllm` and `sglang` and mounts the host driver on NixOS without installing a system container runtime. Images that expect the NVIDIA container runtime to supply `nvidia-smi` can instead use `NVIDIA_SMI_BINARY=/usr/bin/nvidia-smi` to bind a compatible host executable read-only. This is needed by the pinned SGLang image on the PRO workstation; a missing utility is a launch failure, not evidence of an unsupported inference kernel. The executable's loader and library dependencies must be available inside the image. The current vLLM compressed-tensors automatic INT8 backend rejects SM120; select its supported Triton backend explicitly. For example, from the repository root:
+
+```sh
+crates/inferrous-qwen3/tools/stock_container.sh vllm python3 \
+  /workspace/crates/inferrous-qwen3/tools/bench_engines.py vllm \
+  --model /workspace/clean-work/model-bundle/hf \
+  --requests /workspace/clean-work/batch-workloads.json \
+  --output /workspace/clean-work/stock-batch-results.jsonl \
+  --hardware-profile rtx5090 --max-context 4096 --max-num-seqs 4 \
+  --quantization compressed-tensors --linear-backend triton \
+  --cache-mode reuse --repeat 23
+```
+
+Use a new output path for every run. Increasing context requires a matching workload, engine limit and memory budget; cold/warm prefix policy and verification overhead must be stated separately. Preserve failed engine logs and verify the expected number of JSONL records before accepting a result: a stock worker failure can terminate its parent without a useful process exit status. The current SGLang W8A8 kernel also rejects SM120. Humming runs but converts these FP32 per-channel weight scales to BF16; its effective precision is recorded separately. The [active round 7 record](optimization/round-7.md) distinguishes tested configurations, unsupported paths and the unfinished comparison matrix.
+
+For graph-only stock screening, add `--graphs-without-compile`. Its default capture sizes now cover powers of two through the configured sequence capacity, plus that capacity itself; it no longer silently captures only batch 1 for a batched run. `--graph-capture-sizes 1 2 4 8 16 32` makes the list explicit, while `--graph-size-one` retains the original solo experiment. Raw records include the chosen sizes and immutable container image identifier.
+
+For matched KV capacity, vLLM accepts `--kv-cache-bytes 12884901888` for the RTX 5090 profile's 12 GiB budget. This explicitly controls KV allocation instead of deriving it from the memory fraction; the raw record retains both arguments. `--disable-cutedsl-warmup` selects vLLM's supported `enable_cutedsl_warmup: false` setting for diagnosing its legacy precompile hook. It does not disable runtime kernel compilation or the benchmark's excluded warmup repetitions. Record the flag and check whether JIT work remains in measured repetitions.
+
+The official vLLM image omits B12X. This optional stock variant installs exactly the `b12x==1.5.1` extra declared by vLLM 0.32.0, retaining the base image's other packages and unmodified engine code:
+
+```sh
+docker build --tag inferrous-vllm-b12x:0.32.0-1.5.1 \
+  - < crates/inferrous-qwen3/tools/stock-vllm-b12x.Dockerfile
+# Use stock_container.sh vllm-b12x for this image and --attention-backend B12X.
+```
+
+Use `tools/summarize_batch.py` for the new batch schemas:
+
+```sh
+python crates/inferrous-qwen3/tools/summarize_batch.py \
+  clean-work/batch-results.jsonl clean-work/stock-batch-results.jsonl \
+  --output clean-work/batch-summary.json
+```
+
+It excludes three warmups per workload per file and requires twenty measured samples per distinct executable/configuration/workload by default. Tuning pilots must explicitly lower `--min-samples` and label the smaller sample count. Complete request arrays, model roots, hardware, executable/image identities and settings separate series; reordered, missing or duplicate repetitions and incomplete outputs fail validation. The common host-call metrics are API latency and total output tokens divided by that latency, which also applies to ragged batches. Per-stream first-token/completion/post-first-output metrics retain the engine's native boundary: local generation-call timing, vLLM's native latency and monotonic timestamps, or recomputation-harness step completions. Do not treat those boundaries as interchangeable host-call measurements. Three additional host tests cover ragged completion accounting, timestamp domains and incomplete outputs. Percentile tails at these sample counts remain descriptive.
+
+Timing validation checks individual local steps before summing them, requires finite positive API durations, rejects nonfinite or negative native timings, and requires monotonic recomputation completions and ordered first/last-token timestamps. Invalid intermediate values cannot be hidden by a positive total or silently omitted from decode-rate samples. Missing optional native metrics remain unknown.
+
+Each series also contains `streams`, indexed by the original request slot with that slot's prompt/output lengths and separate first-token, completion, post-first-token rate and latency distributions. This keeps ragged requests and admission waves visible instead of reporting only pooled stream values. `native_per_stream_post_first_seconds_per_token` is the post-first-token interval divided by the number of subsequent outputs; each measured repetition contributes one mean latency per stream. Its percentiles describe those means, not individual inter-token latency tails. A single-output stream has no decode sample. A known zero interval contributes zero latency but no finite rate; absent timestamps remain unknown. Warmups are excluded independently in each input file for both pooled and slot-specific metrics.
+
+When local records include `prefix_cache_stats`, the summary reports per-call differences of the lifetime lookup, hit, miss, matched-token, eviction, replacement and clear counters, along with after-call resident entry/token counts. `prefix_hit_fraction` is hits divided by lookups for each call; calls with no lookups contribute no fraction sample. Decreasing counters, inconsistent lookup totals and lookups under a disabled prefix policy fail validation. Older records and stock engines without these counters contribute unknown values, not zeros. These metrics describe the automatic prefix cache; `reused_tokens` also reflects the actual token rows avoided by execution. See the [session metrics contract](sessions.md#rust-ownership) for retries, concurrent callers and shared physical pages.
+
+The `reused_tokens` distribution includes the local engine's reused-token counter and vLLM's native `num_cached_tokens` values summed across the batch. vLLM defines this field as prefix-cache hits, distinct from within-request decode KV. Recomputation checks every one-token submission and rejects any nonzero prefix reuse; cold stock records also reject hits when prefix caching is disabled. Missing native counters remain unknown (an empty sample list, summarized as `null`), never implicit zero-hit evidence. Invalid counts, counts exceeding the submitted prefix and incomplete per-step metadata fail validation. Cache-count availability for other stock engines must be established separately; timing success alone does not prove warm-prefix reuse.
+
+Use `tools/compare_batch_performance.py` to compare complete matched series against every supplied stock candidate, separately for each cache/prefix mode:
+
+```sh
+python3 crates/inferrous-qwen3/tools/compare_batch_performance.py \
+  --local path/to/local-a1.jsonl path/to/local-a2.jsonl \
+  --stock path/to/stock-triton.jsonl path/to/stock-flashinfer.jsonl \
+  --workloads path/to/workloads.json \
+  --output path/to/new-performance-comparison.json
+```
+
+Every input must contain the complete workload set with matching request arrays and contiguous repetitions; distinct files can contribute samples to the same executable/configuration. Records must follow sorted workload order, with every repetition of one workload completed before the next workload begins, matching both resident-engine harnesses. Reordered or interleaved workloads fail even when each workload has all its samples, because the order can change prefix-cache history. Preserve complete suite files as the unit of reuse when resuming execution; do not assemble a purported resident suite from separate process fragments. The default excludes three warmups per file and requires twenty measurements per candidate and workload. The checker rejects duplicate file contents, changed identities within an input, verification-enabled local timings, precision changes, unmatched model/device/context/sequence/KV capacities, prefix-policy differences and incomplete recomputation submissions. It selects the lowest stock API median independently for each workload and reports local losses as well as gains. File hashes, candidate identities, sample counts and descriptive percentiles remain in the report. This establishes only the fastest supplied eligible candidate: exhaustive stock screening, numerical agreement, sanitizer gates and coverage of every required mode remain separate acceptance requirements. A stock engine whose actual KV capacity is not established cannot enter this explicitly matched-capacity comparison.
+
+### Executing a frozen comparison plan
+
+[`execute_batch_plan.py`](../../crates/inferrous-qwen3/tools/execute_batch_plan.py) consumes a version-1 plan containing the workstation root, input hashes, image identities, environment, ordered suite commands, expected record/sample counts and comparison commands. The [current round 8 plan](optimization/round-8.md#per-stream-reporting-for-the-final-matrix) contains all 99 scenarios, three modes and eight stock candidates. The v3 execution plan pins the retained certified-head executable, but the original independent numerical acceptance requirement remains unsatisfied. Regenerate identities and commands if the final selected candidate or pinned reporting inputs change.
+
+Run preflight on the workstation; this checks the files, images and command bindings without using the GPU:
+
+```sh
+ssh wx-workstation 'cd /home/callen/work/inferrous-kv-batch && python3 crates/inferrous-qwen3/tools/execute_batch_plan.py --plan clean-work/pro6000-matrix-execution-v3/plan.json'
+```
+
+After the candidate's independent validation is complete, `--execute` runs that plan in order. A plan lock prevents simultaneous executors for the same plan. Before each new suite, the runner rechecks pinned inputs/images and refuses to start if a compute process already occupies the GPU. It captures raw GPU telemetry and separate stdout/stderr, records the child PID, requires exit zero and validates complete ordered records against the workload and command's binary/configuration/model/image identities. Numerical validation, absence of overlapping builds and final eligibility/acceptance remain separate requirements; the executor does not certify them from successful timing runs.
+
+The telemetry query samples device-wide utilization, memory used, SM/memory clocks, temperature and power every 500 ms. Successful receipts include `gpu_telemetry`: sample count, first/last host-local timestamps, observed time span, largest timestamp gap, and minimum/median/maximum for each metric. Memory is in MiB, clocks in MHz, temperature in Celsius and power in watts. The parser requires the query's exact eight-column header/units, the expected device name, valid timestamps and finite nonnegative values; utilization must also be at most 100%. Missing or unavailable metric values are rejected, not converted to zero. A single sample has no observed sampling gap. Wall-clock reversals are counted in `backward_timestamp_steps`; they leave span/gap fields unknown while retaining valid metric samples. They do not invalidate the independent monotonic inference timings or force a whole-suite rerun.
+
+`gpu_telemetry.metrics.memory_used_mib.maximum` is the largest observed device-memory sample over the whole captured interval. Loading, JIT, graph capture, warmups, all resident workloads and other processes may contribute. It is neither an exact peak nor per-request memory, and it cannot establish peak occupied KV pages or actual admission-wave counts. Keep configured KV capacity, after-call page/reference counts, explicit capacity probes and these device-wide samples distinct. A large timestamp gap can reflect missing observations or a wall-clock adjustment; a 500 ms requested cadence does not guarantee that all brief peaks were sampled. [Historical telemetry validation](optimization/round-8.md#validated-device-telemetry-and-sampled-memory-reporting) records the tested scope.
+
+Successful suites receive receipts containing the executor and execution-contract hashes plus all artifact hashes. Resuming rechecks those artifacts, validates the records and recomputes the telemetry summary before skipping execution; edited derived telemetry cannot override the raw observations. A failed receipt or partial output is never silently reused or restarted. Inspect the recorded process and terminal state first; leave a live job running. After confirmed termination, preserve the failed attempt and give its replacement whole suite fresh output paths, updating the corresponding comparison command. Other completed suites remain reusable only when their own execution contract and the pinned inputs/images/executor are unchanged. The runner never joins fragments from separate resident processes. Comparisons run only after all planned suites validate, require every planned arm, and report losses without turning them into execution failures or completion claims.
