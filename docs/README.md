@@ -20,6 +20,7 @@
 - [Fixed paged policy qualification](qwen3-8b-w8a8/results/pro6000-fixed-policy-qualification.md): isolated current-head candidate passes release/checked native tests, full-model memcheck and exhaustive changed-family racecheck partitions; production and the original numerical gate remain unchanged.
 - [Exact ordered PV experiment](qwen3-8b-w8a8/results/pro6000-exact-pv.md): exact CPU/CUDA comparisons and scoped sanitizers pass, but the guarded integer-grid prototype loses every production-kernel timing case and is rejected.
 - [FP32 shared-key staging](qwen3-8b-w8a8/results/pro6000-qk-staging.md): release/checked operator comparisons and scoped sanitizers pass; thirteen paired QK shapes show no win, so the staging variant is rejected.
+- [Exact-order softmax experiments](qwen3-8b-w8a8/results/pro6000-softmax-tree.md): bitwise operator and sanitizer checks pass; a modest 128-thread candidate enters an isolated model trial, while the single-warp follow-up is rejected.
 - [RTX PRO 6000 segmented-attention operators](qwen3-8b-w8a8/results/pro6000-segmented-attention.md): independent-reference and sanitizer checks, complete shape timings and the short-context gap.
 - [RTX PRO 6000 128-row projections](qwen3-8b-w8a8/results/pro6000-m128-projections.md): complete correctness/sanitizer checks and the rejected operator screen.
 - [RTX 5090 Nix validation](qwen3-8b-w8a8/results/rtx5090-nix.md): local release/checked test results, benchmark timings and exact-output comparisons.
